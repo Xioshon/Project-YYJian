@@ -12,6 +12,7 @@ from agent_hooks import DEFAULT_HOOK_MANAGER, HookDecision, HookManager, TRACE_L
 from agent_action_verification import ActionVerificationResult, verify_action
 from agent_latency import ResponsePolicy, policy_for_semantic_intent
 from agent_outcome import OutcomeController, detect_outcome_action, format_last_outcome_reply, is_result_followup, tool_result_outcome
+from agent_permission_replay import PermissionReplayController
 from agent_planner import DEFAULT_PLANNER
 from agent_protocol import EMPTY_REPLY_FALLBACK, FAIL_SAFE_REPLY, TOOL_LOOP_TIMEOUT_REPLY, classify_approval, screenshot_tags
 from agent_replay import record_failure_replay
@@ -473,6 +474,26 @@ class CompanionAgent:
         self._remember_turn_summary(user_input, final_reply)
         self._save_history()
 
+    def _user_input_with_runtime_context(self, user_input: str, turn_intent: str, worker_results: list[dict[str, Any]] | None = None) -> str:
+        enriched = f"{user_input}\n\n[SessionBrain]\n{self.session_brain.summary()}\n\n[TaskGraph]\n{self.task_graphs.summary()}\nturn_intent: {turn_intent}"
+        worker_context = _worker_context(worker_results or [])
+        if worker_context:
+            enriched += f"\n\n[WorkerEvidence]\n{worker_context}"
+        return enriched
+
+    def _append_user_context_message(self, user_input: str, turn_intent: str, worker_results: list[dict[str, Any]] | None = None) -> str:
+        enriched = self._user_input_with_runtime_context(user_input, turn_intent, worker_results)
+        self.memory.append({"role": "user", "content": enriched})
+        return enriched
+
+    def _append_assistant_only(self, final_reply: str) -> None:
+        self.memory.append({"role": "assistant", "content": final_reply})
+        self._save_history()
+
+    def _reset_after_deterministic_turn(self) -> None:
+        self.permission_manager.reset_after_turn()
+        self.always_allow_tools = False
+
     def _outcome_controller(self) -> OutcomeController:
         return OutcomeController(
             session_brain=self.session_brain,
@@ -481,6 +502,20 @@ class CompanionAgent:
             hooks=self.hooks,
             after_tool_result=self._after_tool_result,
             append_reply=self._append_final_reply,
+            session_id=self.session_id,
+            turn_id_getter=lambda: self.turn_id,
+        )
+
+    def _permission_replay_controller(self, turn_intent: str, worker_results: list[dict[str, Any]]) -> PermissionReplayController:
+        return PermissionReplayController(
+            permission_manager=self.permission_manager,
+            session_brain=self.session_brain,
+            executor=self.executor,
+            hooks=self.hooks,
+            after_tool_result=self._after_tool_result,
+            append_user_context=lambda text: self._append_user_context_message(text, turn_intent, worker_results),
+            append_assistant_reply=self._append_assistant_only,
+            reset_turn_state=self._reset_after_deterministic_turn,
             session_id=self.session_id,
             turn_id_getter=lambda: self.turn_id,
         )
@@ -613,63 +648,10 @@ class CompanionAgent:
             self.hooks.emit("Stop", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
             return {"content": final_reply, "reasoning": ""}
         if grant == "single":
-            approved_action = self.permission_manager.pop_approved_action()
-            if approved_action:
-                user_input += f"\n\n[SessionBrain]\n{self.session_brain.summary()}\n\n[TaskGraph]\n{self.task_graphs.summary()}\nturn_intent: {turn_classification.intent}"
-                worker_context = _worker_context(assimilated_worker_results)
-                if worker_context:
-                    user_input += f"\n\n[WorkerEvidence]\n{worker_context}"
-                self.memory.append({"role": "user", "content": user_input})
-                self.hooks.emit(
-                    "PermissionReplay",
-                    session_id=self.session_id,
-                    turn_id=self.turn_id,
-                    tool=approved_action.tool_name,
-                    arguments=approved_action.arguments,
-                )
-                result = self.executor.execute(approved_action.tool_name, approved_action.arguments, tool_callback, None)
-                verification, replay_case = self._after_tool_result(approved_action.tool_name, approved_action.arguments, result)
-                self.hooks.emit(
-                    "PermissionReplayResult",
-                    session_id=self.session_id,
-                    turn_id=self.turn_id,
-                    tool=approved_action.tool_name,
-                    status=result.status,
-                    verification_status=verification.status,
-                )
-                if result.status == "ok":
-                    self.session_brain.mark_validation_needed(
-                        "verify tool results: " + approved_action.tool_name,
-                        self.turn_id,
-                        self.session_id,
-                        evidence=[approved_action.tool_name],
-                    )
-                    outcome_summary, artifacts = tool_result_outcome(approved_action.tool_name, result)
-                    final_reply = f"已執行剛剛批准的 `{approved_action.tool_name}`：{result.message}"
-                    if outcome_summary:
-                        final_reply += "\n" + outcome_summary
-                    if artifacts:
-                        final_reply += "\n如果你要我發送或分析這些產物，直接說「發給我」或「分析一下」就好。"
-                elif replay_case:
-                    final_reply = f"主人，我發現 `{approved_action.tool_name}` 重複卡住，所以先停下來了。Replay case: {replay_case.get('name')}"
-                elif result.status == "blocked":
-                    if result.requires_permission:
-                        self.session_brain.mark_permission_needed(approved_action.tool_name, self.turn_id, self.session_id)
-                    final_reply = f"`{approved_action.tool_name}` 仍被攔截：{result.message}"
-                else:
-                    final_reply = f"`{approved_action.tool_name}` 執行失敗：{result.message}"
-                    if result.error:
-                        final_reply += f"\n{result.error[:800]}"
-                reply_decision = self.hooks.emit("BeforeReply", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
-                if reply_decision.annotate:
-                    final_reply += reply_decision.annotate
-                self.memory.append({"role": "assistant", "content": final_reply})
-                self._remember_turn_summary(user_input, final_reply)
-                self.permission_manager.reset_after_turn()
-                self.always_allow_tools = False
-                self.hooks.emit("Stop", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
-                self._save_history()
-                return {"content": final_reply, "reasoning": ""}
+            replayed = self._permission_replay_controller(turn_classification.intent, assimilated_worker_results).maybe_replay(grant, user_input, tool_callback)
+            if replayed is not None:
+                self._remember_turn_summary(user_input, replayed.content)
+                return replayed.to_chat_result()
         if grant == "single":
             user_input += "\n\n[System notice: owner approved the previously blocked exact tool call once. Retry that same tool call if it is still needed.]"
         elif grant == "turn":

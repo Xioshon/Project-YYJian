@@ -259,6 +259,20 @@ def permission_replay_bypasses_chat_route_policy():
     return "approved pending python replay bypassed chat route policy"
 
 
+def permission_replay_lives_in_controller_not_core_loop():
+    import inspect
+    import core_agent as core_agent_module
+    from agent_permission_replay import PermissionReplayController
+
+    chat_source = inspect.getsource(core_agent_module.CompanionAgent.chat)
+    controller_source = inspect.getsource(PermissionReplayController)
+    if "self.hooks.emit(\n                    \"PermissionReplay\"" in chat_source or "pop_approved_action()" in chat_source:
+        raise AssertionError("permission replay flow leaked back into CompanionAgent.chat")
+    if "PermissionReplay" not in controller_source or "pop_approved_action" not in controller_source:
+        raise AssertionError("permission replay controller is missing replay responsibilities")
+    return "permission replay flow isolated in controller"
+
+
 def task_result_followup_uses_last_outcome_without_replanning():
     agent = CompanionAgent(PermissionReplayPythonAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "task_result_followup_test.json"))
     agent.interactive_mode = False
@@ -2794,6 +2808,7 @@ def main():
         ("unknown_tool_fallback", unknown_tool_fallback),
         ("permission_followup_allows_exact_tool", permission_followup_allows_exact_tool),
         ("permission_replay_bypasses_chat_route_policy", permission_replay_bypasses_chat_route_policy),
+        ("permission_replay_lives_in_controller_not_core_loop", permission_replay_lives_in_controller_not_core_loop),
         ("task_result_followup_uses_last_outcome_without_replanning", task_result_followup_uses_last_outcome_without_replanning),
         ("outcome_send_artifact_uses_stored_artifact_without_replanning", outcome_send_artifact_uses_stored_artifact_without_replanning),
         ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),
