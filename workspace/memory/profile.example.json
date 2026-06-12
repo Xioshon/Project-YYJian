@@ -1,0 +1,11 @@
+﻿{
+  "basic_info": {
+    "name": "Demo Owner",
+    "preferred_address": "主人"
+  },
+  "preferences": [
+    "Likes concise, warm replies.",
+    "Uses YueYue as a private Telegram companion agent."
+  ],
+  "important_facts": []
+}

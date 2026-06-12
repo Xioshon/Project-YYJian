@@ -1,0 +1,33 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*token*
+*secret*
+*api_key*
+workspace/tg_chat_id.txt
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Runtime state, private chats, traces, and logs
+workspace/chat_history/
+workspace/logs/
+workspace/project_cache/
+workspace/telegram_images/
+workspace/assets/tg_images/
+workspace/assets/screenshots/
+workspace/screenshot_*.png
+
+# Local generated app/project artifacts
+workspace/project/**/__pycache__/
+workspace/project/**/*.pyc
+
+# Temporary test outputs
+workspace/project_cache/
+*.tmp
+*.bak
+
