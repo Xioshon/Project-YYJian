@@ -68,6 +68,7 @@ from agent_task_graph import TASK_GRAPHS_FILE, WORKFLOW_REPLAY_FILE, TaskGraphMa
 from agent_worker import ALLOWED_VERIFIER_COMMANDS, WORKER_JOBS_FILE, WORKER_RESULTS_FILE, WorkerJob, WorkerQueue, VerifierWorker
 from core_agent import CompanionAgent, SiliconFlowAdapter, TRACE_LOG_FILE, clean_assistant_output
 import agent_llm
+from agent_llm import RoutedLLMAdapter, infer_route_from_messages
 from main import TelegramGateway, _dedupe_preserve_order, _prompt_mode_for_seed, _split_sticker_command_payload, build_system_prompt, find_sticker_file
 
 
@@ -327,6 +328,29 @@ def llm_adapter_lives_outside_core_agent():
     if SiliconFlowAdapter is not agent_llm.SiliconFlowAdapter:
         raise AssertionError("core_agent compatibility export should point to agent_llm.SiliconFlowAdapter")
     return "LLM adapter isolated"
+
+
+def routed_llm_adapter_selects_fast_chat_and_strong_task_models():
+    adapter = RoutedLLMAdapter(chat_model="fast-chat", task_model="strong-task", vision_model="vision-task", api_key="test-key")
+    if adapter.model_for_route("chat") != "fast-chat":
+        raise AssertionError("chat route should use fast chat model")
+    if adapter.model_for_route("social_sticker") != "fast-chat":
+        raise AssertionError("social route should use fast chat model")
+    if adapter.model_for_route("tool_task") != "strong-task":
+        raise AssertionError("tool route should use strong task model")
+    if adapter.model_for_route("screen_observe") != "vision-task":
+        raise AssertionError("screen route should use vision model")
+    messages = [{"role": "user", "content": "hi\n\n[SessionBrain]\nstate\nturn_intent: task_continuation"}]
+    if infer_route_from_messages(messages) != "task_continuation":
+        raise AssertionError("turn_intent route not inferred")
+    return "routed model policy selected expected models"
+
+
+def main_build_agent_uses_routed_llm_adapter():
+    source = inspect.getsource(main_module.build_agent)
+    if "RoutedLLMAdapter" not in source or "SiliconFlowAdapter" in source:
+        raise AssertionError(source)
+    return "main build_agent uses routed adapter"
 
 
 def task_result_followup_uses_last_outcome_without_replanning():
@@ -3032,6 +3056,8 @@ def main():
         ("tool_loop_lives_in_controller_not_core_loop", tool_loop_lives_in_controller_not_core_loop),
         ("tool_runtime_services_are_outside_core_agent", tool_runtime_services_are_outside_core_agent),
         ("llm_adapter_lives_outside_core_agent", llm_adapter_lives_outside_core_agent),
+        ("routed_llm_adapter_selects_fast_chat_and_strong_task_models", routed_llm_adapter_selects_fast_chat_and_strong_task_models),
+        ("main_build_agent_uses_routed_llm_adapter", main_build_agent_uses_routed_llm_adapter),
         ("task_result_followup_uses_last_outcome_without_replanning", task_result_followup_uses_last_outcome_without_replanning),
         ("outcome_send_artifact_uses_stored_artifact_without_replanning", outcome_send_artifact_uses_stored_artifact_without_replanning),
         ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),

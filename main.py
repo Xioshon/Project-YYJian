@@ -17,7 +17,8 @@ from agent_protocol import STICKER_MARKER_LABEL, SCREENSHOT_MARKER_LABEL, TELEGR
 from agent_skills import DEFAULT_SKILL_REGISTRY
 from agent_social import DEFAULT_SOCIAL_CURATION_REMINDER, DEFAULT_SOCIAL_SESSION_MANAGER, DEFAULT_SOCIAL_STICKER_INDEX, social_reply_policy_for
 from agent_turns import InboundMessagePart, MessageCoalescer, build_turn_prompt
-from core_agent import CompanionAgent, SiliconFlowAdapter
+from agent_llm import RoutedLLMAdapter
+from core_agent import CompanionAgent
 from core_tools import (
     ALL_TOOLS,
     API_KEY,
@@ -610,7 +611,7 @@ class TelegramGateway:
 def build_agent() -> CompanionAgent:
     session_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     current_history_file = os.path.join(HISTORY_DIR, f"{session_time}_ongoing.json")
-    agent = CompanionAgent(SiliconFlowAdapter(model="deepseek-ai/DeepSeek-V4-Pro", thinking_level=THINKING_LEVEL), build_system_prompt(), current_history_file)
+    agent = CompanionAgent(RoutedLLMAdapter(thinking_level=THINKING_LEVEL), build_system_prompt(), current_history_file)
     for tool in ALL_TOOLS:
         agent.add_tool(tool)
     return agent

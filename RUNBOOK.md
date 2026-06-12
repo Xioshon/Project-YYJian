@@ -16,6 +16,7 @@
 - Memory + Personality Core adds compiled memory, memory health checks, rolling chat summary, and the SOUL cyber-catgirl personality core.
 - Phase 5 restores YueYue's SOUL direction, adds persona health reporting, routes screen-observe tasks through a short observe-once flow, and dedupes Telegram render artifacts.
 - Repo hygiene and execution recovery keep private runtime files out of Git and let cwd-related command failures retry once from project root.
+- LLM routing separates the runtime from the provider adapter and can send casual chat/social turns to a fast model while keeping task, tool, and vision turns on the stronger model.
 - Tools return structured `ToolResult` data instead of loose strings.
 - Approval is explicit state, not guessed from the last assistant message.
 - Telegram sticker rendering through `[表情包: filename]` or `[sticker: filename]` is autonomous and does not require tool approval.
@@ -37,6 +38,23 @@
   - `telegram_media_bundle`: `send_telegram_media`
   - `screenshot_bundle`: `get_screen_ui`, `send_telegram_media`, `delete_file`
 - High-risk tools such as arbitrary `execute_command`, arbitrary `execute_python`, and `execute_async_command` are not included in ordinary bundles.
+
+## Debug Trace
+
+## Model Routing
+
+`agent_llm.RoutedLLMAdapter` is the default adapter used by `main.build_agent()`.
+
+Optional `.env` values:
+
+```env
+YUEYUE_CHAT_MODEL=
+YUEYUE_STRONG_MODEL=deepseek-ai/DeepSeek-V4-Pro
+YUEYUE_TASK_MODEL=
+YUEYUE_VISION_MODEL=
+```
+
+Leave `YUEYUE_CHAT_MODEL` blank to use the strong model for every route. Set it when ordinary chat feels too slow.
 
 ## Debug Trace
 

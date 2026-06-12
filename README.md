@@ -34,6 +34,21 @@ Generate the live evaluation gate report:
 python agent_eval.py
 ```
 
+## Model Routing
+
+YueYue uses `RoutedLLMAdapter` by default. Casual chat/social turns can use a faster chat model, while task/tool/vision turns stay on the stronger model.
+
+Configure in `.env`:
+
+```env
+YUEYUE_CHAT_MODEL=
+YUEYUE_STRONG_MODEL=deepseek-ai/DeepSeek-V4-Pro
+YUEYUE_TASK_MODEL=
+YUEYUE_VISION_MODEL=
+```
+
+If `YUEYUE_CHAT_MODEL` is blank, chat uses the same strong model as tasks.
+
 Rebuild the local engineering knowledge index:
 
 ```powershell

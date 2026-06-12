@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any, Protocol
 
@@ -8,6 +9,11 @@ import httpx
 from openai import OpenAI
 
 from core_tools import API_KEY, AgentTool
+
+
+DEFAULT_STRONG_MODEL = "deepseek-ai/DeepSeek-V4-Pro"
+DEFAULT_CHAT_MODEL = DEFAULT_STRONG_MODEL
+DEFAULT_VISION_MODEL = DEFAULT_STRONG_MODEL
 
 
 class LLMAdapter(Protocol):
@@ -112,3 +118,71 @@ class SiliconFlowAdapter:
                     }
                 )
         return result
+
+
+def _env_model(name: str, default: str) -> str:
+    value = os.getenv(name, "").strip()
+    return value or default
+
+
+class RoutedLLMAdapter:
+    """Route lightweight chat to a fast model while keeping tasks on a stronger model."""
+
+    def __init__(
+        self,
+        *,
+        chat_model: str | None = None,
+        task_model: str | None = None,
+        vision_model: str | None = None,
+        thinking_level: str = "auto",
+        api_key: str | None = None,
+        base_url: str = "https://api.siliconflow.cn/v1",
+    ):
+        self.chat_model = chat_model or _env_model("YUEYUE_CHAT_MODEL", DEFAULT_CHAT_MODEL)
+        self.task_model = task_model or _env_model("YUEYUE_TASK_MODEL", _env_model("YUEYUE_STRONG_MODEL", DEFAULT_STRONG_MODEL))
+        self.vision_model = vision_model or _env_model("YUEYUE_VISION_MODEL", self.task_model)
+        self.thinking_level = thinking_level
+        self.api_key = api_key
+        self.base_url = base_url
+        self._adapters: dict[str, SiliconFlowAdapter] = {}
+        self.last_route = ""
+        self.last_model = ""
+
+    def chat_with_tools(self, messages: list[dict[str, Any]], tools: list[AgentTool]) -> dict[str, Any]:
+        route = infer_route_from_messages(messages)
+        model = self.model_for_route(route)
+        self.last_route = route
+        self.last_model = model
+        return self._adapter_for(model).chat_with_tools(messages, tools)
+
+    def model_for_route(self, route: str) -> str:
+        normalized = (route or "").casefold()
+        if normalized in {"chat", "social_sticker", "idle"}:
+            return self.chat_model
+        if normalized in {"vision_task", "vision", "screen_observe", "screen"}:
+            return self.vision_model
+        return self.task_model
+
+    def _adapter_for(self, model: str) -> SiliconFlowAdapter:
+        if model not in self._adapters:
+            self._adapters[model] = SiliconFlowAdapter(
+                model=model,
+                thinking_level=self.thinking_level,
+                api_key=self.api_key,
+                base_url=self.base_url,
+            )
+        return self._adapters[model]
+
+
+def infer_route_from_messages(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages or []):
+        if message.get("role") != "user":
+            continue
+        content = str(message.get("content") or "")
+        marker = "turn_intent:"
+        if marker in content:
+            tail = content.rsplit(marker, 1)[-1].strip().splitlines()[0].strip()
+            return tail or "chat"
+        if "[SessionBrain]" not in content and "[TaskGraph]" not in content:
+            return "chat"
+    return "task"
