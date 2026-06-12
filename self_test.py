@@ -67,6 +67,7 @@ from agent_transactions import TASK_TRANSACTIONS_FILE, TaskTransactionManager
 from agent_task_graph import TASK_GRAPHS_FILE, WORKFLOW_REPLAY_FILE, TaskGraphManager
 from agent_worker import ALLOWED_VERIFIER_COMMANDS, WORKER_JOBS_FILE, WORKER_RESULTS_FILE, WorkerJob, WorkerQueue, VerifierWorker
 from core_agent import CompanionAgent, SiliconFlowAdapter, TRACE_LOG_FILE, clean_assistant_output
+import agent_llm
 from main import TelegramGateway, _dedupe_preserve_order, _prompt_mode_for_seed, _split_sticker_command_payload, build_system_prompt, find_sticker_file
 
 
@@ -307,6 +308,25 @@ def tool_runtime_services_are_outside_core_agent():
     if missing:
         raise AssertionError(f"agent_tool_runtime.py missing service responsibilities: {missing}")
     return "tool runtime services isolated"
+
+
+def llm_adapter_lives_outside_core_agent():
+    import inspect
+    import core_agent as core_agent_module
+
+    core_source = inspect.getsource(core_agent_module)
+    llm_source = inspect.getsource(agent_llm)
+    forbidden = ["from openai import OpenAI", "import httpx", "chat.completions.create", "base_url=\"https://api.siliconflow.cn/v1\"", "class SiliconFlowAdapter"]
+    leaked = [marker for marker in forbidden if marker in core_source]
+    if leaked:
+        raise AssertionError(f"LLM provider leaked back into core_agent.py: {leaked}")
+    required = ["class SiliconFlowAdapter", "chat.completions.create", "format_tools_for_openai", "add_runtime_guardrail"]
+    missing = [marker for marker in required if marker not in llm_source]
+    if missing:
+        raise AssertionError(f"agent_llm.py missing adapter responsibilities: {missing}")
+    if SiliconFlowAdapter is not agent_llm.SiliconFlowAdapter:
+        raise AssertionError("core_agent compatibility export should point to agent_llm.SiliconFlowAdapter")
+    return "LLM adapter isolated"
 
 
 def task_result_followup_uses_last_outcome_without_replanning():
@@ -3011,6 +3031,7 @@ def main():
         ("permission_replay_lives_in_controller_not_core_loop", permission_replay_lives_in_controller_not_core_loop),
         ("tool_loop_lives_in_controller_not_core_loop", tool_loop_lives_in_controller_not_core_loop),
         ("tool_runtime_services_are_outside_core_agent", tool_runtime_services_are_outside_core_agent),
+        ("llm_adapter_lives_outside_core_agent", llm_adapter_lives_outside_core_agent),
         ("task_result_followup_uses_last_outcome_without_replanning", task_result_followup_uses_last_outcome_without_replanning),
         ("outcome_send_artifact_uses_stored_artifact_without_replanning", outcome_send_artifact_uses_stored_artifact_without_replanning),
         ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),

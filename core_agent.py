@@ -1,15 +1,13 @@
-﻿import json
-import os
+﻿import os
 import re
 import time
 from typing import Any, Callable
 
-import httpx
-from openai import OpenAI
 
 from agent_hooks import DEFAULT_HOOK_MANAGER, HookDecision, HookManager, TRACE_LOG_FILE, emit_trace
 from agent_action_verification import ActionVerificationResult, verify_action
 from agent_latency import ResponsePolicy, policy_for_semantic_intent
+from agent_llm import SiliconFlowAdapter
 from agent_outcome import OutcomeController, detect_outcome_action, format_last_outcome_reply, is_result_followup, tool_result_outcome
 from agent_permission_replay import PermissionReplayController
 from agent_planner import DEFAULT_PLANNER
@@ -22,7 +20,7 @@ from agent_tool_loop import ToolLoopController
 from agent_tool_runtime import PermissionManager, ToolExecutor, ToolRegistry
 from agent_transactions import TaskTransactionManager
 from agent_worker import WorkerQueue
-from core_tools import AgentTool, API_KEY, PROJECT_CACHE_DIR, ToolResult
+from core_tools import AgentTool, PROJECT_CACHE_DIR, ToolResult
 
 
 def _capture_screen() -> str:
@@ -50,72 +48,6 @@ def _worker_context(items: list[dict[str, Any]]) -> str:
     for item in items[-5:]:
         lines.append(f"{item.get('step_id', 'step')} worker={item.get('status', 'unknown')} job={item.get('job_id', '')}")
     return "\n".join(lines)
-
-
-class SiliconFlowAdapter:
-    def __init__(self, model: str = "deepseek-ai/DeepSeek-V4-Pro", thinking_level: str = "auto"):
-        self.model = model
-        self.thinking_level = thinking_level
-
-    def chat_with_tools(self, messages: list[dict], tools: list[AgentTool]) -> dict:
-        if not API_KEY or len(API_KEY) < 10:
-            raise ValueError("SILICONFLOW_API_KEY is not configured.")
-
-        openai_tools = [
-            {"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.parameters}}
-            for tool in tools
-        ]
-        formatted_messages = []
-        for message in messages:
-            item = {"role": message["role"], "content": message.get("content", "")}
-            for key in ("name", "tool_calls", "tool_call_id"):
-                if key in message:
-                    item[key] = message[key]
-            formatted_messages.append(item)
-
-        guardrail = (
-            "Reply naturally in Traditional Chinese unless the user asks otherwise. "
-            "Do not expose hidden reasoning. Use tools only when useful. "
-            "Sticker replies may include [表情包: filename] or [sticker: filename] when emotionally appropriate."
-        )
-        if formatted_messages and formatted_messages[0]["role"] == "system":
-            formatted_messages[0]["content"] = formatted_messages[0].get("content", "") + "\n\n" + guardrail
-        else:
-            formatted_messages.insert(0, {"role": "system", "content": guardrail})
-
-        kwargs: dict[str, Any] = {"model": self.model, "messages": formatted_messages}
-        if openai_tools:
-            kwargs["tools"] = openai_tools
-            kwargs["tool_choice"] = "auto"
-
-        last_error = ""
-        for attempt in range(2):
-            try:
-                client = OpenAI(api_key=API_KEY, base_url="https://api.siliconflow.cn/v1", http_client=httpx.Client(timeout=60.0))
-                response = client.chat.completions.create(**kwargs)
-                choice = response.choices[0]
-                message = choice.message
-                result = {"role": "assistant", "content": message.content or "", "reasoning": getattr(message, "reasoning_content", "") or ""}
-                if getattr(message, "tool_calls", None):
-                    result["tool_calls"] = []
-                    for tool_call in message.tool_calls:
-                        try:
-                            args = json.loads(tool_call.function.arguments or "{}")
-                        except Exception:
-                            args = {}
-                        result["tool_calls"].append(
-                            {
-                                "id": tool_call.id,
-                                "name": tool_call.function.name,
-                                "arguments": args,
-                                "raw_arguments": tool_call.function.arguments or "{}",
-                            }
-                        )
-                return result
-            except Exception as exc:
-                last_error = str(exc)
-                time.sleep(1)
-        return {"role": "assistant", "content": f"[LLM API error] {last_error}", "reasoning": ""}
 
 
 class CompanionAgent:
@@ -356,4 +288,5 @@ class CompanionAgent:
 
         self.memory.append({"role": "user", "content": user_input})
         return self._tool_loop_controller(response_policy).run(self.memory, user_input, tool_callback).to_chat_result()
+
 
