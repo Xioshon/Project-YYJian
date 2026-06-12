@@ -15,6 +15,7 @@ from agent_permission_replay import PermissionReplayController
 from agent_planner import DEFAULT_PLANNER
 from agent_protocol import EMPTY_REPLY_FALLBACK, FAIL_SAFE_REPLY, TOOL_LOOP_TIMEOUT_REPLY, classify_approval, screenshot_tags
 from agent_replay import record_failure_replay
+from agent_self_recovery import SelfRecoveryController
 from agent_session import SessionBrain
 from agent_task_graph import TaskGraphManager
 from agent_tool_loop import ToolLoopController
@@ -134,6 +135,7 @@ class CompanionAgent:
         self.history_file = current_history_file
         self.interactive_mode = True
         self.executor = ToolExecutor(self.registry, self.permission_manager, self.interactive_mode, self.hooks, self.session_id)
+        self.self_recovery = SelfRecoveryController(executor=self.executor, hooks=self.hooks, session_id=self.session_id)
         self.hooks.emit("SessionStart", session_id=self.session_id, turn_id=0, history_file=current_history_file)
 
     @property
@@ -306,41 +308,7 @@ class CompanionAgent:
         self.task_graphs.plan_steps(user_input, plan.step_names(), session_id=self.session_id, turn_id=self.turn_id, planner_version=plan.planner_version)
 
     def _recover_tool_result(self, tool_name: str, arguments: dict, result: ToolResult, tool_callback: Callable | None, response_policy: ResponsePolicy | None) -> tuple[ToolResult, dict[str, Any] | None]:
-        if tool_name != "execute_command" or result.status != "error":
-            return result, None
-        data = result.data if isinstance(result.data, dict) else {}
-        retry_hint = str(data.get("retry_hint") or "")
-        original_cwd = str((arguments or {}).get("cwd") or data.get("cwd") or "project")
-        if not retry_hint or original_cwd == "project":
-            return result, None
-        retry_args = dict(arguments or {})
-        retry_args["cwd"] = "project"
-        self.hooks.emit(
-            "ToolRecoveryAttempt",
-            session_id=self.session_id,
-            turn_id=self.turn_id,
-            tool=tool_name,
-            reason="cwd_retry",
-            original_cwd=original_cwd,
-            retry_cwd="project",
-            retry_hint=retry_hint,
-        )
-        recovered = self.executor.execute(tool_name, retry_args, tool_callback, response_policy)
-        recovery = {
-            "reason": "cwd_retry",
-            "original_status": result.status,
-            "original_message": result.message,
-            "original_error": result.error,
-            "original_cwd": original_cwd,
-            "retry_cwd": "project",
-            "retry_status": recovered.status,
-        }
-        if isinstance(recovered.data, dict):
-            recovered.data["recovered_from"] = recovery
-        self.hooks.emit("ToolRecoveryResult", session_id=self.session_id, turn_id=self.turn_id, tool=tool_name, **recovery)
-        if recovered.status == "ok":
-            return recovered, recovery
-        return result, recovery
+        return self.self_recovery.recover(tool_name, arguments or {}, result, tool_callback, response_policy, self.turn_id)
 
     def chat(self, user_input: str, tool_callback: Callable | None = None, response_policy: ResponsePolicy | None = None) -> dict[str, str]:
         response_policy = response_policy or ResponsePolicy()

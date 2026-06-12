@@ -47,6 +47,7 @@ from agent_observability import summarize_trace
 from agent_protocol import STICKER_MARKER_LABEL, classify_approval, screenshot_marker, sticker_marker, sticker_pattern
 from agent_action_verification import verify_action
 from agent_replay import FAILURE_REPLAY_FILE, ReplayCase, ReplayHarness, record_failure_replay
+from agent_self_recovery import SelfRecoveryController
 from agent_session import SESSION_BRAIN_FILE, SessionBrain
 from agent_skills import DEFAULT_SKILL_REGISTRY
 from agent_social import SocialCurationReminder, SocialSessionManager, SocialStickerIndex, infer_intent_tags, infer_metadata_tags, infer_social_mode, infer_sticker_tags, is_safe_sticker, social_reply_policy_for
@@ -559,6 +560,24 @@ class CwdRecoveryAdapter:
         return {"role": "assistant", "content": "recovery ok"}
 
 
+class TransientToolAdapter:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_flaky", "name": "fake_flaky_search", "arguments": {"query": "x"}, "raw_arguments": '{"query":"x"}'}],
+            }
+        tool_content = "\n".join(message.get("content", "") for message in messages if message.get("role") == "tool")
+        if "recovered_from" in tool_content and '"status": "ok"' in tool_content:
+            return {"role": "assistant", "content": "自己重試後好了"}
+        return {"role": "assistant", "content": "沒有自救成功"}
+
+
 def turn_approval_allows_tool_chain():
     target = os.path.join(core_tools.PROJECT_CACHE_DIR, "turn.txt")
     try:
@@ -595,6 +614,48 @@ def command_cwd_failure_recovers_inside_agent_loop():
     if not any("recovered_from" in content and '"cwd": "project"' in content for content in tool_messages):
         raise AssertionError(tool_messages[-2:])
     return "cwd failure recovered and continued"
+
+
+def transient_tool_error_recovers_before_user_followup():
+    attempts = {"count": 0}
+
+    def flaky_search(query: str):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+        return core_tools.ToolResult("ok", "search recovered", data={"items": ["ok"]})
+
+    agent = CompanionAgent(TransientToolAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "transient_recovery_test.json"))
+    agent.add_tool(core_tools.AgentTool("fake_flaky_search", "fake flaky idempotent search", flaky_search, {"type": "object", "properties": {"query": {"type": "string"}}}))
+    agent.self_recovery = SelfRecoveryController(executor=agent.executor, hooks=agent.hooks, session_id=agent.session_id)
+    agent.self_recovery._can_retry_exactly = lambda tool_name, arguments: tool_name == "fake_flaky_search"
+    result = agent.chat("search with transient failure")
+    if result["content"] != "自己重試後好了":
+        raise AssertionError(result)
+    if attempts["count"] != 2:
+        raise AssertionError(f"expected one automatic retry, got {attempts['count']}")
+    tool_messages = [message.get("content", "") for message in agent.memory if message.get("role") == "tool"]
+    if not any("transient_retry" in content and "recovered_from" in content for content in tool_messages):
+        raise AssertionError(tool_messages)
+    return result["content"]
+
+
+def self_recovery_does_not_retry_unsafe_python():
+    attempts = {"count": 0}
+
+    def unsafe_python(code: str):
+        attempts["count"] += 1
+        return core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+
+    agent = CompanionAgent(PlainReplyAdapter("unused"), "system self test", os.path.join(core_tools.HISTORY_DIR, "unsafe_recovery_test.json"))
+    agent.add_tool(core_tools.AgentTool("execute_python", "fake python", unsafe_python, {"type": "object", "properties": {"code": {"type": "string"}}}, True))
+    original = core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+    recovered, evidence = agent.self_recovery.recover("execute_python", {"code": "print('x')"}, original, None, response_policy_for(InteractionMode.TOOL_TASK), agent.turn_id)
+    if recovered is not original or evidence is not None:
+        raise AssertionError((recovered.to_text(), evidence))
+    if attempts["count"] != 0:
+        raise AssertionError("unsafe python should not be retried")
+    return "unsafe python was not auto-retried"
 
 
 def trace_log_records_tool_events():
@@ -1887,6 +1948,18 @@ class FakeBot:
         self.sent.append(("reply", args, kwargs))
 
 
+class FlakyTelegramBot(FakeBot):
+    def __init__(self):
+        super().__init__()
+        self.failures_left = 1
+
+    def send_message(self, *args, **kwargs):
+        if self.failures_left:
+            self.failures_left -= 1
+            raise ConnectionResetError(10054, "遠端主機已強制關閉一個現存的連線。")
+        super().send_message(*args, **kwargs)
+
+
 def fake_message(chat_id=123, message_id=1, text="", caption=""):
     return SimpleNamespace(
         chat=SimpleNamespace(id=chat_id),
@@ -1904,6 +1977,20 @@ class FakeGatewayAgent:
 
     def chat(self, prompt, tool_callback=None, response_policy=None):
         return {"content": self.content}
+
+
+def telegram_gateway_retries_transient_send_errors():
+    gateway = object.__new__(TelegramGateway)
+    gateway.bot = FlakyTelegramBot()
+    gateway.agent = FakeGatewayAgent("hello after retry")
+    gateway.turn_coalescer = None
+    gateway.send_reply_with_stickers(123, {"content": "hello after retry"}, 9)
+    messages = [item for item in gateway.bot.sent if item[0] == "message"]
+    if len(messages) != 1 or "hello after retry" not in messages[0][1]:
+        raise AssertionError(gateway.bot.sent)
+    if gateway.bot.failures_left != 0:
+        raise AssertionError("transient failure was not consumed")
+    return "telegram send retried after transient error"
 
 
 def turn_coalesces_text_and_sticker():
@@ -2889,6 +2976,8 @@ def main():
         ("single_approval_does_not_allow_unrelated_tool", single_approval_does_not_allow_unrelated_tool),
         ("turn_approval_allows_tool_chain", turn_approval_allows_tool_chain),
         ("command_cwd_failure_recovers_inside_agent_loop", command_cwd_failure_recovers_inside_agent_loop),
+        ("transient_tool_error_recovers_before_user_followup", transient_tool_error_recovers_before_user_followup),
+        ("self_recovery_does_not_retry_unsafe_python", self_recovery_does_not_retry_unsafe_python),
         ("trace_log_records_tool_events", trace_log_records_tool_events),
         ("session_brain_plain_chat_stays_idle", session_brain_plain_chat_stays_idle),
         ("session_brain_task_enters_active_task", session_brain_task_enters_active_task),
@@ -2966,6 +3055,7 @@ def main():
         ("dsml_cleaner_handles_spaced_tags", dsml_cleaner_handles_spaced_tags),
         ("fail_safe_returns_without_retry", fail_safe_returns_without_retry),
         ("turn_coalesces_text_and_sticker", turn_coalesces_text_and_sticker),
+        ("telegram_gateway_retries_transient_send_errors", telegram_gateway_retries_transient_send_errors),
         ("turn_coalesces_sticker_then_text_with_text_primary", turn_coalesces_sticker_then_text_with_text_primary),
         ("turn_sticker_only_is_social_sticker", turn_sticker_only_is_social_sticker),
         ("turn_explicit_vision_request_uses_vision_task", turn_explicit_vision_request_uses_vision_task),

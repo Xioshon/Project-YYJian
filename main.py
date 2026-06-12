@@ -192,6 +192,25 @@ def _record_render_dedupe(chat_id: int | str, kind: str, original_count: int, re
         pass
 
 
+def _looks_transient_telegram_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".casefold()
+    markers = [
+        "connectionreseterror",
+        "connection aborted",
+        "remote end closed",
+        "remotedisconnected",
+        "timed out",
+        "timeout",
+        "read timed out",
+        "temporarily unavailable",
+        "10054",
+        "502",
+        "503",
+        "504",
+    ]
+    return any(marker in text for marker in markers)
+
+
 class TelegramGateway:
     def __init__(self, token: str, agent: CompanionAgent):
         self.bot = telebot.TeleBot(token)
@@ -199,6 +218,20 @@ class TelegramGateway:
         self.agent.interactive_mode = False
         self.turn_coalescer = MessageCoalescer()
         self.register_handlers()
+
+    def _telegram_call(self, fn, *args, attempts: int = 3, **kwargs):
+        last_exc = None
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if not _looks_transient_telegram_error(exc) or attempt >= attempts:
+                    raise
+                print(f"[TG transient] {type(exc).__name__}: {exc}; retry {attempt}/{attempts - 1}")
+                time.sleep(min(0.4 * attempt, 1.2))
+        if last_exc:
+            raise last_exc
 
     def remember_chat(self, chat_id: int | str) -> None:
         with open(CHAT_ID_FILE, "w", encoding="utf-8") as file:
@@ -219,11 +252,11 @@ class TelegramGateway:
             with open(sticker_path, "rb") as file:
                 ext = os.path.splitext(sticker_path)[1].lower()
                 if ext in {".gif", ".tgs", ".webm", ".mp4"}:
-                    self.bot.send_animation(chat_id, file)
+                    self._telegram_call(self.bot.send_animation, chat_id, file)
                 elif ext == ".webp":
-                    self.bot.send_sticker(chat_id, file)
+                    self._telegram_call(self.bot.send_sticker, chat_id, file)
                 else:
-                    self.bot.send_photo(chat_id, file)
+                    self._telegram_call(self.bot.send_photo, chat_id, file)
             DEFAULT_SOCIAL_STICKER_INDEX.mark_used(os.path.basename(sticker_path))
             DEFAULT_SOCIAL_SESSION_MANAGER.mark_sticker_sent(chat_id, os.path.basename(sticker_path))
             return True
@@ -247,13 +280,13 @@ class TelegramGateway:
         if clean_text:
             parts = [part.strip() for part in re.split(r"(?<=[。！？!?~\n])\s*", clean_text) if part.strip()]
             for part in parts or [clean_text]:
-                self.bot.send_chat_action(chat_id, "typing")
+                self._telegram_call(self.bot.send_chat_action, chat_id, "typing")
                 time.sleep(max(0.2, min(1.5, len(part) * 0.04)))
                 if reply_to_message_id:
-                    self.bot.send_message(chat_id, part, reply_to_message_id=reply_to_message_id)
+                    self._telegram_call(self.bot.send_message, chat_id, part, reply_to_message_id=reply_to_message_id)
                     reply_to_message_id = None
                 else:
-                    self.bot.send_message(chat_id, part)
+                    self._telegram_call(self.bot.send_message, chat_id, part)
 
         for sticker_name in stickers:
             self._send_sticker_asset(chat_id, sticker_name)
@@ -263,7 +296,7 @@ class TelegramGateway:
             if os.path.exists(path):
                 try:
                     with open(path, "rb") as file:
-                        self.bot.send_photo(chat_id, file, caption="最後畫面截圖")
+                        self._telegram_call(self.bot.send_photo, chat_id, file, caption="最後畫面截圖")
                 except Exception as exc:
                     print(f"[TG warning] screenshot send failed: {exc}")
     def _tool_notifier_for(self, message):
@@ -282,10 +315,10 @@ class TelegramGateway:
             }
             try:
                 if state == "start":
-                    self.bot.send_message(message.chat.id, f"_{html.escape(labels.get(tool_name, '正在調用工具: ' + tool_name))}_", parse_mode="Markdown")
-                    self.bot.send_chat_action(message.chat.id, "typing")
+                    self._telegram_call(self.bot.send_message, message.chat.id, f"_{html.escape(labels.get(tool_name, '正在調用工具: ' + tool_name))}_", parse_mode="Markdown")
+                    self._telegram_call(self.bot.send_chat_action, message.chat.id, "typing")
                 elif state == "end" and result and getattr(result, "status", "") == "error":
-                    self.bot.send_message(message.chat.id, f"`{tool_name}` 失敗：{html.escape(getattr(result, 'error', '') or getattr(result, 'message', ''))[:800]}", parse_mode="Markdown")
+                    self._telegram_call(self.bot.send_message, message.chat.id, f"`{tool_name}` 失敗：{html.escape(getattr(result, 'error', '') or getattr(result, 'message', ''))[:800]}", parse_mode="Markdown")
             except Exception:
                 pass
 
@@ -296,7 +329,7 @@ class TelegramGateway:
         if not ack:
             return
         try:
-            self.bot.send_message(message.chat.id, ack, reply_to_message_id=message.message_id)
+            self._telegram_call(self.bot.send_message, message.chat.id, ack, reply_to_message_id=message.message_id)
         except Exception:
             pass
 
