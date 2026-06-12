@@ -260,12 +260,16 @@ def _looks_like_task_followup(text: str) -> bool:
         "\u8dd1\u5427",
         "\u767c\u7d66\u6211",
         "\u50b3\u7d66\u6211",
+        "\u5206\u6790\u4e00\u4e0b",
+        "\u770b\u4e00\u4e0b",
+        "\u770b\u770b",
         "\u622a\u5716\u5462",
         "\u5716\u5462",
         "continue",
         "result",
         "again",
         "retry",
+        "analyze",
     ]
     return bool(text) and len(text) <= 120 and _contains_any(text, markers)
 

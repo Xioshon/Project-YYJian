@@ -275,6 +275,84 @@ def task_result_followup_uses_last_outcome_without_replanning():
     return "result follow-up used stored tool outcome"
 
 
+class NoReplanAdapter:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        raise AssertionError("outcome continuation should not call LLM")
+
+
+def _agent_with_last_artifact(filename: str = "outcome_artifact.png"):
+    artifact = os.path.join(core_tools.PROJECT_CACHE_DIR, filename)
+    with open(artifact, "wb") as file:
+        file.write(b"\x89PNG\r\n\x1a\n")
+    agent = CompanionAgent(NoReplanAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, f"{filename}.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.session_brain.state.state = "awaiting_validation"
+    agent.session_brain.state.pending_validation = ["verify tool results: execute_python"]
+    agent.session_brain.state.last_tool = "execute_python"
+    agent.session_brain.state.last_tool_status = "ok"
+    agent.session_brain.state.last_tool_summary = "execute_python: ok - Python completed.\nstdout:\nmade a screenshot"
+    agent.session_brain.state.last_artifacts = [artifact]
+    return agent, artifact
+
+
+def outcome_send_artifact_uses_stored_artifact_without_replanning():
+    agent, artifact = _agent_with_last_artifact("send_me_artifact.png")
+
+    def fake_send_telegram_media(file_path, caption=""):
+        if os.path.abspath(file_path) != os.path.abspath(artifact):
+            raise AssertionError(file_path)
+        return core_tools.ToolResult("ok", "fake media sent", data={"file": file_path})
+
+    agent.add_tool(core_tools.AgentTool("send_telegram_media", "fake send", fake_send_telegram_media, {"type": "object", "properties": {}}))
+    result = agent.chat("發給我", response_policy=response_policy_for(InteractionMode.CHAT))
+    if "發給你" not in result["content"] or "send_me_artifact.png" not in result["content"]:
+        raise AssertionError(result)
+    if agent.llm.calls:
+        raise AssertionError("send artifact should not replan")
+    return "stored artifact sent without replanning"
+
+
+def outcome_analyze_artifact_uses_stored_artifact_without_replanning():
+    agent, artifact = _agent_with_last_artifact("analyze_me_artifact.png")
+
+    def fake_analyze_media(file_path, prompt=""):
+        if os.path.abspath(file_path) != os.path.abspath(artifact):
+            raise AssertionError(file_path)
+        return core_tools.ToolResult("ok", "fake analysis complete", data={"summary": "這是一張測試截圖。"})
+
+    agent.add_tool(core_tools.AgentTool("analyze_media", "fake analyze", fake_analyze_media, {"type": "object", "properties": {}}))
+    result = agent.chat("分析一下", response_policy=response_policy_for(InteractionMode.CHAT))
+    if "測試截圖" not in result["content"]:
+        raise AssertionError(result)
+    if agent.llm.calls:
+        raise AssertionError("analyze artifact should not replan")
+    return "stored artifact analyzed without replanning"
+
+
+def outcome_action_without_artifact_is_clear():
+    agent = CompanionAgent(NoReplanAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "no_artifact.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.session_brain.state.state = "awaiting_validation"
+    agent.session_brain.state.last_tool = "execute_python"
+    agent.session_brain.state.last_tool_status = "ok"
+    agent.session_brain.state.last_artifacts = []
+    agent.session_brain.state.pending_validation = ["verify tool results: execute_python"]
+    result = agent.chat("發給我", response_policy=response_policy_for(InteractionMode.CHAT))
+    if "沒有找到可用的產物" not in result["content"]:
+        raise AssertionError(result)
+    if agent.llm.calls:
+        raise AssertionError("missing artifact should not replan")
+    return "missing artifact continuation was clear"
+
+
 class WrongToolAfterApprovalAdapter:
     def __init__(self):
         self.calls = 0
@@ -2633,6 +2711,9 @@ def main():
         ("permission_followup_allows_exact_tool", permission_followup_allows_exact_tool),
         ("permission_replay_bypasses_chat_route_policy", permission_replay_bypasses_chat_route_policy),
         ("task_result_followup_uses_last_outcome_without_replanning", task_result_followup_uses_last_outcome_without_replanning),
+        ("outcome_send_artifact_uses_stored_artifact_without_replanning", outcome_send_artifact_uses_stored_artifact_without_replanning),
+        ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),
+        ("outcome_action_without_artifact_is_clear", outcome_action_without_artifact_is_clear),
         ("single_approval_does_not_allow_unrelated_tool", single_approval_does_not_allow_unrelated_tool),
         ("turn_approval_allows_tool_chain", turn_approval_allows_tool_chain),
         ("command_cwd_failure_recovers_inside_agent_loop", command_cwd_failure_recovers_inside_agent_loop),

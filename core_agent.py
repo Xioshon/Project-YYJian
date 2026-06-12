@@ -116,6 +116,19 @@ def _is_result_followup(text: str) -> bool:
     return bool(normalized) and len(normalized) <= 120 and any(marker.casefold() in normalized for marker in markers)
 
 
+def _outcome_action(text: str) -> str:
+    normalized = (text or "").strip().casefold()
+    if not normalized or len(normalized) > 140:
+        return ""
+    if any(marker in normalized for marker in ["\u767c\u7d66\u6211", "\u50b3\u7d66\u6211", "\u4e0a\u50b3\u7d66\u6211", "\u767c\u5716", "\u50b3\u5716", "send it", "send file"]):
+        return "send_artifact"
+    if any(marker in normalized for marker in ["\u5206\u6790\u4e00\u4e0b", "\u5206\u6790\u4e0b", "\u9019\u662f\u4ec0\u9ebc", "analyze it"]):
+        return "analyze_artifact"
+    if any(marker in normalized for marker in ["\u7e7c\u7e8c", "\u4e0b\u4e00\u6b65", "\u8dd1\u5427", "continue", "next step"]):
+        return "continue_task"
+    return ""
+
+
 def _format_last_outcome_reply(brain: SessionBrain) -> str:
     state = brain.state
     if not state.last_tool:
@@ -129,6 +142,16 @@ def _format_last_outcome_reply(brain: SessionBrain) -> str:
     if state.pending_validation:
         lines.append("目前還在等待後續確認：" + " | ".join(state.pending_validation[-3:]))
     return "\n".join(lines)
+
+
+def _artifact_for_action(brain: SessionBrain) -> str:
+    for artifact in brain.state.last_artifacts:
+        try:
+            if os.path.exists(artifact) and is_workspace_path(artifact):
+                return artifact
+        except Exception:
+            continue
+    return ""
 
 
 def _worker_context(items: list[dict[str, Any]]) -> str:
@@ -657,6 +680,73 @@ class CompanionAgent:
             return recovered, recovery
         return result, recovery
 
+    def _handle_outcome_action(self, action: str, user_input: str, tool_callback: Callable | None) -> dict[str, str] | None:
+        artifact = _artifact_for_action(self.session_brain)
+        if action in {"send_artifact", "analyze_artifact"} and not artifact:
+            final_reply = "剛剛沒有找到可用的產物檔案喵。你要我重新截圖或重跑剛剛的步驟，可以直接說「重試」。"
+            self.memory.append({"role": "user", "content": user_input})
+            self.memory.append({"role": "assistant", "content": final_reply})
+            self._remember_turn_summary(user_input, final_reply)
+            self.hooks.emit("Stop", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
+            self._save_history()
+            return {"content": final_reply, "reasoning": ""}
+
+        if action == "send_artifact":
+            args = {"file_path": artifact, "caption": "剛剛的結果喵"}
+            result = self.executor.execute("send_telegram_media", args, tool_callback, None)
+            verification, replay_case = self._after_tool_result("send_telegram_media", args, result)
+            if result.status == "ok":
+                final_reply = f"發給你啦喵：{os.path.basename(artifact)}"
+            elif replay_case:
+                final_reply = f"`send_telegram_media` 重複卡住，我先停下來了。Replay case: {replay_case.get('name')}"
+            elif result.requires_permission:
+                self.session_brain.mark_permission_needed("send_telegram_media", self.turn_id, self.session_id)
+                final_reply = f"發送這個檔案需要你確認一下：{os.path.basename(artifact)}"
+            else:
+                final_reply = f"我想發給你，但發送失敗了：{result.message}"
+                if result.error:
+                    final_reply += f"\n{result.error[:800]}"
+            self.memory.append({"role": "user", "content": user_input})
+            self.memory.append({"role": "assistant", "content": final_reply})
+            self._remember_turn_summary(user_input, final_reply)
+            self.hooks.emit("Stop", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160], verification_status=verification.status)
+            self._save_history()
+            return {"content": final_reply, "reasoning": ""}
+
+        if action == "analyze_artifact":
+            args = {"file_path": artifact, "prompt": "用繁體中文簡短分析這張圖片或截圖，先說重點。"}
+            result = self.executor.execute("analyze_media", args, tool_callback, ResponsePolicy(max_tool_iterations=1, allow_vision=True, route="artifact_analysis"))
+            verification, replay_case = self._after_tool_result("analyze_media", args, result)
+            if result.status == "ok":
+                summary = result.data.get("summary") if isinstance(result.data, dict) else ""
+                final_reply = f"我看完啦喵。\n{summary or result.message}"
+            elif replay_case:
+                final_reply = f"`analyze_media` 重複卡住，我先停下來了。Replay case: {replay_case.get('name')}"
+            else:
+                final_reply = f"我想分析剛剛的產物，但失敗了：{result.message}"
+                if result.error:
+                    final_reply += f"\n{result.error[:800]}"
+            self.memory.append({"role": "user", "content": user_input})
+            self.memory.append({"role": "assistant", "content": final_reply})
+            self._remember_turn_summary(user_input, final_reply)
+            self.hooks.emit("Stop", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160], verification_status=verification.status)
+            self._save_history()
+            return {"content": final_reply, "reasoning": ""}
+
+        if action == "continue_task":
+            final_reply = _format_last_outcome_reply(self.session_brain)
+            if self.session_brain.state.verification_plan:
+                final_reply += "\n下一步我會按這個驗證方向走：\n" + "\n".join(self.session_brain.state.verification_plan[-4:])
+            else:
+                final_reply += "\n目前沒有明確下一步。你可以說「發給我」「分析一下」或直接補一句新目標。"
+            self.memory.append({"role": "user", "content": user_input})
+            self.memory.append({"role": "assistant", "content": final_reply})
+            self._remember_turn_summary(user_input, final_reply)
+            self.hooks.emit("Stop", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
+            self._save_history()
+            return {"content": final_reply, "reasoning": ""}
+        return None
+
     def chat(self, user_input: str, tool_callback: Callable | None = None, response_policy: ResponsePolicy | None = None) -> dict[str, str]:
         response_policy = response_policy or ResponsePolicy()
         self.executor.interactive_mode = self.interactive_mode
@@ -672,6 +762,11 @@ class CompanionAgent:
             self.transactions.start_or_resume(user_input, self.session_id, self.turn_id)
             self._plan_turn_if_needed(user_input, turn_classification)
         self.hooks.emit("UserMessage", session_id=self.session_id, turn_id=self.turn_id, grant=grant, interactive_mode=self.interactive_mode, pending=bool(self.permission_manager.pending))
+        outcome_action = _outcome_action(user_input) if grant == "none" and turn_classification.intent == "task_continuation" else ""
+        if outcome_action:
+            handled = self._handle_outcome_action(outcome_action, user_input, tool_callback)
+            if handled is not None:
+                return handled
         if grant == "none" and turn_classification.intent == "task_continuation" and _is_result_followup(user_input):
             final_reply = _format_last_outcome_reply(self.session_brain)
             reply_decision = self.hooks.emit("BeforeReply", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
