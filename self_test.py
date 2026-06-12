@@ -273,6 +273,24 @@ def permission_replay_lives_in_controller_not_core_loop():
     return "permission replay flow isolated in controller"
 
 
+def tool_loop_lives_in_controller_not_core_loop():
+    import inspect
+    import core_agent as core_agent_module
+    from agent_tool_loop import ToolLoopController
+
+    chat_source = inspect.getsource(core_agent_module.CompanionAgent.chat)
+    controller_source = inspect.getsource(ToolLoopController)
+    forbidden = ["llm.chat_with_tools", "tool_call_counts", "Repeated tool call stopped", "failsafe"]
+    leaked = [marker for marker in forbidden if marker in chat_source]
+    if leaked:
+        raise AssertionError(f"tool loop leaked back into CompanionAgent.chat: {leaked}")
+    required = ["llm.chat_with_tools", "tool_call_counts", "Repeated tool call stopped", "failsafe"]
+    missing = [marker for marker in required if marker not in controller_source]
+    if missing:
+        raise AssertionError(f"tool loop controller missing responsibilities: {missing}")
+    return "tool loop flow isolated in controller"
+
+
 def task_result_followup_uses_last_outcome_without_replanning():
     agent = CompanionAgent(PermissionReplayPythonAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "task_result_followup_test.json"))
     agent.interactive_mode = False
@@ -2809,6 +2827,7 @@ def main():
         ("permission_followup_allows_exact_tool", permission_followup_allows_exact_tool),
         ("permission_replay_bypasses_chat_route_policy", permission_replay_bypasses_chat_route_policy),
         ("permission_replay_lives_in_controller_not_core_loop", permission_replay_lives_in_controller_not_core_loop),
+        ("tool_loop_lives_in_controller_not_core_loop", tool_loop_lives_in_controller_not_core_loop),
         ("task_result_followup_uses_last_outcome_without_replanning", task_result_followup_uses_last_outcome_without_replanning),
         ("outcome_send_artifact_uses_stored_artifact_without_replanning", outcome_send_artifact_uses_stored_artifact_without_replanning),
         ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),

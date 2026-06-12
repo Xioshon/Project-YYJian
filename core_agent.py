@@ -18,6 +18,7 @@ from agent_protocol import EMPTY_REPLY_FALLBACK, FAIL_SAFE_REPLY, TOOL_LOOP_TIME
 from agent_replay import record_failure_replay
 from agent_session import SessionBrain
 from agent_task_graph import TaskGraphManager
+from agent_tool_loop import ToolLoopController
 from agent_transactions import TaskTransactionManager
 from agent_worker import WorkerQueue
 from core_tools import AgentTool, API_KEY, PROJECT_CACHE_DIR, ROOT_DIR, ToolResult, is_workspace_path, resolve_path
@@ -48,14 +49,6 @@ def _worker_context(items: list[dict[str, Any]]) -> str:
     for item in items[-5:]:
         lines.append(f"{item.get('step_id', 'step')} worker={item.get('status', 'unknown')} job={item.get('job_id', '')}")
     return "\n".join(lines)
-
-
-def _tool_signature(tool_name: str, arguments: dict[str, Any]) -> str:
-    try:
-        encoded = json.dumps(arguments or {}, ensure_ascii=False, sort_keys=True, default=str)
-    except Exception:
-        encoded = str(arguments or {})
-    return f"{tool_name}:{encoded[:1200]}"
 
 
 class SiliconFlowAdapter:
@@ -494,6 +487,27 @@ class CompanionAgent:
         self.permission_manager.reset_after_turn()
         self.always_allow_tools = False
 
+    def _tool_loop_controller(self, response_policy: ResponsePolicy) -> ToolLoopController:
+        return ToolLoopController(
+            llm=self.llm,
+            registry=self.registry,
+            executor=self.executor,
+            hooks=self.hooks,
+            session_brain=self.session_brain,
+            task_graphs=self.task_graphs,
+            permission_manager=self.permission_manager,
+            response_policy=response_policy,
+            clean_output=clean_assistant_output,
+            recover_tool_result=self._recover_tool_result,
+            after_tool_result=self._after_tool_result,
+            capture_screen=_capture_screen,
+            remember_turn_summary=self._remember_turn_summary,
+            save_history=self._save_history,
+            reset_turn_state=self._reset_after_deterministic_turn,
+            session_id=self.session_id,
+            turn_id=self.turn_id,
+        )
+
     def _outcome_controller(self) -> OutcomeController:
         return OutcomeController(
             session_brain=self.session_brain,
@@ -664,134 +678,5 @@ class CompanionAgent:
             user_input += f"\n\n[WorkerEvidence]\n{worker_context}"
 
         self.memory.append({"role": "user", "content": user_input})
-        total_reasoning = ""
-        max_iterations = response_policy.max_tool_iterations
-        successful_tools: list[str] = []
-        tool_call_counts: dict[str, int] = {}
-
-        for _ in range(max_iterations):
-            response = self.llm.chat_with_tools(self.memory, self.registry.list())
-            self.hooks.emit("llm.response", session_id=self.session_id, turn_id=self.turn_id, has_tool_calls=bool(response.get("tool_calls")), content_preview=(response.get("content") or "")[:160])
-            if response.get("reasoning"):
-                total_reasoning += response["reasoning"] + "\n\n"
-
-            tool_calls = response.get("tool_calls") or []
-            if tool_calls:
-                self.memory.append(
-                    {
-                        "role": "assistant",
-                        "content": response.get("content") or "",
-                        "tool_calls": [
-                            {
-                                "id": call["id"],
-                                "type": "function",
-                                "function": {"name": call["name"], "arguments": call.get("raw_arguments", json.dumps(call.get("arguments", {}), ensure_ascii=False))},
-                            }
-                            for call in tool_calls
-                        ],
-                    }
-                )
-                for call in tool_calls:
-                    signature = _tool_signature(call["name"], call.get("arguments", {}))
-                    tool_call_counts[signature] = tool_call_counts.get(signature, 0) + 1
-                    if tool_call_counts[signature] > max(1, response_policy.max_repeated_tool_calls):
-                        repeated_result = ToolResult("error", f"Repeated tool call stopped by {response_policy.route} loop controller.", error="repeated_tool_call")
-                        replay_case = record_failure_replay(
-                            call["name"],
-                            call.get("arguments", {}),
-                            repeated_result,
-                            session_id=self.session_id,
-                            turn_id=self.turn_id,
-                            count=tool_call_counts[signature],
-                        )
-                        self.task_graphs.mark_blocked(
-                            "repeated tool call stopped",
-                            self.session_id,
-                            self.turn_id,
-                            tool_name=call["name"],
-                            arguments=call.get("arguments", {}),
-                            result=repeated_result,
-                        )
-                        final_reply = f"主人，我發現 `{call['name']}` 在同一輪重複卡住，所以先停下來了。Replay case: {replay_case.get('name')}"
-                        self.memory.append({"role": "assistant", "content": final_reply})
-                        self.permission_manager.reset_after_turn()
-                        self.always_allow_tools = False
-                        self.hooks.emit("StopFailure", session_id=self.session_id, turn_id=self.turn_id, tool=call["name"], replay_case=replay_case.get("name"), reason="repeated_tool_call")
-                        self._remember_turn_summary(user_input, final_reply)
-                        self._save_history()
-                        return {"content": final_reply, "reasoning": total_reasoning.strip()}
-                    result = self.executor.execute(call["name"], call.get("arguments", {}), tool_callback, response_policy)
-                    result, recovery = self._recover_tool_result(call["name"], call.get("arguments", {}), result, tool_callback, response_policy)
-                    verification, replay_case = self._after_tool_result(call["name"], call.get("arguments", {}), result)
-                    result_text = result.to_text()[:4000]
-                    if "fail-safe" in result_text.casefold() or "failsafe" in result_text.casefold():
-                        screen = _capture_screen()
-                        tag = f" [系統截圖: {screen}]" if screen else ""
-                        result_text = ToolResult("error", f"Fail-safe triggered. Stop all actions immediately.{tag}").to_text()
-                        self.always_allow_tools = False
-                        self.memory.append({"role": "tool", "tool_call_id": call["id"], "name": call["name"], "content": result_text})
-                        final_reply = f"主人，我遇到 fail-safe，已立刻停止所有操作。{tag}"
-                        self.memory.append({"role": "assistant", "content": final_reply})
-                        self._remember_turn_summary(user_input, final_reply)
-                        self._save_history()
-                        return {"content": final_reply, "reasoning": total_reasoning.strip()}
-                    self.memory.append({"role": "tool", "tool_call_id": call["id"], "name": call["name"], "content": result_text})
-                    if replay_case:
-                        final_reply = (
-                            f"`{call['name']}` failed repeatedly, so I stopped this loop and saved a replay case: "
-                            f"{replay_case.get('name')}. Trace: {TRACE_LOG_FILE}"
-                        )
-                        self.memory.append({"role": "assistant", "content": final_reply})
-                        self.permission_manager.reset_after_turn()
-                        self.always_allow_tools = False
-                        self.hooks.emit("StopFailure", session_id=self.session_id, turn_id=self.turn_id, tool=call["name"], replay_case=replay_case.get("name"))
-                        self._remember_turn_summary(user_input, final_reply)
-                        self._save_history()
-                        return {"content": final_reply, "reasoning": total_reasoning.strip()}
-                    if result.status == "blocked":
-                        if result.requires_permission:
-                            self.session_brain.mark_permission_needed(call["name"], self.turn_id, self.session_id)
-                        else:
-                            final_reply = f"這一步我先停住：`{call['name']}` 不是現在最合適的下一步。{result.message}"
-                            self.memory.append({"role": "assistant", "content": final_reply})
-                            self.permission_manager.reset_after_turn()
-                            self.always_allow_tools = False
-                            self.hooks.emit("StopFailure", session_id=self.session_id, turn_id=self.turn_id, tool=call["name"], reason="route_policy_block")
-                            self._remember_turn_summary(user_input, final_reply)
-                            self._save_history()
-                            return {"content": final_reply, "reasoning": total_reasoning.strip()}
-                        break
-                    if result.status == "ok":
-                        successful_tools.append(call["name"])
-                continue
-
-            final_reply = clean_assistant_output(response.get("content", ""))
-            if not final_reply:
-                final_reply = "主人，我已經處理完了。"
-            reply_decision = self.hooks.emit("BeforeReply", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
-            if reply_decision.annotate:
-                final_reply += reply_decision.annotate
-            self.memory.append({"role": "assistant", "content": final_reply})
-            self._remember_turn_summary(user_input, final_reply)
-            self.hooks.emit("Stop", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
-            if successful_tools:
-                self.session_brain.mark_validation_needed(
-                    "verify tool results: " + ", ".join(successful_tools[-5:]),
-                    self.turn_id,
-                    self.session_id,
-                    evidence=successful_tools[-5:],
-                )
-            self.permission_manager.reset_after_turn()
-            self.always_allow_tools = False
-            self._save_history()
-            if successful_tools:
-                self.task_graphs.mark_completed(self.session_id, self.turn_id)
-            return {"content": final_reply, "reasoning": total_reasoning.strip()}
-
-        self.always_allow_tools = False
-        timeout_msg = "主人，我卡在工具迴圈裡了，已停止本輪操作。這次不再繼續重試，避免把同一個工具刷屏。"
-        self.memory.append({"role": "assistant", "content": timeout_msg})
-        self._remember_turn_summary(user_input, timeout_msg)
-        self._save_history()
-        return {"content": timeout_msg, "reasoning": total_reasoning.strip()}
+        return self._tool_loop_controller(response_policy).run(self.memory, user_input, tool_callback).to_chat_result()
 
