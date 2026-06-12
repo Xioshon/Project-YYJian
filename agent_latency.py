@@ -65,23 +65,33 @@ class MediaCacheEntry:
 
 
 VISION_INTENT_MARKERS = [
-    "\u770b\u5716",
-    "\u5206\u6790",
-    "\u8b58\u5225",
-    "\u9019\u662f\u4ec0\u9ebc",
-    "\u662f\u4ec0\u9ebc",
-    "\u5e6b\u6211\u770b",
-    "\u770b\u770b",
+    "看圖",
+    "看图",
+    "分析",
+    "識別",
+    "识别",
+    "這是什麼",
+    "这是什么",
+    "是什麼",
+    "是什么",
+    "幫我看",
+    "帮我看",
+    "看看",
     "analyze",
     "what is this",
     "describe",
 ]
 
 TOOL_INTENT_MARKERS = [
-    "\u57f7\u884c",
-    "\u4fee",
-    "\u6e2c\u8a66",
-    "\u627e bug",
+    "執行",
+    "执行",
+    "修",
+    "測試",
+    "测试",
+    "找 bug",
+    "跑一下",
+    "檢查",
+    "检查",
     "run",
     "execute",
     "debug",
@@ -91,24 +101,49 @@ TOOL_INTENT_MARKERS = [
 SCREEN_OBSERVE_MARKERS = [
     "截圖",
     "截图",
+    "截屏",
     "螢幕",
     "屏幕",
     "畫面",
     "画面",
+    "看狀態",
+    "看状态",
     "看看狀態",
     "看看状态",
     "看一下狀態",
     "看一下状态",
+    "看一下螢幕",
+    "看一下屏幕",
+    "電腦屏幕",
+    "电脑屏幕",
+    "電腦螢幕",
+    "电脑螢幕",
     "screen",
     "screenshot",
 ]
 
 QUICK_ACKS = {
-    InteractionMode.VISION_TASK: "\u6211\u5148\u770b\u4e00\u4e0b\uff5e",
-    InteractionMode.TOOL_TASK: "\u6211\u5148\u8655\u7406\u4e00\u4e0b\uff5e",
-    InteractionMode.SOCIAL_STICKER: "\u6536\u5230\uff5e",
+    InteractionMode.VISION_TASK: "我先看一下～",
+    InteractionMode.TOOL_TASK: "我先處理一下～",
+    InteractionMode.SOCIAL_STICKER: "收到～",
     InteractionMode.SCREEN_OBSERVE: "我看一下畫面～",
 }
+
+CHAT_SAFE_TOOLS = ["search_sticker", "send_telegram_media", "search_knowledge", "read_knowledge"]
+SOCIAL_STICKER_TOOLS = ["search_sticker", "send_telegram_media"]
+VISION_TOOLS = ["analyze_media", "read_file", "search_sticker", "send_telegram_media"]
+SCREEN_OBSERVE_TOOLS = [
+    "get_screen_ui",
+    "read_file",
+    "list_files",
+    "search_in_files",
+    "search_knowledge",
+    "read_knowledge",
+    "search_sticker",
+    "send_telegram_media",
+    "execute_command",
+    "execute_python",
+]
 
 
 def classify_interaction(text: str = "", has_media: bool = False, media_kind: str = "") -> InteractionMode:
@@ -126,13 +161,31 @@ def classify_interaction(text: str = "", has_media: bool = False, media_kind: st
     return InteractionMode.CHAT
 
 
+def policy_for_semantic_intent(intent: str, fallback: ResponsePolicy | None = None) -> ResponsePolicy:
+    """Map natural turn intent to a tool budget without exposing modes to users."""
+    normalized = (intent or "").casefold()
+    if fallback is not None and fallback.route not in {"", "chat"}:
+        return fallback
+    if normalized in {"permission_reply", "permission_granted", "task_continuation", "task_followup"}:
+        return ResponsePolicy(max_tool_iterations=12, allow_vision=True, allow_sticker=True, progress_style="normal", route="task_continuation")
+    if normalized in {"task", "tool_task", "active_task"}:
+        return ResponsePolicy(max_tool_iterations=25, allow_vision=True, allow_sticker=True, progress_style="normal", route="tool_task")
+    if normalized in {"screen_observe", "screen"}:
+        return response_policy_for(InteractionMode.SCREEN_OBSERVE)
+    if normalized in {"vision_task", "vision"}:
+        return response_policy_for(InteractionMode.VISION_TASK)
+    if fallback is not None:
+        return fallback
+    return response_policy_for(InteractionMode.CHAT)
+
+
 def response_policy_for(mode: InteractionMode) -> ResponsePolicy:
     if mode == InteractionMode.CHAT:
-        return ResponsePolicy(max_tool_iterations=2, allow_vision=False, allow_sticker=True, progress_style="quiet", route=mode.value, allowed_tools=[])
+        return ResponsePolicy(max_tool_iterations=2, allow_vision=False, allow_sticker=True, progress_style="quiet", route=mode.value, allowed_tools=CHAT_SAFE_TOOLS)
     if mode == InteractionMode.SOCIAL_STICKER:
-        return ResponsePolicy(max_tool_iterations=2, allow_vision=False, allow_sticker=True, progress_style="quiet", route=mode.value, allowed_tools=["search_sticker", "send_telegram_media"])
+        return ResponsePolicy(max_tool_iterations=2, allow_vision=False, allow_sticker=True, progress_style="quiet", route=mode.value, allowed_tools=SOCIAL_STICKER_TOOLS)
     if mode == InteractionMode.VISION_TASK:
-        return ResponsePolicy(max_tool_iterations=8, allow_vision=True, allow_sticker=True, progress_style="quick_ack", route=mode.value, allowed_tools=["analyze_media", "read_file", "search_sticker"])
+        return ResponsePolicy(max_tool_iterations=8, allow_vision=True, allow_sticker=True, progress_style="quick_ack", route=mode.value, allowed_tools=VISION_TOOLS)
     if mode == InteractionMode.SCREEN_OBSERVE:
         return ResponsePolicy(
             max_tool_iterations=6,
@@ -140,18 +193,7 @@ def response_policy_for(mode: InteractionMode) -> ResponsePolicy:
             allow_sticker=True,
             progress_style="quick_ack",
             route=mode.value,
-            allowed_tools=[
-                "get_screen_ui",
-                "read_file",
-                "list_files",
-                "search_in_files",
-                "search_knowledge",
-                "read_knowledge",
-                "search_sticker",
-                "send_telegram_media",
-                "execute_command",
-                "execute_python",
-            ],
+            allowed_tools=SCREEN_OBSERVE_TOOLS,
             max_repeated_tool_calls=1,
         )
     return ResponsePolicy(max_tool_iterations=25, allow_vision=True, allow_sticker=True, progress_style="normal", route=mode.value)

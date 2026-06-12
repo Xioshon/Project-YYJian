@@ -15,6 +15,7 @@ from agent_latency import (
     InteractionMode,
     classify_interaction,
     media_type_for,
+    policy_for_semantic_intent,
     quick_ack_for,
     response_policy_for,
 )
@@ -1564,6 +1565,10 @@ def latency_policy_classifies_modes():
         raise AssertionError("plain chat should be chat")
     if classify_interaction("可以幫我截取電腦螢幕的畫面嗎", False) != InteractionMode.SCREEN_OBSERVE:
         raise AssertionError("screen requests should be screen_observe")
+    if classify_interaction("可以幫我截圖看看現在什麼狀態嗎", False) != InteractionMode.SCREEN_OBSERVE:
+        raise AssertionError("traditional Chinese screenshot request should be screen_observe")
+    if classify_interaction("幫我看一下屏幕", False) != InteractionMode.SCREEN_OBSERVE:
+        raise AssertionError("simplified Chinese screen request should be screen_observe")
     if classify_interaction("", True, "sticker") != InteractionMode.SOCIAL_STICKER:
         raise AssertionError("plain sticker should be social_sticker")
     if classify_interaction("幫我看圖", True, "photo") != InteractionMode.VISION_TASK:
@@ -1579,11 +1584,24 @@ def chat_policy_blocks_vision_tool():
         agent.add_tool(tool)
     result = agent.chat("plain chat", response_policy=response_policy_for(InteractionMode.CHAT))
     tool_messages = [m for m in agent.memory if m.get("role") == "tool"]
-    if not any("vision_disabled" in m.get("content", "") or "不適合在現在這種回覆節奏" in m.get("content", "") for m in tool_messages):
+    if not any("vision_disabled" in m.get("content", "") or "不是現在最合適的下一步" in m.get("content", "") for m in tool_messages):
         raise AssertionError(agent.memory)
-    if "analyze_media" not in result["content"] or "回覆節奏" not in result["content"]:
+    if "analyze_media" not in result["content"] or "route policy" in result["content"] or "回覆節奏" in result["content"]:
         raise AssertionError(result)
     return result["content"]
+
+
+def semantic_intent_upgrades_chat_policy_without_user_modes():
+    chat_policy = response_policy_for(InteractionMode.CHAT)
+    upgraded = policy_for_semantic_intent("task_continuation", chat_policy)
+    if upgraded.route != "task_continuation" or upgraded.max_tool_iterations <= chat_policy.max_tool_iterations:
+        raise AssertionError(upgraded)
+    if upgraded.allowed_tools is not None:
+        raise AssertionError("task continuation should not inherit chat allowed_tools")
+    screen = policy_for_semantic_intent("screen_observe", chat_policy)
+    if "get_screen_ui" not in (screen.allowed_tools or []):
+        raise AssertionError(screen)
+    return "semantic intent maps to internal policy"
 
 
 def safe_verifier_command_runs_in_screen_observe_route():
@@ -1715,7 +1733,7 @@ def screen_observe_policy_blocks_unrelated_vision_tool():
     for tool in core_tools.ALL_TOOLS:
         agent.add_tool(tool)
     result = agent.chat("幫我截圖看看狀態", response_policy=response_policy_for(InteractionMode.SCREEN_OBSERVE))
-    if "回覆節奏" not in result["content"] or "analyze_media" not in result["content"]:
+    if "analyze_media" not in result["content"] or "route policy" in result["content"] or "回覆節奏" in result["content"]:
         raise AssertionError(result)
     return result["content"]
 
@@ -2829,6 +2847,7 @@ def main():
         ("session_brain_validation_includes_plan_and_clears_it", session_brain_validation_includes_plan_and_clears_it),
         ("latency_policy_classifies_modes", latency_policy_classifies_modes),
         ("chat_policy_blocks_vision_tool", chat_policy_blocks_vision_tool),
+        ("semantic_intent_upgrades_chat_policy_without_user_modes", semantic_intent_upgrades_chat_policy_without_user_modes),
         ("safe_verifier_command_runs_in_screen_observe_route", safe_verifier_command_runs_in_screen_observe_route),
         ("arbitrary_command_still_requires_permission", arbitrary_command_still_requires_permission),
         ("workspace_media_send_is_low_friction_but_external_media_is_guarded", workspace_media_send_is_low_friction_but_external_media_is_guarded),

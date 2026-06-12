@@ -10,7 +10,7 @@ from openai import OpenAI
 
 from agent_hooks import DEFAULT_HOOK_MANAGER, HookDecision, HookManager, TRACE_LOG_FILE, emit_trace
 from agent_action_verification import ActionVerificationResult, verify_action
-from agent_latency import ResponsePolicy
+from agent_latency import ResponsePolicy, policy_for_semantic_intent
 from agent_planner import DEFAULT_PLANNER
 from agent_protocol import EMPTY_REPLY_FALLBACK, FAIL_SAFE_REPLY, TOOL_LOOP_TIMEOUT_REPLY, classify_approval, screenshot_tags
 from agent_replay import record_failure_replay
@@ -477,9 +477,9 @@ class ToolExecutor:
             self.hooks.emit("ToolSkippedByPolicy", session_id=self.session_id, turn_id=self.turn_id, tool=tool_name, arguments=arguments, reason="tool_not_allowed_for_route", route=policy.route)
             return ToolResult(
                 "blocked",
-                f"這一步我先停住：`{tool_name}` 不適合在現在這種回覆節奏裡直接跑。你如果是要我繼續剛剛的任務，直接說「繼續」或「可以」就好。",
+                f"這一步我先停住：`{tool_name}` 不是現在最合適的下一步。你如果是要我接著剛剛的任務，直接說「繼續」或「可以」就好。",
                 requires_permission=False,
-                data={"route": policy.route, "tool": tool_name},
+                data={"route": policy.route, "tool": tool_name, "retry_hint": "Say 繼續 to resume the active task, or describe the exact task goal."},
             )
         if policy and not policy.allow_vision and tool_name == "analyze_media":
             self.hooks.emit("ToolSkippedByPolicy", session_id=self.session_id, turn_id=self.turn_id, tool=tool_name, arguments=arguments, reason="vision_disabled")
@@ -784,8 +784,7 @@ class CompanionAgent:
         pending_before = bool(self.permission_manager.pending)
         grant = self.permission_manager.classify_user_reply(user_input, self.turn_id)
         turn_classification = self.session_brain.classify_turn(user_input, grant=grant, pending_permission=pending_before, turn_id=self.turn_id, session_id=self.session_id)
-        if not turn_classification.is_chat and response_policy.route in {"chat", ""}:
-            response_policy = ResponsePolicy(max_tool_iterations=12, allow_vision=True, allow_sticker=True, progress_style="normal", route="task_continuation")
+        response_policy = policy_for_semantic_intent(turn_classification.intent, response_policy)
         if not turn_classification.is_chat:
             self.transactions.start_or_resume(user_input, self.session_id, self.turn_id)
             self._plan_turn_if_needed(user_input, turn_classification)
@@ -964,7 +963,7 @@ class CompanionAgent:
                         if result.requires_permission:
                             self.session_brain.mark_permission_needed(call["name"], self.turn_id, self.session_id)
                         else:
-                            final_reply = f"這一步我先停住：`{call['name']}` 不適合在現在這種回覆節奏裡直接跑。{result.message}"
+                            final_reply = f"這一步我先停住：`{call['name']}` 不是現在最合適的下一步。{result.message}"
                             self.memory.append({"role": "assistant", "content": final_reply})
                             self.permission_manager.reset_after_turn()
                             self.always_allow_tools = False
