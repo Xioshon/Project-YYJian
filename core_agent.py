@@ -350,7 +350,12 @@ class ToolExecutor:
         arguments = arguments if isinstance(arguments, dict) else {}
         if policy and policy.allowed_tools is not None and tool_name not in policy.allowed_tools:
             self.hooks.emit("ToolSkippedByPolicy", session_id=self.session_id, turn_id=self.turn_id, tool=tool_name, arguments=arguments, reason="tool_not_allowed_for_route", route=policy.route)
-            return ToolResult("blocked", f"{tool_name} skipped by {policy.route} route policy.", requires_permission=False, data={"route": policy.route, "tool": tool_name})
+            return ToolResult(
+                "blocked",
+                f"這一步我先停住：`{tool_name}` 不適合在現在這種回覆節奏裡直接跑。你如果是要我繼續剛剛的任務，直接說「繼續」或「可以」就好。",
+                requires_permission=False,
+                data={"route": policy.route, "tool": tool_name},
+            )
         if policy and not policy.allow_vision and tool_name == "analyze_media":
             self.hooks.emit("ToolSkippedByPolicy", session_id=self.session_id, turn_id=self.turn_id, tool=tool_name, arguments=arguments, reason="vision_disabled")
             return ToolResult("blocked", "analyze_media skipped by response policy.", requires_permission=False)
@@ -587,7 +592,7 @@ class CompanionAgent:
                     tool=approved_action.tool_name,
                     arguments=approved_action.arguments,
                 )
-                result = self.executor.execute(approved_action.tool_name, approved_action.arguments, tool_callback, response_policy)
+                result = self.executor.execute(approved_action.tool_name, approved_action.arguments, tool_callback, None)
                 verification, replay_case = self._after_tool_result(approved_action.tool_name, approved_action.arguments, result)
                 self.hooks.emit(
                     "PermissionReplayResult",

@@ -221,6 +221,40 @@ def permission_followup_allows_exact_tool():
     return "single approval replayed the pending exact tool"
 
 
+class PermissionReplayPythonAdapter:
+    def __init__(self):
+        self.calls = 0
+        self.args = {"code": "print('approved python replay')"}
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_py", "name": "execute_python", "arguments": self.args, "raw_arguments": json.dumps(self.args)}],
+            }
+        if self.calls == 2:
+            return {"role": "assistant", "content": "需要權限，可以嗎？"}
+        return {"role": "assistant", "content": "unexpected replanning"}
+
+
+def permission_replay_bypasses_chat_route_policy():
+    agent = CompanionAgent(PermissionReplayPythonAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "permission_python_route_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    first = agent.chat("run python", response_policy=response_policy_for(InteractionMode.TOOL_TASK))
+    if "可以嗎" not in first["content"] and "requires approval" not in first["content"]:
+        raise AssertionError(first)
+    second = agent.chat("好", response_policy=response_policy_for(InteractionMode.CHAT))
+    if "execute_python" not in second["content"] or "Python completed" not in second["content"]:
+        raise AssertionError(second)
+    if agent.llm.calls != 2:
+        raise AssertionError(f"approval should replay without replanning; calls={agent.llm.calls}")
+    return "approved pending python replay bypassed chat route policy"
+
+
 class WrongToolAfterApprovalAdapter:
     def __init__(self):
         self.calls = 0
@@ -1400,7 +1434,7 @@ def chat_policy_blocks_vision_tool():
         agent.add_tool(tool)
     result = agent.chat("plain chat", response_policy=response_policy_for(InteractionMode.CHAT))
     tool_messages = [m for m in agent.memory if m.get("role") == "tool"]
-    if not any("vision_disabled" in m.get("content", "") or "skipped by" in m.get("content", "") for m in tool_messages):
+    if not any("vision_disabled" in m.get("content", "") or "不適合在現在這種回覆節奏" in m.get("content", "") for m in tool_messages):
         raise AssertionError(agent.memory)
     if "analyze_media" not in result["content"] or "聊天路線" not in result["content"]:
         raise AssertionError(result)
@@ -2577,6 +2611,7 @@ def main():
         ("agent_init_all_tools", init_agent),
         ("unknown_tool_fallback", unknown_tool_fallback),
         ("permission_followup_allows_exact_tool", permission_followup_allows_exact_tool),
+        ("permission_replay_bypasses_chat_route_policy", permission_replay_bypasses_chat_route_policy),
         ("single_approval_does_not_allow_unrelated_tool", single_approval_does_not_allow_unrelated_tool),
         ("turn_approval_allows_tool_chain", turn_approval_allows_tool_chain),
         ("command_cwd_failure_recovers_inside_agent_loop", command_cwd_failure_recovers_inside_agent_loop),
