@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from agent_hooks import TRACE_LOG_FILE
 from agent_replay import record_failure_replay
+from agent_user_voice import empty_reply_fallback, failsafe_reply, failure_replay_reply, friendly_tool_block, repeated_tool_stop_reply, tool_loop_timeout_reply
 from core_tools import ToolResult
 
 
@@ -145,10 +146,10 @@ class ToolLoopController:
         return None
 
     def _stop_repeated_tool(self, memory: list[dict[str, Any]], call: dict[str, Any], arguments: dict[str, Any], count: int, user_input: str, total_reasoning: str) -> ToolLoopResult:
-        repeated_result = ToolResult("error", f"Repeated tool call stopped by {self.response_policy.route} loop controller.", error="repeated_tool_call")
+        repeated_result = ToolResult("error", "Repeated tool call stopped.", error="repeated_tool_call")
         replay_case = record_failure_replay(call["name"], arguments, repeated_result, session_id=self.session_id, turn_id=self.turn_id, count=count)
         self.task_graphs.mark_blocked("repeated tool call stopped", self.session_id, self.turn_id, tool_name=call["name"], arguments=arguments, result=repeated_result)
-        final_reply = f"主人，我發現 `{call['name']}` 在同一輪重複卡住，所以先停下來了。Replay case: {replay_case.get('name')}"
+        final_reply = repeated_tool_stop_reply(call["name"], replay_case.get("name", ""))
         memory.append({"role": "assistant", "content": final_reply})
         self.reset_turn_state()
         self.hooks.emit("StopFailure", session_id=self.session_id, turn_id=self.turn_id, tool=call["name"], replay_case=replay_case.get("name"), reason="repeated_tool_call")
@@ -161,7 +162,7 @@ class ToolLoopController:
         tag = f" [系統截圖: {screen}]" if screen else ""
         result_text = ToolResult("error", f"Fail-safe triggered. Stop all actions immediately.{tag}").to_text()
         memory.append({"role": "tool", "tool_call_id": call["id"], "name": call["name"], "content": result_text})
-        final_reply = f"主人，我遇到 fail-safe，已立刻停止所有操作。{tag}"
+        final_reply = failsafe_reply(tag)
         memory.append({"role": "assistant", "content": final_reply})
         self.reset_turn_state()
         self.remember_turn_summary(user_input, final_reply)
@@ -169,7 +170,7 @@ class ToolLoopController:
         return ToolLoopResult(final_reply, total_reasoning.strip())
 
     def _stop_failure_replay(self, memory: list[dict[str, Any]], call: dict[str, Any], replay_case: dict[str, Any], user_input: str, total_reasoning: str) -> ToolLoopResult:
-        final_reply = f"`{call['name']}` failed repeatedly, so I stopped this loop and saved a replay case: {replay_case.get('name')}. Trace: {TRACE_LOG_FILE}"
+        final_reply = failure_replay_reply(call["name"], replay_case.get("name", ""), TRACE_LOG_FILE)
         memory.append({"role": "assistant", "content": final_reply})
         self.reset_turn_state()
         self.hooks.emit("StopFailure", session_id=self.session_id, turn_id=self.turn_id, tool=call["name"], replay_case=replay_case.get("name"))
@@ -178,7 +179,7 @@ class ToolLoopController:
         return ToolLoopResult(final_reply, total_reasoning.strip())
 
     def _stop_route_block(self, memory: list[dict[str, Any]], call: dict[str, Any], result: ToolResult, user_input: str, total_reasoning: str) -> ToolLoopResult:
-        final_reply = f"這一步我先停住：`{call['name']}` 不是現在最合適的下一步。{result.message}"
+        final_reply = friendly_tool_block(call["name"], result, getattr(self.response_policy, "route", ""))
         memory.append({"role": "assistant", "content": final_reply})
         self.reset_turn_state()
         self.hooks.emit("StopFailure", session_id=self.session_id, turn_id=self.turn_id, tool=call["name"], reason="route_policy_block")
@@ -187,7 +188,7 @@ class ToolLoopController:
         return ToolLoopResult(final_reply, total_reasoning.strip())
 
     def _final_reply(self, memory: list[dict[str, Any]], response: dict[str, Any], user_input: str, total_reasoning: str, successful_tools: list[str]) -> ToolLoopResult:
-        final_reply = self.clean_output(response.get("content", "")) or "主人，我已經處理完了。"
+        final_reply = self.clean_output(response.get("content", "")) or empty_reply_fallback()
         reply_decision = self.hooks.emit("BeforeReply", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
         if reply_decision.annotate:
             final_reply += reply_decision.annotate
@@ -203,7 +204,7 @@ class ToolLoopController:
         return ToolLoopResult(final_reply, total_reasoning.strip())
 
     def _timeout(self, memory: list[dict[str, Any]], user_input: str, total_reasoning: str) -> ToolLoopResult:
-        timeout_msg = "主人，我卡在工具迴圈裡了，已停止本輪操作。這次不再繼續重試，避免把同一個工具刷屏。"
+        timeout_msg = tool_loop_timeout_reply()
         memory.append({"role": "assistant", "content": timeout_msg})
         self.reset_turn_state()
         self.remember_turn_summary(user_input, timeout_msg)

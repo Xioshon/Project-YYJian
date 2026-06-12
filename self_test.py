@@ -1652,11 +1652,42 @@ def chat_policy_blocks_vision_tool():
         agent.add_tool(tool)
     result = agent.chat("plain chat", response_policy=response_policy_for(InteractionMode.CHAT))
     tool_messages = [m for m in agent.memory if m.get("role") == "tool"]
-    if not any("vision_disabled" in m.get("content", "") or "不是現在最合適的下一步" in m.get("content", "") for m in tool_messages):
+    if not any("看圖任務" in m.get("content", "") or "停在" in m.get("content", "") for m in tool_messages):
         raise AssertionError(agent.memory)
-    if "analyze_media" not in result["content"] or "route policy" in result["content"] or "回覆節奏" in result["content"]:
+    if _contains_internal_policy_leak(result["content"]):
         raise AssertionError(result)
     return result["content"]
+
+
+def _contains_internal_policy_leak(text: str) -> bool:
+    lowered = (text or "").casefold()
+    leaks = [
+        "route policy",
+        "chat route",
+        "screen_observe",
+        "tool_task",
+        "social_sticker",
+        "skipped by",
+        "response policy",
+        "loop controller",
+        "tool_not_allowed_for_route",
+    ]
+    return any(item in lowered for item in leaks)
+
+
+def user_visible_tool_blocks_hide_internal_route_terms():
+    agent = CompanionAgent(PlainReplyAdapter("ok"), "system self test", os.path.join(core_tools.HISTORY_DIR, "route_voice_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    result = agent.executor.execute("execute_python", {"code": "print('x')"}, None, response_policy_for(InteractionMode.CHAT))
+    if result.status != "blocked":
+        raise AssertionError(result.to_text())
+    if _contains_internal_policy_leak(result.message):
+        raise AssertionError(result.to_text())
+    if "繼續" not in result.message:
+        raise AssertionError(result.to_text())
+    return result.message
 
 
 def semantic_intent_upgrades_chat_policy_without_user_modes():
@@ -1791,7 +1822,9 @@ def repeated_tool_call_stops_before_timeout():
     agent = CompanionAgent(RepeatToolAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "repeat_tool_test.json"))
     agent.add_tool(core_tools.AgentTool("fake_repeat", "fake repeat tool", lambda value=1: core_tools.ToolResult("ok", "repeat ok"), {"type": "object", "properties": {"value": {"type": "integer"}}}))
     result = agent.chat("repeat tool")
-    if "重複卡住" not in result["content"] or "Replay case" not in result["content"]:
+    if "重複" not in result["content"] or "重現" not in result["content"]:
+        raise AssertionError(result)
+    if _contains_internal_policy_leak(result["content"]):
         raise AssertionError(result)
     return result["content"]
 
@@ -1801,7 +1834,7 @@ def screen_observe_policy_blocks_unrelated_vision_tool():
     for tool in core_tools.ALL_TOOLS:
         agent.add_tool(tool)
     result = agent.chat("幫我截圖看看狀態", response_policy=response_policy_for(InteractionMode.SCREEN_OBSERVE))
-    if "analyze_media" not in result["content"] or "route policy" in result["content"] or "回覆節奏" in result["content"]:
+    if "看圖任務" not in result["content"] or _contains_internal_policy_leak(result["content"]):
         raise AssertionError(result)
     return result["content"]
 
@@ -2919,6 +2952,7 @@ def main():
         ("session_brain_validation_includes_plan_and_clears_it", session_brain_validation_includes_plan_and_clears_it),
         ("latency_policy_classifies_modes", latency_policy_classifies_modes),
         ("chat_policy_blocks_vision_tool", chat_policy_blocks_vision_tool),
+        ("user_visible_tool_blocks_hide_internal_route_terms", user_visible_tool_blocks_hide_internal_route_terms),
         ("semantic_intent_upgrades_chat_policy_without_user_modes", semantic_intent_upgrades_chat_policy_without_user_modes),
         ("safe_verifier_command_runs_in_screen_observe_route", safe_verifier_command_runs_in_screen_observe_route),
         ("arbitrary_command_still_requires_permission", arbitrary_command_still_requires_permission),

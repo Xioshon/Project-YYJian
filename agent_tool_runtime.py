@@ -8,6 +8,7 @@ from typing import Callable
 from agent_hooks import DEFAULT_HOOK_MANAGER, HookManager
 from agent_latency import ResponsePolicy
 from agent_protocol import classify_approval
+from agent_user_voice import friendly_tool_block, permission_request_reply
 from core_tools import AgentTool, ROOT_DIR, ToolResult, is_workspace_path, resolve_path
 
 
@@ -236,13 +237,13 @@ class ToolExecutor:
             self.hooks.emit("ToolSkippedByPolicy", session_id=self.session_id, turn_id=self.turn_id, tool=tool_name, arguments=arguments, reason="tool_not_allowed_for_route", route=policy.route)
             return ToolResult(
                 "blocked",
-                f"這一步我先停住：`{tool_name}` 不是現在最合適的下一步。你如果是要我接著剛剛的任務，直接說「繼續」或「可以」就好。",
+                friendly_tool_block(tool_name, route=policy.route),
                 requires_permission=False,
-                data={"route": policy.route, "tool": tool_name, "retry_hint": "Say 繼續 to resume the active task, or describe the exact task goal."},
+                data={"route": policy.route, "tool": tool_name, "retry_hint": "你可以說「繼續」接回原任務，或直接補一句新的任務目標。"},
             )
         if policy and not policy.allow_vision and tool_name == "analyze_media":
             self.hooks.emit("ToolSkippedByPolicy", session_id=self.session_id, turn_id=self.turn_id, tool=tool_name, arguments=arguments, reason="vision_disabled")
-            return ToolResult("blocked", "analyze_media skipped by response policy.", requires_permission=False)
+            return ToolResult("blocked", friendly_tool_block(tool_name, route=policy.route), requires_permission=False, data={"route": policy.route, "tool": tool_name})
         requires_confirm = self._requires_confirm(tool, arguments)
         pre_decision = self.hooks.emit("PreToolUse", session_id=self.session_id, turn_id=self.turn_id, tool=tool_name, arguments=arguments, requires_confirm=requires_confirm)
         if pre_decision.replace_args is not None:
@@ -262,7 +263,7 @@ class ToolExecutor:
                 self.hooks.emit("tool.blocked", session_id=self.session_id, turn_id=self.turn_id, tool=tool_name, arguments=arguments)
                 return ToolResult(
                     "blocked",
-                    f"Tool {tool_name} requires approval. Ask the owner if this exact action is allowed.",
+                    permission_request_reply(tool_name, arguments),
                     data={"tool": tool_name, "arguments": arguments},
                     requires_permission=True,
                 )
