@@ -353,6 +353,53 @@ def outcome_action_without_artifact_is_clear():
     return "missing artifact continuation was clear"
 
 
+def outcome_continue_starts_allowlisted_verifier_worker():
+    jobs_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "continue_worker_jobs_test.jsonl")
+    results_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "continue_worker_results_test.jsonl")
+    for path in (jobs_path, results_path):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    queue = WorkerQueue(jobs_path=jobs_path, results_path=results_path, allowed_commands={"py_compile": ["python", "-c", "print('compiled')"]})
+    agent = CompanionAgent(NoReplanAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "continue_verifier.json"))
+    agent.worker_queue = queue
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.session_brain.state.state = "awaiting_validation"
+    agent.session_brain.state.pending_validation = ["verify tool results: execute_python"]
+    agent.session_brain.state.verification_plan = ["py_compile (required): python -m py_compile core_tools.py -- runtime changed"]
+    agent.session_brain.state.last_tool = "execute_python"
+    agent.session_brain.state.last_tool_status = "ok"
+    result = agent.chat("繼續", response_policy=response_policy_for(InteractionMode.CHAT))
+    if "py_compile" not in result["content"] or "job:" not in result["content"]:
+        raise AssertionError(result)
+    if agent.llm.calls:
+        raise AssertionError("continue verifier should not replan")
+    jobs = queue.list_jobs(limit=10)
+    if not any(job.get("kind") == "py_compile" for job in jobs):
+        raise AssertionError(jobs)
+    return "continue started allowlisted verifier worker"
+
+
+def outcome_continue_rejects_non_allowlisted_verifier_plan():
+    queue = WorkerQueue(jobs_path=os.path.join(core_tools.PROJECT_CACHE_DIR, "continue_reject_jobs_test.jsonl"), results_path=os.path.join(core_tools.PROJECT_CACHE_DIR, "continue_reject_results_test.jsonl"), allowed_commands={"py_compile": ["python", "-c", "print('ok')"]})
+    agent = CompanionAgent(NoReplanAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "continue_reject.json"))
+    agent.worker_queue = queue
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.session_brain.state.state = "awaiting_validation"
+    agent.session_brain.state.verification_plan = ["danger (required): powershell remove everything"]
+    result = agent.chat("繼續", response_policy=response_policy_for(InteractionMode.CHAT))
+    if "目前沒有明確下一步" not in result["content"]:
+        raise AssertionError(result)
+    if queue.list_jobs(limit=10):
+        raise AssertionError("non-allowlisted verifier should not create job")
+    return "non-allowlisted continue plan was not executed"
+
+
 class WrongToolAfterApprovalAdapter:
     def __init__(self):
         self.calls = 0
@@ -2526,7 +2573,7 @@ def _restore_optional_file(path: str, content: str | None) -> None:
 
 
 def cleanup_self_test_files():
-    for name in ("self_test.txt", "permission_test.txt", "wrong_tool.txt", "turn.txt", "delete_me_self_test.txt", "download_test.html", "dedupe_screen.png", "observability_trace_test.jsonl", "eval_trace_test.jsonl", "eval_missing_trace.jsonl", "eval_report_test.json", "workflow_eval_trace_test.jsonl", "worker_eval_trace_test.jsonl", "control_plane_eval_trace_test.jsonl", "worker_jobs_test.jsonl", "worker_results_test.jsonl", "worker_fail_jobs_test.jsonl", "worker_fail_results_test.jsonl", "worker_timeout_jobs_test.jsonl", "worker_timeout_results_test.jsonl", "worker_reject_jobs_test.jsonl", "worker_reject_results_test.jsonl", "worker_subagent_jobs_test.jsonl", "worker_subagent_results_test.jsonl", "action_verify.txt", "transaction_test.txt", "transaction_test.json", "task_graph_test.json", "task_graph_permission_test.json", "planner_graph_test.json", "planner_tool_graph_test.json", "worker_assim_graph_test.json", "observe_graph_test.json", "workflow_replay_graph_test.json", "workflow_replay_test.jsonl", "graph_file.txt", "failure_replay_test.jsonl"):
+    for name in ("self_test.txt", "permission_test.txt", "wrong_tool.txt", "turn.txt", "delete_me_self_test.txt", "download_test.html", "dedupe_screen.png", "observability_trace_test.jsonl", "eval_trace_test.jsonl", "eval_missing_trace.jsonl", "eval_report_test.json", "workflow_eval_trace_test.jsonl", "worker_eval_trace_test.jsonl", "control_plane_eval_trace_test.jsonl", "worker_jobs_test.jsonl", "worker_results_test.jsonl", "worker_fail_jobs_test.jsonl", "worker_fail_results_test.jsonl", "worker_timeout_jobs_test.jsonl", "worker_timeout_results_test.jsonl", "worker_reject_jobs_test.jsonl", "worker_reject_results_test.jsonl", "worker_subagent_jobs_test.jsonl", "worker_subagent_results_test.jsonl", "continue_worker_jobs_test.jsonl", "continue_worker_results_test.jsonl", "continue_reject_jobs_test.jsonl", "continue_reject_results_test.jsonl", "action_verify.txt", "transaction_test.txt", "transaction_test.json", "task_graph_test.json", "task_graph_permission_test.json", "planner_graph_test.json", "planner_tool_graph_test.json", "worker_assim_graph_test.json", "observe_graph_test.json", "workflow_replay_graph_test.json", "workflow_replay_test.jsonl", "graph_file.txt", "failure_replay_test.jsonl"):
         try:
             os.remove(os.path.join(core_tools.PROJECT_CACHE_DIR, name))
         except FileNotFoundError:
@@ -2714,6 +2761,8 @@ def main():
         ("outcome_send_artifact_uses_stored_artifact_without_replanning", outcome_send_artifact_uses_stored_artifact_without_replanning),
         ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),
         ("outcome_action_without_artifact_is_clear", outcome_action_without_artifact_is_clear),
+        ("outcome_continue_starts_allowlisted_verifier_worker", outcome_continue_starts_allowlisted_verifier_worker),
+        ("outcome_continue_rejects_non_allowlisted_verifier_plan", outcome_continue_rejects_non_allowlisted_verifier_plan),
         ("single_approval_does_not_allow_unrelated_tool", single_approval_does_not_allow_unrelated_tool),
         ("turn_approval_allows_tool_chain", turn_approval_allows_tool_chain),
         ("command_cwd_failure_recovers_inside_agent_loop", command_cwd_failure_recovers_inside_agent_loop),

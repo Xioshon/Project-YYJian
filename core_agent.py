@@ -154,6 +154,16 @@ def _artifact_for_action(brain: SessionBrain) -> str:
     return ""
 
 
+def _next_verifier_from_plan(lines: list[str]) -> str:
+    allowed = ("py_compile", "self_test", "agent_eval", "trace_summary")
+    for line in lines or []:
+        lowered = str(line or "").casefold()
+        for name in allowed:
+            if lowered.startswith(name.casefold() + " ") or lowered.startswith(name.casefold() + "(") or name.casefold() in lowered:
+                return name
+    return ""
+
+
 def _worker_context(items: list[dict[str, Any]]) -> str:
     if not items:
         return ""
@@ -734,10 +744,28 @@ class CompanionAgent:
             return {"content": final_reply, "reasoning": ""}
 
         if action == "continue_task":
-            final_reply = _format_last_outcome_reply(self.session_brain)
-            if self.session_brain.state.verification_plan:
-                final_reply += "\n下一步我會按這個驗證方向走：\n" + "\n".join(self.session_brain.state.verification_plan[-4:])
+            verifier_name = _next_verifier_from_plan(self.session_brain.state.verification_plan)
+            if verifier_name:
+                try:
+                    job = self.worker_queue.start_verifier(
+                        verifier_name,
+                        timeout=180 if verifier_name == "self_test" else 90,
+                        metadata={
+                            "session_id": self.session_id,
+                            "turn_id": self.turn_id,
+                            "source": "outcome_continue",
+                            "last_tool": self.session_brain.state.last_tool,
+                        },
+                    )
+                    final_reply = (
+                        f"好，我接著跑 `{verifier_name}` 驗證喵。\n"
+                        f"job: {job.job_id}\n"
+                        "我先讓背景 verifier 跑，下一輪我會吸收結果再告訴你。"
+                    )
+                except Exception as exc:
+                    final_reply = f"我想接著跑驗證，但 verifier 啟動失敗了：{exc}"
             else:
+                final_reply = _format_last_outcome_reply(self.session_brain)
                 final_reply += "\n目前沒有明確下一步。你可以說「發給我」「分析一下」或直接補一句新目標。"
             self.memory.append({"role": "user", "content": user_input})
             self.memory.append({"role": "assistant", "content": final_reply})
