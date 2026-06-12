@@ -36,6 +36,17 @@ IDEMPOTENT_RETRY_TOOLS = {
     "search_in_files",
 }
 
+SELF_REPAIR_TOOLS = {
+    "execute_command",
+    "execute_python",
+    "read_file",
+    "list_files",
+    "search_in_files",
+    "analyze_media",
+    "send_telegram_media",
+    "get_screen_ui",
+}
+
 
 @dataclass
 class RecoveryEvidence:
@@ -194,3 +205,36 @@ class SelfRecoveryController:
 
     def _key(self, tool_name: str, arguments: dict[str, Any], reason: str) -> str:
         return f"{reason}:{tool_name}:{repr(sorted((arguments or {}).items()))[:1000]}"
+
+
+def should_prompt_self_repair(tool_name: str, result: ToolResult, response_policy: Any = None) -> bool:
+    if result.status != "error":
+        return False
+    if tool_name not in SELF_REPAIR_TOOLS:
+        return False
+    route = str(getattr(response_policy, "route", "") or "").casefold()
+    if route in {"chat", "social_sticker"}:
+        return False
+    return True
+
+
+def self_repair_instruction(tool_name: str, arguments: dict[str, Any], result: ToolResult) -> str:
+    data = result.data if isinstance(result.data, dict) else {}
+    retry_hint = str(data.get("retry_hint") or "").strip()
+    stderr = str(data.get("stderr") or result.error or "").strip()
+    stdout = str(data.get("stdout") or "").strip()
+    parts = [
+        "[SelfRepair]",
+        f"The previous `{tool_name}` call failed. Do not stop at the raw error if a safe recovery is possible.",
+        "First inspect the error, then choose one bounded next step: retry with corrected cwd/path, inspect relevant files, run an allowlisted verifier, or explain clearly if permission or external state is required.",
+        "Do not repeat the exact same failing tool call. Do not invent success. Do not run destructive commands.",
+    ]
+    if retry_hint:
+        parts.append(f"retry_hint: {retry_hint}")
+    if stderr:
+        parts.append(f"stderr: {stderr[:900]}")
+    elif stdout:
+        parts.append(f"stdout: {stdout[:900]}")
+    if arguments:
+        parts.append(f"failed_arguments: {repr(arguments)[:900]}")
+    return "\n".join(parts)

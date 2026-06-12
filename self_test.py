@@ -623,6 +623,35 @@ class TransientToolAdapter:
         return {"role": "assistant", "content": "沒有自救成功"}
 
 
+class SelfRepairHintAdapter:
+    def __init__(self):
+        self.calls = 0
+        self.saw_repair_prompt = False
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            args = {"command": "python -m py_compile definitely_missing_file.py", "timeout": 20, "cwd": "project"}
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_bad_compile", "name": "execute_command", "arguments": args, "raw_arguments": json.dumps(args)}],
+            }
+        tool_text = "\n".join(message.get("content", "") for message in messages if message.get("role") == "tool")
+        if "Command completed" in tool_text or '"status": "ok"' in tool_text:
+            return {"role": "assistant", "content": "我自己換了安全驗證方式，已經跑通了"}
+        system_text = "\n".join(message.get("content", "") for message in messages if message.get("role") == "system")
+        if "[SelfRepair]" in system_text:
+            self.saw_repair_prompt = True
+            args = {"command": "python -m py_compile core_tools.py", "timeout": 60, "cwd": "project"}
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_good_compile", "name": "execute_command", "arguments": args, "raw_arguments": json.dumps(args)}],
+            }
+        return {"role": "assistant", "content": "只看到錯誤，沒有自救"}
+
+
 def turn_approval_allows_tool_chain():
     target = os.path.join(core_tools.PROJECT_CACHE_DIR, "turn.txt")
     try:
@@ -701,6 +730,26 @@ def self_recovery_does_not_retry_unsafe_python():
     if attempts["count"] != 0:
         raise AssertionError("unsafe python should not be retried")
     return "unsafe python was not auto-retried"
+
+
+def tool_loop_prompts_self_repair_before_user_followup():
+    agent = CompanionAgent(SelfRepairHintAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "self_repair_hint_test.json"))
+    agent.interactive_mode = False
+    agent.always_allow_tools = True
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    result = agent.chat("run a verifier and recover if it fails", response_policy=response_policy_for(InteractionMode.TOOL_TASK))
+    if "已經跑通" not in result["content"]:
+        raise AssertionError(result)
+    if not agent.llm.saw_repair_prompt:
+        raise AssertionError("self repair prompt was not presented to the model")
+    system_messages = [message.get("content", "") for message in agent.memory if message.get("role") == "system"]
+    if any("[SelfRepair]" in content for content in system_messages):
+        raise AssertionError("transient self repair prompt leaked into persistent memory")
+    tool_messages = [message.get("content", "") for message in agent.memory if message.get("role") == "tool"]
+    if not any("definitely_missing_file.py" in content for content in tool_messages) or not any('"status": "ok"' in content for content in tool_messages):
+        raise AssertionError(tool_messages[-4:])
+    return "self repair hint led to safe follow-up tool before owner had to ask"
 
 
 def trace_log_records_tool_events():
@@ -3135,6 +3184,7 @@ def main():
         ("command_cwd_failure_recovers_inside_agent_loop", command_cwd_failure_recovers_inside_agent_loop),
         ("transient_tool_error_recovers_before_user_followup", transient_tool_error_recovers_before_user_followup),
         ("self_recovery_does_not_retry_unsafe_python", self_recovery_does_not_retry_unsafe_python),
+        ("tool_loop_prompts_self_repair_before_user_followup", tool_loop_prompts_self_repair_before_user_followup),
         ("trace_log_records_tool_events", trace_log_records_tool_events),
         ("session_brain_plain_chat_stays_idle", session_brain_plain_chat_stays_idle),
         ("session_brain_task_enters_active_task", session_brain_task_enters_active_task),
