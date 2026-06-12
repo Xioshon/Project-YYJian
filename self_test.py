@@ -33,6 +33,7 @@ from agent_memory import (
     search_engineering_knowledge,
     update_chat_summary,
 )
+from agent_outcome import detect_outcome_action, format_last_outcome_reply, is_result_followup
 from agent_knowledge import (
     KNOWLEDGE_CHUNKS_FILE,
     KNOWLEDGE_INDEX_FILE,
@@ -352,6 +353,24 @@ def outcome_action_without_artifact_is_clear():
     if agent.llm.calls:
         raise AssertionError("missing artifact should not replan")
     return "missing artifact continuation was clear"
+
+
+def outcome_intent_helpers_are_deterministic_and_bounded():
+    if detect_outcome_action("發給我") != "send_artifact":
+        raise AssertionError("send artifact intent not detected")
+    if detect_outcome_action("分析一下") != "analyze_artifact":
+        raise AssertionError("analyze artifact intent not detected")
+    if detect_outcome_action("繼續") != "continue_task":
+        raise AssertionError("continue intent not detected")
+    if detect_outcome_action("發給我" + "，但是" * 80):
+        raise AssertionError("long mixed text should not be hijacked by outcome controller")
+    if not is_result_followup("有結果嗎"):
+        raise AssertionError("result followup not detected")
+    agent, _artifact = _agent_with_last_artifact("outcome_format_artifact.png")
+    reply = format_last_outcome_reply(agent.session_brain)
+    if "execute_python" not in reply or "outcome_format_artifact.png" not in reply:
+        raise AssertionError(reply)
+    return "outcome helper boundary held"
 
 
 def outcome_continue_starts_allowlisted_verifier_worker():
@@ -2779,6 +2798,7 @@ def main():
         ("outcome_send_artifact_uses_stored_artifact_without_replanning", outcome_send_artifact_uses_stored_artifact_without_replanning),
         ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),
         ("outcome_action_without_artifact_is_clear", outcome_action_without_artifact_is_clear),
+        ("outcome_intent_helpers_are_deterministic_and_bounded", outcome_intent_helpers_are_deterministic_and_bounded),
         ("outcome_continue_starts_allowlisted_verifier_worker", outcome_continue_starts_allowlisted_verifier_worker),
         ("outcome_continue_rejects_non_allowlisted_verifier_plan", outcome_continue_rejects_non_allowlisted_verifier_plan),
         ("single_approval_does_not_allow_unrelated_tool", single_approval_does_not_allow_unrelated_tool),
