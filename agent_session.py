@@ -26,6 +26,10 @@ class SessionBrainState:
     failed_tools: list[str] = field(default_factory=list)
     pending_validation: list[str] = field(default_factory=list)
     verification_plan: list[str] = field(default_factory=list)
+    last_tool: str = ""
+    last_tool_status: str = ""
+    last_tool_summary: str = ""
+    last_artifacts: list[str] = field(default_factory=list)
     last_turn_was_chat: bool = True
     consecutive_failures: int = 0
     updated_at: float = field(default_factory=time.time)
@@ -91,6 +95,12 @@ class SessionBrain:
             self.save()
             return self._emit_classified("active_task", "permission_granted", f"permission_{grant}", False, turn_id, session_id, old_state)
 
+        if self.state.state in {"active_task", "awaiting_validation", "awaiting_permission"} and _looks_like_task_followup(normalized):
+            self._set_state("active_task", turn_id, session_id, "task_continuation")
+            self.state.last_turn_was_chat = False
+            self.save()
+            return self._emit_classified("active_task", "task_continuation", "task_continuation", False, turn_id, session_id, old_state)
+
         interaction = classify_interaction(text, has_media=False)
         if interaction == InteractionMode.TOOL_TASK or _looks_like_task(normalized):
             self._set_state("active_task", turn_id, session_id, "task_intent")
@@ -117,10 +127,16 @@ class SessionBrain:
         self.state.last_turn_was_chat = False
         self.save()
 
-    def mark_tool_result(self, tool_name: str, status: str, turn_id: int = 0, session_id: str = "") -> None:
+    def mark_tool_result(self, tool_name: str, status: str, turn_id: int = 0, session_id: str = "", summary: str = "", artifacts: list[str] | None = None) -> None:
+        self.state.last_tool = tool_name
+        self.state.last_tool_status = status
+        if summary:
+            self.state.last_tool_summary = summary[-1200:]
+        self.state.last_artifacts = (artifacts or [])[-8:]
         if status == "ok":
             self.state.consecutive_failures = 0
             self._append_recent_step(f"{tool_name} ok")
+            self.save()
             return
         self.state.consecutive_failures += 1
         self.state.failed_tools.append(tool_name)
@@ -176,6 +192,12 @@ class SessionBrain:
             lines.append("pending_validation: " + " | ".join(self.state.pending_validation[-5:]))
         if self.state.verification_plan:
             lines.append("verification_plan: " + " | ".join(self.state.verification_plan[-5:]))
+        if self.state.last_tool:
+            lines.append(f"last_tool: {self.state.last_tool} {self.state.last_tool_status}")
+        if self.state.last_tool_summary:
+            lines.append("last_tool_summary: " + self.state.last_tool_summary[-500:])
+        if self.state.last_artifacts:
+            lines.append("last_artifacts: " + " | ".join(self.state.last_artifacts[-5:]))
         return "\n".join(lines)[-max_chars:]
 
     def _append_recent_step(self, step: str) -> None:
@@ -223,6 +245,29 @@ def _looks_like_task(text: str) -> bool:
         "optimize",
     ]
     return _contains_any(text, markers)
+
+
+def _looks_like_task_followup(text: str) -> bool:
+    markers = [
+        "\u7e7c\u7e8c",
+        "\u7d50\u679c",
+        "\u6709\u7d50\u679c",
+        "\u525b\u525b",
+        "\u4e4b\u524d",
+        "\u90a3\u500b",
+        "\u518d\u8a66",
+        "\u91cd\u8a66",
+        "\u8dd1\u5427",
+        "\u767c\u7d66\u6211",
+        "\u50b3\u7d66\u6211",
+        "\u622a\u5716\u5462",
+        "\u5716\u5462",
+        "continue",
+        "result",
+        "again",
+        "retry",
+    ]
+    return bool(text) and len(text) <= 120 and _contains_any(text, markers)
 
 
 def _looks_casual(text: str) -> bool:

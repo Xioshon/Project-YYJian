@@ -39,6 +39,98 @@ def clean_assistant_output(text: str) -> str:
     return cleaned.strip()
 
 
+def _tool_result_outcome(tool_name: str, result: ToolResult) -> tuple[str, list[str]]:
+    lines = [f"{tool_name}: {result.status} - {result.message}"]
+    artifacts = _collect_result_artifacts(result)
+    data = result.data if isinstance(result.data, dict) else {}
+    stdout = str(data.get("stdout") or "").strip()
+    stderr = str(data.get("stderr") or "").strip()
+    returncode = data.get("returncode")
+    if returncode is not None:
+        lines.append(f"returncode: {returncode}")
+    if stdout:
+        lines.append("stdout:\n" + stdout[:1200])
+    if stderr:
+        lines.append("stderr:\n" + stderr[:1200])
+    if result.error:
+        lines.append("error:\n" + str(result.error)[:1200])
+    if artifacts:
+        lines.append("artifacts:\n" + "\n".join(f"- {item}" for item in artifacts[:8]))
+    return "\n".join(lines), artifacts
+
+
+def _collect_result_artifacts(result: ToolResult) -> list[str]:
+    candidates: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, str):
+            candidates.extend(_path_candidates_from_text(value))
+
+    visit(result.data)
+    visit(result.message)
+    visit(result.error)
+    return _dedupe_existing_paths(candidates)
+
+
+def _path_candidates_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    found = re.findall(r"[A-Za-z]:\\[^\s\"'<>|]+|(?:[\w .\-\u4e00-\u9fff]+)\.(?:png|jpg|jpeg|webp|gif|txt|json|md|log|py)", text)
+    return [item.strip("`'\"，。；;:,") for item in found if item.strip()]
+
+
+def _dedupe_existing_paths(candidates: list[str]) -> list[str]:
+    resolved: list[str] = []
+    for candidate in candidates:
+        paths = []
+        if os.path.isabs(candidate):
+            paths.append(candidate)
+        else:
+            paths.extend(
+                [
+                    resolve_path(candidate),
+                    os.path.join(ROOT_DIR, "workspace", candidate),
+                    os.path.join(PROJECT_CACHE_DIR, candidate),
+                ]
+            )
+        for path in paths:
+            try:
+                absolute = os.path.abspath(path)
+                if os.path.exists(absolute) and is_workspace_path(absolute) and absolute not in resolved:
+                    resolved.append(absolute)
+                    break
+            except Exception:
+                continue
+    return resolved
+
+
+def _is_result_followup(text: str) -> bool:
+    normalized = (text or "").strip().casefold()
+    markers = ["\u7d50\u679c", "\u6709\u7d50\u679c", "\u600e\u9ebc\u6a23", "\u622a\u5716\u5462", "\u5716\u5462", "result", "status"]
+    return bool(normalized) and len(normalized) <= 120 and any(marker.casefold() in normalized for marker in markers)
+
+
+def _format_last_outcome_reply(brain: SessionBrain) -> str:
+    state = brain.state
+    if not state.last_tool:
+        return "剛剛沒有可回報的工具結果喵。你要我繼續哪個任務，可以直接說一下。"
+    lines = [f"剛剛 `{state.last_tool}` 的結果是：{state.last_tool_status or 'unknown'}"]
+    if state.last_tool_summary:
+        lines.append(state.last_tool_summary[-1400:])
+    if state.last_artifacts:
+        lines.append("我看到的產物：")
+        lines.extend(f"- {item}" for item in state.last_artifacts[-5:])
+    if state.pending_validation:
+        lines.append("目前還在等待後續確認：" + " | ".join(state.pending_validation[-3:]))
+    return "\n".join(lines)
+
+
 def _worker_context(items: list[dict[str, Any]]) -> str:
     if not items:
         return ""
@@ -468,9 +560,10 @@ class CompanionAgent:
 
     def _after_tool_result(self, tool_name: str, arguments: dict, result: ToolResult) -> tuple[ActionVerificationResult, dict[str, Any] | None]:
         verification = verify_action(tool_name, arguments, result, self.session_id, self.turn_id)
+        outcome_summary, artifacts = _tool_result_outcome(tool_name, result)
         self.transactions.record_tool_result(tool_name, arguments, result, verification, self.session_id, self.turn_id)
         self.task_graphs.record_tool_result(tool_name, arguments, result, verification, self.session_id, self.turn_id)
-        self.session_brain.mark_tool_result(tool_name, result.status, self.turn_id, self.session_id)
+        self.session_brain.mark_tool_result(tool_name, result.status, self.turn_id, self.session_id, summary=outcome_summary, artifacts=artifacts)
         if verification.status == "fail":
             self.session_brain.mark_verification_result("fail", [verification.message], self.turn_id, self.session_id)
         elif verification.status == "observe_needed":
@@ -573,10 +666,23 @@ class CompanionAgent:
         pending_before = bool(self.permission_manager.pending)
         grant = self.permission_manager.classify_user_reply(user_input, self.turn_id)
         turn_classification = self.session_brain.classify_turn(user_input, grant=grant, pending_permission=pending_before, turn_id=self.turn_id, session_id=self.session_id)
+        if not turn_classification.is_chat and response_policy.route in {"chat", ""}:
+            response_policy = ResponsePolicy(max_tool_iterations=12, allow_vision=True, allow_sticker=True, progress_style="normal", route="task_continuation")
         if not turn_classification.is_chat:
             self.transactions.start_or_resume(user_input, self.session_id, self.turn_id)
             self._plan_turn_if_needed(user_input, turn_classification)
         self.hooks.emit("UserMessage", session_id=self.session_id, turn_id=self.turn_id, grant=grant, interactive_mode=self.interactive_mode, pending=bool(self.permission_manager.pending))
+        if grant == "none" and turn_classification.intent == "task_continuation" and _is_result_followup(user_input):
+            final_reply = _format_last_outcome_reply(self.session_brain)
+            reply_decision = self.hooks.emit("BeforeReply", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
+            if reply_decision.annotate:
+                final_reply += reply_decision.annotate
+            self.memory.append({"role": "user", "content": user_input})
+            self.memory.append({"role": "assistant", "content": final_reply})
+            self._remember_turn_summary(user_input, final_reply)
+            self.hooks.emit("Stop", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
+            self._save_history()
+            return {"content": final_reply, "reasoning": ""}
         if grant == "single":
             approved_action = self.permission_manager.pop_approved_action()
             if approved_action:
@@ -609,7 +715,12 @@ class CompanionAgent:
                         self.session_id,
                         evidence=[approved_action.tool_name],
                     )
+                    outcome_summary, artifacts = _tool_result_outcome(approved_action.tool_name, result)
                     final_reply = f"已執行剛剛批准的 `{approved_action.tool_name}`：{result.message}"
+                    if outcome_summary:
+                        final_reply += "\n" + outcome_summary
+                    if artifacts:
+                        final_reply += "\n如果你要我發送或分析這些產物，直接說「發給我」或「分析一下」就好。"
                 elif replay_case:
                     final_reply = f"主人，我發現 `{approved_action.tool_name}` 重複卡住，所以先停下來了。Replay case: {replay_case.get('name')}"
                 elif result.status == "blocked":
@@ -730,7 +841,7 @@ class CompanionAgent:
                         if result.requires_permission:
                             self.session_brain.mark_permission_needed(call["name"], self.turn_id, self.session_id)
                         else:
-                            final_reply = f"這一步我先停住：`{call['name']}` 不適合放在現在這個聊天路線裡直接跑。{result.message}"
+                            final_reply = f"這一步我先停住：`{call['name']}` 不適合在現在這種回覆節奏裡直接跑。{result.message}"
                             self.memory.append({"role": "assistant", "content": final_reply})
                             self.permission_manager.reset_after_turn()
                             self.always_allow_tools = False

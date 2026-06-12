@@ -250,9 +250,29 @@ def permission_replay_bypasses_chat_route_policy():
     second = agent.chat("好", response_policy=response_policy_for(InteractionMode.CHAT))
     if "execute_python" not in second["content"] or "Python completed" not in second["content"]:
         raise AssertionError(second)
+    if "approved python replay" not in second["content"]:
+        raise AssertionError("permission replay did not surface stdout")
     if agent.llm.calls != 2:
         raise AssertionError(f"approval should replay without replanning; calls={agent.llm.calls}")
     return "approved pending python replay bypassed chat route policy"
+
+
+def task_result_followup_uses_last_outcome_without_replanning():
+    agent = CompanionAgent(PermissionReplayPythonAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "task_result_followup_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.chat("run python", response_policy=response_policy_for(InteractionMode.TOOL_TASK))
+    replay = agent.chat("好", response_policy=response_policy_for(InteractionMode.CHAT))
+    if "approved python replay" not in replay["content"]:
+        raise AssertionError(replay)
+    before_calls = agent.llm.calls
+    status = agent.chat("有結果嗎", response_policy=response_policy_for(InteractionMode.CHAT))
+    if "approved python replay" not in status["content"] or "execute_python" not in status["content"]:
+        raise AssertionError(status)
+    if agent.llm.calls != before_calls:
+        raise AssertionError("result follow-up should use stored outcome without LLM replanning")
+    return "result follow-up used stored tool outcome"
 
 
 class WrongToolAfterApprovalAdapter:
@@ -1436,7 +1456,7 @@ def chat_policy_blocks_vision_tool():
     tool_messages = [m for m in agent.memory if m.get("role") == "tool"]
     if not any("vision_disabled" in m.get("content", "") or "不適合在現在這種回覆節奏" in m.get("content", "") for m in tool_messages):
         raise AssertionError(agent.memory)
-    if "analyze_media" not in result["content"] or "聊天路線" not in result["content"]:
+    if "analyze_media" not in result["content"] or "回覆節奏" not in result["content"]:
         raise AssertionError(result)
     return result["content"]
 
@@ -1570,7 +1590,7 @@ def screen_observe_policy_blocks_unrelated_vision_tool():
     for tool in core_tools.ALL_TOOLS:
         agent.add_tool(tool)
     result = agent.chat("幫我截圖看看狀態", response_policy=response_policy_for(InteractionMode.SCREEN_OBSERVE))
-    if "聊天路線" not in result["content"] or "analyze_media" not in result["content"]:
+    if "回覆節奏" not in result["content"] or "analyze_media" not in result["content"]:
         raise AssertionError(result)
     return result["content"]
 
@@ -2612,6 +2632,7 @@ def main():
         ("unknown_tool_fallback", unknown_tool_fallback),
         ("permission_followup_allows_exact_tool", permission_followup_allows_exact_tool),
         ("permission_replay_bypasses_chat_route_policy", permission_replay_bypasses_chat_route_policy),
+        ("task_result_followup_uses_last_outcome_without_replanning", task_result_followup_uses_last_outcome_without_replanning),
         ("single_approval_does_not_allow_unrelated_tool", single_approval_does_not_allow_unrelated_tool),
         ("turn_approval_allows_tool_chain", turn_approval_allows_tool_chain),
         ("command_cwd_failure_recovers_inside_agent_loop", command_cwd_failure_recovers_inside_agent_loop),
