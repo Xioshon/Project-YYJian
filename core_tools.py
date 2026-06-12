@@ -684,9 +684,57 @@ def real_send_telegram_media(file_path: str, caption: str = "") -> ToolResult:
         data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
         if response.ok and data.get("ok", response.ok):
             return _ok("Telegram media sent.", {"file": filepath})
+        fallback = _send_telegram_media_text_fallback(chat_id, filepath, caption, f"HTTP {response.status_code}: {response.text[:300]}")
+        if fallback.status == "ok":
+            return ToolResult(
+                "ok",
+                "Telegram media upload failed, but a text fallback was sent.",
+                data={"file": filepath, "fallback": fallback.data, "original_error": response.text[:500]},
+            )
         return _error(f"Telegram send failed with HTTP {response.status_code}.", response.text[:500])
     except Exception as exc:
+        try:
+            chat_id = ""
+            if os.path.exists(CHAT_ID_FILE):
+                with open(CHAT_ID_FILE, "r", encoding="utf-8") as file:
+                    chat_id = file.read().strip()
+            fallback = _send_telegram_media_text_fallback(chat_id, filepath, caption, str(exc))
+            if fallback.status == "ok":
+                return ToolResult(
+                    "ok",
+                    "Telegram media upload failed, but a text fallback was sent.",
+                    data={"file": filepath, "fallback": fallback.data, "original_error": str(exc)[:500]},
+                )
+        except Exception:
+            pass
         return _error("Telegram media send failed.", str(exc))
+
+
+def _send_telegram_media_text_fallback(chat_id: str, filepath: str, caption: str = "", reason: str = "") -> ToolResult:
+    if not TG_TOKEN or not chat_id:
+        return _error("Telegram text fallback is not configured.")
+    try:
+        safe_name = os.path.basename(filepath)
+        text = (
+            "媒體暫時發不出去，我先把結果位置留給你：\n"
+            f"{safe_name}\n"
+            f"{filepath}"
+        )
+        if caption:
+            text = f"{caption[:500]}\n\n{text}"
+        if reason:
+            text += f"\n\n原因：{truncate_text(reason, 300)}"
+        response = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text[:3900]},
+            timeout=15,
+        )
+        data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        if response.ok and data.get("ok", response.ok):
+            return _ok("Telegram text fallback sent.", {"chat_id": chat_id, "file": filepath})
+        return _error("Telegram text fallback failed.", response.text[:500])
+    except Exception as exc:
+        return _error("Telegram text fallback raised an exception.", str(exc))
 
 
 def real_react_to_message(emoji: str, chat_id: str = "", message_id: int | str = "") -> ToolResult:

@@ -2934,6 +2934,50 @@ def live_telegram_smoke():
     return "live Telegram message, reaction, and media smoke passed"
 
 
+def send_telegram_media_falls_back_to_text_after_upload_failure():
+    class DummyResponse:
+        def __init__(self, ok: bool, text: str = "", payload=None):
+            self.ok = ok
+            self.text = text
+            self.status_code = 500 if not ok else 200
+            self.headers = {"content-type": "application/json"}
+            self._payload = payload if payload is not None else {"ok": ok}
+
+        def json(self):
+            return self._payload
+
+    media_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "media_fallback.png")
+    with open(media_path, "wb") as file:
+        file.write(b"fake png")
+    old_token = core_tools.TG_TOKEN
+    old_post = core_tools.requests.post
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append({"url": url, "kwargs": kwargs})
+        if "sendPhoto" in url or "sendAnimation" in url:
+            raise ConnectionResetError(10054, "遠端主機已強制關閉一個現存的連線。")
+        if "sendMessage" in url:
+            return DummyResponse(True, payload={"ok": True, "result": {"message_id": 1}})
+        return DummyResponse(False, "unexpected endpoint")
+
+    try:
+        core_tools.TG_TOKEN = "123456:fake-token-for-test"
+        with open(core_tools.CHAT_ID_FILE, "w", encoding="utf-8") as file:
+            file.write("42")
+        core_tools.requests.post = fake_post
+        result = core_tools.real_send_telegram_media(media_path, "fallback caption")
+    finally:
+        core_tools.TG_TOKEN = old_token
+        core_tools.requests.post = old_post
+
+    if result.status != "ok" or "text fallback" not in result.message:
+        raise AssertionError(result.to_text())
+    if not any("sendPhoto" in call["url"] for call in calls) or not any("sendMessage" in call["url"] for call in calls):
+        raise AssertionError(calls)
+    return result.to_text()
+
+
 def main():
     checks = [
         ("tool_schemas", validate_tool_schemas),
@@ -2958,6 +3002,7 @@ def main():
         ("execute_python", lambda: result_text(core_tools.real_execute_python('print("python self test ok")'))),
         ("analyze_media_missing_file", lambda: result_text(core_tools.real_analyze_media("project_cache/does_not_exist.png"))),
         ("send_telegram_media_missing_file", lambda: result_text(core_tools.real_send_telegram_media("project_cache/does_not_exist.png"))),
+        ("send_telegram_media_falls_back_to_text_after_upload_failure", send_telegram_media_falls_back_to_text_after_upload_failure),
         ("react_to_message_missing_context", react_to_message_missing_context),
         ("agent_init_all_tools", init_agent),
         ("unknown_tool_fallback", unknown_tool_fallback),
