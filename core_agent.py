@@ -13,6 +13,7 @@ from agent_permission_replay import PermissionReplayController
 from agent_planner import DEFAULT_PLANNER
 from agent_protocol import EMPTY_REPLY_FALLBACK, FAIL_SAFE_REPLY, TOOL_LOOP_TIMEOUT_REPLY, classify_approval, screenshot_tags
 from agent_replay import record_failure_replay
+from agent_runtime_context import build_runtime_context, should_include_task_context, worker_context
 from agent_self_recovery import SelfRecoveryController
 from agent_session import SessionBrain
 from agent_task_graph import TaskGraphManager
@@ -39,15 +40,6 @@ def clean_assistant_output(text: str) -> str:
     cleaned = re.sub(r"<[^>]*\bDSML\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"```(?:json|xml)?\s*<\s*\|?\s*DSML.*?```", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
     return cleaned.strip()
-
-
-def _worker_context(items: list[dict[str, Any]]) -> str:
-    if not items:
-        return ""
-    lines = []
-    for item in items[-5:]:
-        lines.append(f"{item.get('step_id', 'step')} worker={item.get('status', 'unknown')} job={item.get('job_id', '')}")
-    return "\n".join(lines)
 
 
 class CompanionAgent:
@@ -110,15 +102,32 @@ class CompanionAgent:
         self._remember_turn_summary(user_input, final_reply)
         self._save_history()
 
-    def _user_input_with_runtime_context(self, user_input: str, turn_intent: str, worker_results: list[dict[str, Any]] | None = None) -> str:
-        enriched = f"{user_input}\n\n[SessionBrain]\n{self.session_brain.summary()}\n\n[TaskGraph]\n{self.task_graphs.summary()}\nturn_intent: {turn_intent}"
-        worker_context = _worker_context(worker_results or [])
-        if worker_context:
-            enriched += f"\n\n[WorkerEvidence]\n{worker_context}"
-        return enriched
+    def _user_input_with_runtime_context(
+        self,
+        user_input: str,
+        turn_intent: str,
+        worker_results: list[dict[str, Any]] | None = None,
+        *,
+        include_task_context: bool = False,
+    ) -> str:
+        return build_runtime_context(
+            user_input,
+            turn_intent=turn_intent,
+            session_summary=self.session_brain.summary(),
+            task_summary=self.task_graphs.summary(),
+            worker_results=worker_results,
+            include_task_context=include_task_context,
+        )
 
-    def _append_user_context_message(self, user_input: str, turn_intent: str, worker_results: list[dict[str, Any]] | None = None) -> str:
-        enriched = self._user_input_with_runtime_context(user_input, turn_intent, worker_results)
+    def _append_user_context_message(
+        self,
+        user_input: str,
+        turn_intent: str,
+        worker_results: list[dict[str, Any]] | None = None,
+        *,
+        include_task_context: bool = True,
+    ) -> str:
+        enriched = self._user_input_with_runtime_context(user_input, turn_intent, worker_results, include_task_context=include_task_context)
         self.memory.append({"role": "user", "content": enriched})
         return enriched
 
@@ -170,7 +179,7 @@ class CompanionAgent:
             executor=self.executor,
             hooks=self.hooks,
             after_tool_result=self._after_tool_result,
-            append_user_context=lambda text: self._append_user_context_message(text, turn_intent, worker_results),
+            append_user_context=lambda text: self._append_user_context_message(text, turn_intent, worker_results, include_task_context=True),
             append_assistant_reply=self._append_assistant_only,
             reset_turn_state=self._reset_after_deterministic_turn,
             session_id=self.session_id,
@@ -281,10 +290,19 @@ class CompanionAgent:
             user_input += "\n\n[System notice: owner approved tool use for this task turn. Use only necessary tools and report results.]"
         elif grant == "deny":
             user_input += "\n\n[System notice: owner rejected the pending tool action. Do not retry it.]"
-        user_input += f"\n\n[SessionBrain]\n{self.session_brain.summary()}\n\n[TaskGraph]\n{self.task_graphs.summary()}\nturn_intent: {turn_classification.intent}"
-        worker_context = _worker_context(assimilated_worker_results)
-        if worker_context:
-            user_input += f"\n\n[WorkerEvidence]\n{worker_context}"
+        include_task_context = should_include_task_context(
+            turn_classification.intent,
+            pending_permission=pending_before,
+            active_task=bool(self.task_graphs.active()),
+            grant=grant,
+            worker_results=assimilated_worker_results,
+        )
+        user_input = self._user_input_with_runtime_context(
+            user_input,
+            turn_classification.intent,
+            assimilated_worker_results,
+            include_task_context=include_task_context,
+        )
 
         self.memory.append({"role": "user", "content": user_input})
         return self._tool_loop_controller(response_policy).run(self.memory, user_input, tool_callback).to_chat_result()

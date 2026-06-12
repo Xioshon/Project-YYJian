@@ -45,6 +45,7 @@ from agent_knowledge import (
 from agent_eval import EVAL_REPORT_FILE, PERMISSION_HEALTH_FILE, build_live_eval_report, check_repo_hygiene, write_eval_report
 from agent_observability import summarize_trace
 from agent_protocol import STICKER_MARKER_LABEL, classify_approval, screenshot_marker, sticker_marker, sticker_pattern
+from agent_runtime_context import build_runtime_context, should_include_task_context
 from agent_action_verification import verify_action
 from agent_replay import FAILURE_REPLAY_FILE, ReplayCase, ReplayHarness, record_failure_replay
 from agent_self_recovery import SelfRecoveryController
@@ -734,6 +735,18 @@ class PlainReplyAdapter:
         return {"role": "assistant", "content": self.content}
 
 
+class CaptureReplyAdapter:
+    def __init__(self, content="plain reply"):
+        self.content = content
+        self.calls = 0
+        self.last_messages = []
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        self.last_messages = [dict(message) for message in messages]
+        return {"role": "assistant", "content": self.content}
+
+
 def reset_session_brain_file():
     try:
         os.remove(SESSION_BRAIN_FILE)
@@ -750,6 +763,58 @@ def session_brain_plain_chat_stays_idle():
     if agent.session_brain.state.state != "idle" or not agent.session_brain.state.last_turn_was_chat:
         raise AssertionError(agent.session_brain.state)
     return agent.session_brain.summary()
+
+
+def runtime_context_keeps_plain_chat_lightweight():
+    reset_session_brain_file()
+    adapter = CaptureReplyAdapter("chat ok")
+    agent = CompanionAgent(adapter, "system self test", os.path.join(core_tools.HISTORY_DIR, "runtime_context_chat.json"))
+    result = agent.chat("月月，普通聊一下今天心情")
+    if result["content"] != "chat ok":
+        raise AssertionError(result)
+    user_messages = [message["content"] for message in adapter.last_messages if message.get("role") == "user"]
+    if not user_messages:
+        raise AssertionError("no user message captured")
+    last_user = user_messages[-1]
+    forbidden = ["[SessionBrain]", "[TaskGraph]", "turn_intent:"]
+    leaked = [item for item in forbidden if item in last_user]
+    if leaked:
+        raise AssertionError(f"plain chat leaked task context: {leaked}\n{last_user}")
+    if infer_route_from_messages(adapter.last_messages) != "chat":
+        raise AssertionError("plain chat should route to chat model")
+    return last_user
+
+
+def runtime_context_keeps_task_state_for_tasks():
+    reset_session_brain_file()
+    adapter = CaptureReplyAdapter("task ok")
+    agent = CompanionAgent(adapter, "system self test", os.path.join(core_tools.HISTORY_DIR, "runtime_context_task.json"))
+    agent.chat("please implement a small fix")
+    user_messages = [message["content"] for message in adapter.last_messages if message.get("role") == "user"]
+    last_user = user_messages[-1]
+    required = ["[SessionBrain]", "[TaskGraph]", "turn_intent:"]
+    missing = [item for item in required if item not in last_user]
+    if missing:
+        raise AssertionError(f"task context missing: {missing}\n{last_user}")
+    if infer_route_from_messages(adapter.last_messages) == "chat":
+        raise AssertionError("task turn should not route to chat model")
+    return "task runtime context preserved"
+
+
+def runtime_context_builder_policy_is_explicit():
+    chat = build_runtime_context("hi", turn_intent="chat", session_summary="state", task_summary="task", include_task_context=False)
+    task = build_runtime_context("fix", turn_intent="task", session_summary="state", task_summary="task", include_task_context=True)
+    if "[SessionBrain]" in chat or "[TaskGraph]" in chat:
+        raise AssertionError(chat)
+    if "[SessionBrain]" not in task or "turn_intent: task" not in task:
+        raise AssertionError(task)
+    if should_include_task_context("chat"):
+        raise AssertionError("chat should not include task context by default")
+    if not should_include_task_context("task") or not should_include_task_context("chat", grant="single"):
+        raise AssertionError("task/grant should include context")
+    if not should_include_task_context("chat", active_task=True):
+        raise AssertionError("active workflow should keep context even for terse follow-up")
+    return "runtime context policy separated chat from task"
 
 
 def session_brain_task_enters_active_task():
