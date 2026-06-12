@@ -291,6 +291,23 @@ def tool_loop_lives_in_controller_not_core_loop():
     return "tool loop flow isolated in controller"
 
 
+def tool_runtime_services_are_outside_core_agent():
+    import inspect
+    import core_agent as core_agent_module
+    import agent_tool_runtime
+
+    core_source = inspect.getsource(core_agent_module)
+    runtime_source = inspect.getsource(agent_tool_runtime)
+    forbidden = ["class PermissionManager", "class ToolExecutor", "class ToolRegistry", "LOW_RISK_TOOLS", "PERMISSION_BUNDLES"]
+    leaked = [marker for marker in forbidden if marker in core_source]
+    if leaked:
+        raise AssertionError(f"tool runtime leaked back into core_agent.py: {leaked}")
+    missing = [marker for marker in forbidden if marker not in runtime_source]
+    if missing:
+        raise AssertionError(f"agent_tool_runtime.py missing service responsibilities: {missing}")
+    return "tool runtime services isolated"
+
+
 def task_result_followup_uses_last_outcome_without_replanning():
     agent = CompanionAgent(PermissionReplayPythonAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "task_result_followup_test.json"))
     agent.interactive_mode = False
@@ -2828,6 +2845,7 @@ def main():
         ("permission_replay_bypasses_chat_route_policy", permission_replay_bypasses_chat_route_policy),
         ("permission_replay_lives_in_controller_not_core_loop", permission_replay_lives_in_controller_not_core_loop),
         ("tool_loop_lives_in_controller_not_core_loop", tool_loop_lives_in_controller_not_core_loop),
+        ("tool_runtime_services_are_outside_core_agent", tool_runtime_services_are_outside_core_agent),
         ("task_result_followup_uses_last_outcome_without_replanning", task_result_followup_uses_last_outcome_without_replanning),
         ("outcome_send_artifact_uses_stored_artifact_without_replanning", outcome_send_artifact_uses_stored_artifact_without_replanning),
         ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),

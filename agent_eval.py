@@ -338,7 +338,7 @@ def _load_persona_health() -> dict[str, Any]:
 
 def _permission_policy_health() -> dict[str, Any]:
     try:
-        from core_agent import LOW_RISK_TOOLS, PERMISSION_BUNDLES, SAFE_VERIFIER_COMMAND_PATTERNS
+        from agent_tool_runtime import LOW_RISK_TOOLS, PERMISSION_BUNDLES, SAFE_VERIFIER_COMMAND_PATTERNS
 
         guarded = sorted({tool for tools in PERMISSION_BUNDLES.values() for tool in tools} - set(LOW_RISK_TOOLS))
         report = {
