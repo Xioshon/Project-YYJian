@@ -1801,6 +1801,27 @@ def action_verification_checks_file_write_and_delete():
     return f"{write_check.status}/{delete_check.status}"
 
 
+def action_verification_preserves_recovery_evidence():
+    result = core_tools.ToolResult(
+        "ok",
+        "Python completed.",
+        data={
+            "returncode": 0,
+            "recovered_from": {
+                "reason": "missing_mss_screenshot_fallback",
+                "details": {"strategy": "missing_mss_screenshot_fallback", "diagnosis": "missing_python_module"},
+            },
+        },
+    )
+    verification = verify_action("execute_python", {"code": "fallback"}, result, "self_test", 1)
+    recovery = verification.details.get("recovery")
+    if verification.status != "pass" or not verification.details.get("recovered") or not recovery:
+        raise AssertionError(verification)
+    if recovery.get("reason") != "missing_mss_screenshot_fallback":
+        raise AssertionError(recovery)
+    return "action verification carried recovery evidence"
+
+
 def task_transaction_records_tool_result():
     path = os.path.join(core_tools.PROJECT_CACHE_DIR, "transaction_test.json")
     try:
@@ -1838,6 +1859,32 @@ def task_graph_creates_persists_and_summarizes_steps():
     if not loaded or loaded.task_id != graph.task_id or "write_file" not in manager2.summary():
         raise AssertionError(manager2.summary())
     return manager2.summary()
+
+
+def task_graph_records_recovery_evidence_on_step():
+    path = os.path.join(core_tools.PROJECT_CACHE_DIR, "task_graph_recovery_evidence_test.json")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    manager = TaskGraphManager(path)
+    result = core_tools.ToolResult(
+        "ok",
+        "Python completed.",
+        data={
+            "returncode": 0,
+            "recovered_from": {
+                "reason": "missing_mss_screenshot_fallback",
+                "details": {"strategy": "missing_mss_screenshot_fallback", "diagnosis": "missing_python_module"},
+            },
+        },
+    )
+    verification = verify_action("execute_python", {"code": "fallback"}, result, "self_test", 1)
+    graph = manager.record_tool_result("execute_python", {"code": "fallback"}, result, verification, "self_test", 1, objective="recover screenshot")
+    evidence = graph.steps[0].evidence
+    if "recovered" not in evidence or "recovery:missing_mss_screenshot_fallback" not in evidence or "diagnosis:missing_python_module" not in evidence:
+        raise AssertionError(evidence)
+    return "task graph recorded recovery evidence"
 
 
 def task_graph_recovery_summary_does_not_grant_permission():
@@ -3810,8 +3857,10 @@ def main():
         ("source_health_detects_bad_user_facing_text", source_health_detects_bad_user_facing_text),
         ("source_health_failure_blocks_next_stage_gate", source_health_failure_blocks_next_stage_gate),
         ("action_verification_checks_file_write_and_delete", action_verification_checks_file_write_and_delete),
+        ("action_verification_preserves_recovery_evidence", action_verification_preserves_recovery_evidence),
         ("task_transaction_records_tool_result", task_transaction_records_tool_result),
         ("task_graph_creates_persists_and_summarizes_steps", task_graph_creates_persists_and_summarizes_steps),
+        ("task_graph_records_recovery_evidence_on_step", task_graph_records_recovery_evidence_on_step),
         ("task_graph_recovery_summary_does_not_grant_permission", task_graph_recovery_summary_does_not_grant_permission),
         ("planner_creates_persistent_steps", planner_creates_persistent_steps),
         ("task_graph_updates_planned_step_with_tool_result", task_graph_updates_planned_step_with_tool_result),

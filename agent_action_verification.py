@@ -19,8 +19,12 @@ class ActionVerificationResult:
 
 def verify_action(tool_name: str, arguments: dict[str, Any], result: ToolResult, session_id: str = "", turn_id: int = 0) -> ActionVerificationResult:
     arguments = arguments or {}
+    recovery = _recovery_from_result(result)
     if result.status != "ok":
-        verification = ActionVerificationResult(tool_name, "fail", f"tool status is {result.status}", {"tool_message": result.message})
+        details = {"tool_message": result.message}
+        if recovery:
+            details["recovery"] = recovery
+        verification = ActionVerificationResult(tool_name, "fail", f"tool status is {result.status}", details)
         _emit(verification, session_id, turn_id)
         return verification
 
@@ -43,6 +47,9 @@ def verify_action(tool_name: str, arguments: dict[str, Any], result: ToolResult,
         verification = ActionVerificationResult(tool_name, "observe_needed", "UI action completed; follow-up observation is required")
     else:
         verification = ActionVerificationResult(tool_name, "pass", "tool returned ok")
+    if recovery:
+        verification.details["recovery"] = recovery
+        verification.details["recovered"] = True
     _emit(verification, session_id, turn_id)
     return verification
 
@@ -60,3 +67,9 @@ def _path_from_result_or_args(result: ToolResult, arguments: dict[str, Any], pre
 
 def _emit(verification: ActionVerificationResult, session_id: str, turn_id: int) -> None:
     emit_trace("ActionVerification", session_id=session_id, turn_id=turn_id, **verification.to_dict())
+
+
+def _recovery_from_result(result: ToolResult) -> dict[str, Any]:
+    data = result.data if isinstance(result.data, dict) else {}
+    recovery = data.get("recovered_from")
+    return recovery if isinstance(recovery, dict) else {}

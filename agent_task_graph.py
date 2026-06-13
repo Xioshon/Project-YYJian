@@ -141,6 +141,9 @@ class TaskGraphManager:
         )
         step.created_files = _created_file_candidates(tool_name, arguments, result)
         step.evidence.extend([item for item in [tool_name, result.status, verification_status] if item])
+        recovery_evidence = _recovery_evidence(result)
+        if recovery_evidence:
+            step.evidence.extend(recovery_evidence)
         step.updated_at = time.time()
         graph.current_step_index = max(0, graph.steps.index(step))
         for path in step.created_files:
@@ -159,6 +162,7 @@ class TaskGraphManager:
             status=step.status,
             result_status=result.status,
             verification_status=verification_status,
+            recovery=recovery_evidence,
         )
         return graph
 
@@ -417,3 +421,22 @@ def _created_file_candidates(tool_name: str, arguments: dict[str, Any], result: 
             except Exception:
                 candidates.append(value)
     return sorted(set(candidates))
+
+
+def _recovery_evidence(result: ToolResult) -> list[str]:
+    data = result.data if isinstance(result.data, dict) else {}
+    recovery = data.get("recovered_from")
+    if not isinstance(recovery, dict):
+        return []
+    items = ["recovered"]
+    reason = str(recovery.get("reason") or "")
+    if reason:
+        items.append(f"recovery:{reason}")
+    details = recovery.get("details") if isinstance(recovery.get("details"), dict) else {}
+    strategy = str(details.get("strategy") or "")
+    diagnosis = str(details.get("diagnosis") or "")
+    if strategy and strategy != reason:
+        items.append(f"strategy:{strategy}")
+    if diagnosis:
+        items.append(f"diagnosis:{diagnosis}")
+    return items
