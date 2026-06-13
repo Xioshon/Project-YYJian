@@ -351,10 +351,20 @@ def write_eval_report(report: LiveEvalReport, path: str = EVAL_REPORT_FILE) -> s
 def _current_session_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for index in range(len(events) - 1, -1, -1):
         if str(events[index].get("event") or "") == "SessionStart" and not _is_test_session(events[index]):
-            return events[index:]
+            filtered: list[dict[str, Any]] = []
+            in_test_segment = False
+            for event in events[index:]:
+                if str(event.get("event") or "") == "SessionStart":
+                    in_test_segment = _is_test_session(event)
+                    if in_test_segment:
+                        continue
+                if in_test_segment or _is_test_session(event):
+                    continue
+                filtered.append(event)
+            return filtered
     if any(str(event.get("event") or "") == "SessionStart" for event in events):
         return []
-    return events
+    return [event for event in events if not _is_test_session(event)]
 
 
 def _is_test_session(event: dict[str, Any]) -> bool:
@@ -385,10 +395,14 @@ def check_repo_hygiene(root_dir: str = ROOT_DIR) -> dict[str, Any]:
 
 USER_FACING_SOURCE_FILES = (
     "agent_user_voice.py",
+    "agent_permission_replay.py",
     "agent_outcome.py",
     "agent_latency.py",
+    "agent_runtime_context.py",
     "agent_tool_runtime.py",
     "agent_tool_loop.py",
+    "core_agent.py",
+    "agent_llm.py",
     "main.py",
 )
 
@@ -396,10 +410,14 @@ SOURCE_MOJIBAKE_MARKERS = ("鍓", "鐪", "绲", "鎴", "锛", "灞", "闆", "铻
 
 SOURCE_REQUIRED_PHRASES = {
     "agent_user_voice.py": ("我先等你點頭", "可以", "繼續"),
+    "agent_permission_replay.py": ("approved_tool_success_reply", "approved_tool_blocked_reply", "approved_tool_error_reply"),
     "agent_outcome.py": ("有結果", "發給我", "分析一下", "繼續"),
     "agent_latency.py": ("我先看一下", "我先處理一下", "收到"),
-    "agent_tool_runtime.py": ("你可以說「繼續」接回原任務"),
+    "agent_runtime_context.py": ("目前任務筆記", "目前步驟", "驗證結果"),
+    "agent_tool_runtime.py": ("你可以說「繼續」接回原任務",),
     "agent_tool_loop.py": ("系統截圖",),
+    "core_agent.py": ("任務提醒",),
+    "agent_llm.py": ("目前任務筆記",),
 }
 
 

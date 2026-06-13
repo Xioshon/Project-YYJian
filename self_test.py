@@ -1537,16 +1537,20 @@ def live_eval_gate_uses_current_session_window():
 def live_eval_ignores_self_test_sessions_for_gate():
     trace_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "eval_self_test_trace.jsonl")
     events = [
+        {"event": "SessionStart", "session_id": "live_owner_chat", "history_file": "workspace/chat_history/live_owner_chat.json"},
+        {"event": "context.budget", "mode": "chat", "total_after": 1000, "max_chars": 9000},
         {"event": "SessionStart", "session_id": "debug_perm_replay", "history_file": "workspace/history/debug_perm_replay.json"},
         {"event": "PostToolUse", "tool": "execute_python", "status": "error", "result": "intentional self-test failure"},
         {"event": "ToolError", "tool": "execute_python", "error": "intentional self-test failure"},
+        {"event": "SessionStart", "session_id": "cwd_recovery_test", "history_file": "workspace/chat_history/cwd_recovery_test.json"},
+        {"event": "PostToolUse", "tool": "execute_command", "status": "error", "result": "intentional cwd test failure"},
     ]
     with open(trace_path, "w", encoding="utf-8") as file:
         for event in events:
             file.write(json.dumps(event, ensure_ascii=False) + "\n")
     report = build_live_eval_report(trace_path, include_repo=False)
     data = report.to_dict()
-    if data["total_events"] != 0 or data["tool_errors"] != 0:
+    if data["total_events"] != 2 or data["tool_errors"] != 0:
         raise AssertionError(data)
     if data["next_stage_gate"]["status"] != "pass":
         raise AssertionError(data["next_stage_gate"])
@@ -1633,9 +1637,17 @@ def live_eval_writes_permission_health():
 
 
 def live_eval_reports_user_facing_source_health():
+    for filename, phrases in agent_eval.SOURCE_REQUIRED_PHRASES.items():
+        if not isinstance(phrases, tuple):
+            raise AssertionError(f"{filename} source health phrases must be a tuple, got {type(phrases).__name__}")
     health = check_user_facing_source_health()
     if health.get("status") != "pass":
         raise AssertionError(health)
+    checked = set(health.get("checked_files", []))
+    expected = {"agent_user_voice.py", "agent_permission_replay.py", "agent_runtime_context.py", "core_agent.py", "agent_llm.py"}
+    missing_files = sorted(expected - checked)
+    if missing_files:
+        raise AssertionError({"missing_source_health_files": missing_files, "checked": sorted(checked)})
     report = build_live_eval_report(include_repo=False)
     data = report.to_dict()
     if data.get("source_health", {}).get("status") != "pass":
