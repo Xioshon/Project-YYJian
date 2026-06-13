@@ -255,6 +255,16 @@ class CompanionAgent:
     def _recover_tool_result(self, tool_name: str, arguments: dict, result: ToolResult, tool_callback: Callable | None, response_policy: ResponsePolicy | None) -> tuple[ToolResult, dict[str, Any] | None]:
         return self.self_recovery.recover(tool_name, arguments or {}, result, tool_callback, response_policy, self.turn_id)
 
+    def _has_outcome_context(self) -> bool:
+        state = self.session_brain.state
+        return bool(
+            state.last_tool
+            or state.last_artifacts
+            or state.pending_validation
+            or state.verification_plan
+            or self.task_graphs.active()
+        )
+
     def chat(self, user_input: str, tool_callback: Callable | None = None, response_policy: ResponsePolicy | None = None) -> dict[str, str]:
         response_policy = response_policy or ResponsePolicy()
         self.executor.interactive_mode = self.interactive_mode
@@ -270,12 +280,13 @@ class CompanionAgent:
             self._plan_turn_if_needed(user_input, turn_classification)
         self.hooks.emit("UserMessage", session_id=self.session_id, turn_id=self.turn_id, grant=grant, interactive_mode=self.interactive_mode, pending=bool(self.permission_manager.pending))
         outcome_controller = self._outcome_controller()
-        outcome_action = detect_outcome_action(user_input) if grant == "none" and turn_classification.intent == "task_continuation" else ""
+        has_outcome_context = self._has_outcome_context()
+        outcome_action = detect_outcome_action(user_input) if grant == "none" and (turn_classification.intent == "task_continuation" or has_outcome_context) else ""
         if outcome_action:
             handled = outcome_controller.maybe_handle(outcome_action, user_input, tool_callback)
             if handled is not None:
                 return handled.to_chat_result()
-        if grant == "none" and turn_classification.intent == "task_continuation" and is_result_followup(user_input):
+        if grant == "none" and (turn_classification.intent == "task_continuation" or has_outcome_context) and is_result_followup(user_input):
             final_reply = format_last_outcome_reply(self.session_brain)
             reply_decision = self.hooks.emit("BeforeReply", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
             if reply_decision.annotate:

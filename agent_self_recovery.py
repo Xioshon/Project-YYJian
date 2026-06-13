@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from agent_hooks import HookManager
@@ -141,7 +141,7 @@ class SelfRecoveryController:
             details={"original_cwd": original_cwd, "retry_cwd": "project", "retry_hint": retry_hint},
         )
         self._emit_attempt(tool_name, turn_id, evidence)
-        recovered = self.executor.execute(tool_name, retry_args, tool_callback, response_policy)
+        recovered = self.executor.execute(tool_name, retry_args, tool_callback, _recovery_policy(response_policy))
         evidence.retry_status = recovered.status
         evidence.retry_message = recovered.message
         if isinstance(recovered.data, dict):
@@ -185,7 +185,7 @@ class SelfRecoveryController:
             details={"missing_module": module_name, "fallback_path": fallback_path},
         )
         self._emit_attempt(tool_name, turn_id, evidence)
-        recovered = self.executor.execute(tool_name, retry_args, tool_callback, response_policy)
+        recovered = self.executor.execute(tool_name, retry_args, tool_callback, _recovery_policy(response_policy))
         evidence.retry_status = recovered.status
         evidence.retry_message = recovered.message
         if isinstance(recovered.data, dict):
@@ -222,7 +222,7 @@ class SelfRecoveryController:
         for attempt in range(1, self.max_transient_retries + 1):
             evidence.attempts = attempt
             time.sleep(min(0.2 * attempt, 0.6))
-            recovered = self.executor.execute(tool_name, arguments, tool_callback, response_policy)
+            recovered = self.executor.execute(tool_name, arguments, tool_callback, _recovery_policy(response_policy))
             evidence.retry_status = recovered.status
             evidence.retry_message = recovered.message
             if recovered.status == "ok":
@@ -306,6 +306,20 @@ def _mss_screenshot_fallback_code(output_path: str) -> str:
         "    image.save(output)\n"
         "print(str(output))\n"
     )
+
+
+def _recovery_policy(response_policy: Any) -> Any:
+    if response_policy is None:
+        return None
+    try:
+        return replace(
+            response_policy,
+            allowed_tools=None,
+            max_tool_iterations=1,
+            route=(str(getattr(response_policy, "route", "") or "tool_task") + "_recovery"),
+        )
+    except Exception:
+        return response_policy
 
 
 def self_repair_instruction(tool_name: str, arguments: dict[str, Any], result: ToolResult) -> str:

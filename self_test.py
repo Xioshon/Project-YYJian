@@ -489,6 +489,23 @@ def task_result_followup_uses_last_outcome_without_replanning():
     return "result follow-up used stored tool outcome"
 
 
+def outcome_context_handles_result_followup_even_when_classified_chat():
+    agent = CompanionAgent(NoReplanAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "outcome_context_chat_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.session_brain.state.state = "idle"
+    agent.session_brain.state.last_tool = "execute_python"
+    agent.session_brain.state.last_tool_status = "ok"
+    agent.session_brain.state.last_tool_summary = "execute_python: ok - Python completed.\nstdout:\nmade a screenshot"
+    result = agent.chat("有結果嗎", response_policy=response_policy_for(InteractionMode.CHAT))
+    if "execute_python" not in result["content"] or "made a screenshot" not in result["content"]:
+        raise AssertionError(result)
+    if agent.llm.calls:
+        raise AssertionError("outcome context follow-up should not call LLM even if classified as chat")
+    return "outcome context bypassed chat route for result follow-up"
+
+
 class NoReplanAdapter:
     def __init__(self):
         self.calls = 0
@@ -903,6 +920,34 @@ def missing_mss_screenshot_recovery_uses_safe_fallback():
     if "fullscreen_screenshot.png" not in attempts["fallback_code"]:
         raise AssertionError(attempts["fallback_code"])
     return "missing mss screenshot recovered through safe fallback"
+
+
+def missing_mss_recovery_bypasses_chat_route_allowlist():
+    attempts = {"count": 0, "policy": None}
+
+    class Executor:
+        def execute(self, tool_name, arguments, callback=None, response_policy=None):
+            attempts["count"] += 1
+            attempts["policy"] = response_policy
+            if getattr(response_policy, "allowed_tools", ["blocked"]) is not None:
+                return core_tools.ToolResult("blocked", "execute_python skipped by chat route policy.", data={"route": getattr(response_policy, "route", "")})
+            return core_tools.ToolResult("ok", "Python completed.", data={"stdout": arguments.get("code", "")})
+
+    recovery = SelfRecoveryController(executor=Executor(), hooks=DEFAULT_HOOK_MANAGER, session_id="self_test")
+    original = core_tools.ToolResult(
+        "error",
+        "Python failed.",
+        data={"stderr": "ModuleNotFoundError: No module named 'mss'"},
+        error="ModuleNotFoundError: No module named 'mss'",
+    )
+    args = {"code": "import mss\nwith mss.mss() as sct:\n    img = sct.grab(sct.monitors[0])\n    img.save('screen.png')", "timeout": 30}
+    recovered, evidence = recovery.recover("execute_python", args, original, None, response_policy_for(InteractionMode.CHAT), 1)
+    if recovered.status != "ok" or not evidence:
+        raise AssertionError((recovered.to_text(), evidence))
+    policy = attempts["policy"]
+    if getattr(policy, "allowed_tools", None) is not None or "recovery" not in getattr(policy, "route", ""):
+        raise AssertionError(policy)
+    return "mss fallback recovery bypassed chat route allowlist"
 
 
 def missing_module_recovery_is_narrow():
@@ -3658,6 +3703,7 @@ def main():
         ("routed_llm_adapter_selects_fast_chat_and_strong_task_models", routed_llm_adapter_selects_fast_chat_and_strong_task_models),
         ("main_build_agent_uses_routed_llm_adapter", main_build_agent_uses_routed_llm_adapter),
         ("task_result_followup_uses_last_outcome_without_replanning", task_result_followup_uses_last_outcome_without_replanning),
+        ("outcome_context_handles_result_followup_even_when_classified_chat", outcome_context_handles_result_followup_even_when_classified_chat),
         ("outcome_send_artifact_uses_stored_artifact_without_replanning", outcome_send_artifact_uses_stored_artifact_without_replanning),
         ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),
         ("outcome_action_without_artifact_is_clear", outcome_action_without_artifact_is_clear),
@@ -3671,6 +3717,7 @@ def main():
         ("transient_tool_error_recovers_before_user_followup", transient_tool_error_recovers_before_user_followup),
         ("self_recovery_does_not_retry_unsafe_python", self_recovery_does_not_retry_unsafe_python),
         ("missing_mss_screenshot_recovery_uses_safe_fallback", missing_mss_screenshot_recovery_uses_safe_fallback),
+        ("missing_mss_recovery_bypasses_chat_route_allowlist", missing_mss_recovery_bypasses_chat_route_allowlist),
         ("missing_module_recovery_is_narrow", missing_module_recovery_is_narrow),
         ("tool_loop_prompts_self_repair_before_user_followup", tool_loop_prompts_self_repair_before_user_followup),
         ("trace_log_records_tool_events", trace_log_records_tool_events),
