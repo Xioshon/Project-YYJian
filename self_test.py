@@ -2015,8 +2015,9 @@ def user_visible_tool_blocks_hide_internal_route_terms():
 def user_voice_strings_are_unicode_safe():
     import agent_user_voice
 
-    runtime_source = open(os.path.join(os.path.dirname(__file__), "agent_tool_runtime.py"), "r", encoding="utf-8").read()
-    loop_source = open(os.path.join(os.path.dirname(__file__), "agent_tool_loop.py"), "r", encoding="utf-8").read()
+    root = os.path.dirname(__file__)
+    runtime_source = open(os.path.join(root, "agent_tool_runtime.py"), "r", encoding="utf-8").read()
+    loop_source = open(os.path.join(root, "agent_tool_loop.py"), "r", encoding="utf-8").read()
     samples = [
         agent_user_voice.friendly_tool_block("execute_python"),
         agent_user_voice.friendly_tool_block("read_file", core_tools.ToolResult("blocked", "Need a cleaner path.", data={"retry_hint": "請換一個檔案路徑。"})),
@@ -2040,6 +2041,42 @@ def user_voice_strings_are_unicode_safe():
     if "[系統截圖: {screen}]" not in loop_source:
         raise AssertionError("failsafe screenshot marker is not Unicode-safe")
     return "user-visible runtime voice is unicode-safe"
+
+
+def user_facing_source_files_are_unicode_safe():
+    root = os.path.dirname(__file__)
+    files = [
+        "agent_user_voice.py",
+        "agent_outcome.py",
+        "agent_latency.py",
+        "agent_tool_runtime.py",
+        "agent_tool_loop.py",
+        "main.py",
+    ]
+    bad_markers = ["鍓", "鐪", "绲", "鎴", "锛", "灞", "闆", "铻", "妯", "楹", "�"]
+    required_pairs = {
+        "agent_user_voice.py": ["我先不直接跑", "可以", "繼續"],
+        "agent_outcome.py": ["有結果", "發給我", "分析一下", "繼續"],
+        "agent_latency.py": ["我先看一下", "我先處理一下", "收到"],
+        "agent_tool_runtime.py": ["你可以說「繼續」接回原任務"],
+        "agent_tool_loop.py": ["系統截圖"],
+    }
+    for filename in files:
+        path = os.path.join(root, filename)
+        with open(path, "rb") as file:
+            raw = file.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise AssertionError(f"{filename} is not valid UTF-8: {exc}") from exc
+        if any(marker in text for marker in bad_markers):
+            raise AssertionError(f"{filename} contains mojibake markers")
+        if "????" in text:
+            raise AssertionError(f"{filename} contains question-mark mojibake")
+        for expected in required_pairs.get(filename, []):
+            if expected not in text:
+                raise AssertionError(f"{filename} is missing expected phrase: {expected}")
+    return "user-facing source files are UTF-8 and voice-safe"
 
 
 def semantic_intent_upgrades_chat_policy_without_user_modes():
@@ -3388,6 +3425,7 @@ def main():
         ("chat_policy_blocks_vision_tool", chat_policy_blocks_vision_tool),
         ("user_visible_tool_blocks_hide_internal_route_terms", user_visible_tool_blocks_hide_internal_route_terms),
         ("user_voice_strings_are_unicode_safe", user_voice_strings_are_unicode_safe),
+        ("user_facing_source_files_are_unicode_safe", user_facing_source_files_are_unicode_safe),
         ("semantic_intent_upgrades_chat_policy_without_user_modes", semantic_intent_upgrades_chat_policy_without_user_modes),
         ("safe_verifier_command_runs_in_screen_observe_route", safe_verifier_command_runs_in_screen_observe_route),
         ("arbitrary_command_still_requires_permission", arbitrary_command_still_requires_permission),
