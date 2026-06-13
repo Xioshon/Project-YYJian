@@ -36,6 +36,7 @@ class LiveEvalReport:
     latency_buckets: dict[str, dict[str, int]] = field(default_factory=dict)
     knowledge: dict[str, Any] = field(default_factory=dict)
     workflow: dict[str, Any] = field(default_factory=dict)
+    self_repair: dict[str, Any] = field(default_factory=dict)
     worker: dict[str, Any] = field(default_factory=dict)
     planner: dict[str, Any] = field(default_factory=dict)
     context: dict[str, Any] = field(default_factory=dict)
@@ -59,6 +60,7 @@ class LiveEvalReport:
             f"Permission replay: {self.permission_replay.get('success_rate', 1.0):.1%} success",
             f"Knowledge hit rate: {self.knowledge.get('hit_rate', 1.0):.1%} ({self.knowledge.get('hit_count', 0)}/{self.knowledge.get('search_count', 0)})",
             f"Workflow success rate: {self.workflow.get('success_rate', 1.0):.1%} ({self.workflow.get('completed_count', 0)}/{self.workflow.get('started_count', 0)})",
+            f"Self repair: {self.self_repair.get('trigger_count', 0)} triggers, deterministic {self.self_repair.get('deterministic_success_rate', 1.0):.1%} success",
             f"Worker success rate: {self.worker.get('success_rate', 1.0):.1%} ({self.worker.get('done_count', 0)}/{self.worker.get('total_results', 0)})",
             f"Planner coverage: {self.planner.get('plan_count', 0)} plans, {self.planner.get('planned_step_count', 0)} planned steps",
             f"Worker assimilation: {self.worker.get('assimilated_count', 0)} results assimilated",
@@ -106,6 +108,12 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
     workflow_steps: Counter[str] = Counter()
     workflow_failures: Counter[str] = Counter()
     recovery_count = 0
+    self_repair_triggers = 0
+    self_repair_results = 0
+    self_repair_success = 0
+    self_repair_failures = 0
+    self_repair_tools: Counter[str] = Counter()
+    self_repair_reasons: Counter[str] = Counter()
     worker_results: Counter[str] = Counter()
     worker_timeouts = 0
     worker_durations: list[int] = []
@@ -176,8 +184,24 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
                 workflow_steps[task_id] += 1
             if str(event.get("status") or "") in {"fail", "blocked"}:
                 workflow_failures[tool or str(event.get("tool") or "unknown")] += 1
-        elif name == "ToolRecoveryResult":
+        elif name in {"SelfRecoveryAttempt", "SelfRepairPrompt", "PermissionReplaySelfRepair"}:
+            self_repair_triggers += 1
+            if tool:
+                self_repair_tools[tool] += 1
+            reason = str(event.get("reason") or name)
+            self_repair_reasons[reason] += 1
+        elif name in {"SelfRecoveryResult", "ToolRecoveryResult"}:
             recovery_count += 1
+            self_repair_results += 1
+            if tool:
+                self_repair_tools[tool] += 1
+            status = str(event.get("retry_status") or "").casefold()
+            if status == "ok":
+                self_repair_success += 1
+            else:
+                self_repair_failures += 1
+            reason = str(event.get("reason") or name)
+            self_repair_reasons[reason] += 1
         elif name == "worker.result":
             status = str(event.get("status") or "unknown")
             worker_results[status] += 1
@@ -247,6 +271,7 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
     worker_done = worker_results.get("done", 0)
     worker_success_rate = 1.0 if worker_total == 0 else worker_done / worker_total
     worker_average_ms = 0 if not worker_durations else int(sum(worker_durations) / len(worker_durations))
+    deterministic_repair_success_rate = 1.0 if self_repair_results == 0 else self_repair_success / self_repair_results
 
     gate = _gate_status(
         tool_success_rate=tool_success_rate,
@@ -277,6 +302,15 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
             "recovery_count": recovery_count,
             "average_steps_per_task": round(average_steps, 2),
             "top_failure_steps": [{"tool": name, "count": count} for name, count in workflow_failures.most_common(5)],
+        },
+        self_repair={
+            "trigger_count": self_repair_triggers,
+            "result_count": self_repair_results,
+            "success_count": self_repair_success,
+            "failure_count": self_repair_failures,
+            "deterministic_success_rate": round(deterministic_repair_success_rate, 4),
+            "top_tools": [{"tool": name, "count": count} for name, count in self_repair_tools.most_common(5)],
+            "by_reason": dict(sorted(self_repair_reasons.items())),
         },
         worker={
             "total_results": worker_total,

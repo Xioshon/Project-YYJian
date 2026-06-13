@@ -20,6 +20,7 @@ workspace/project_cache/
 workspace/telegram_images/
 workspace/assets/tg_images/
 workspace/assets/screenshots/
+workspace/assets/social_sticker_index.json
 workspace/screenshot_*.png
 
 # Local generated app/project artifacts
@@ -30,4 +31,3 @@ workspace/project/**/*.pyc
 workspace/project_cache/
 *.tmp
 *.bak
-

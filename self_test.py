@@ -1399,6 +1399,10 @@ def live_eval_summarizes_fake_trace_and_writes_report():
         {"event": "ToolError", "tool": "execute_command", "error": "failed"},
         {"event": "PermissionReplayResult", "tool": "write_file", "status": "ok"},
         {"event": "PermissionReplayResult", "tool": "execute_python", "status": "error"},
+        {"event": "PermissionReplaySelfRepair", "tool": "execute_python"},
+        {"event": "SelfRepairPrompt", "tool": "execute_python"},
+        {"event": "SelfRecoveryAttempt", "tool": "send_telegram_media", "reason": "transient_retry"},
+        {"event": "SelfRecoveryResult", "tool": "send_telegram_media", "reason": "transient_retry", "retry_status": "ok"},
         {"event": "FailureReplayCreated", "tool": "execute_command"},
         {"event": "PostToolUse", "tool": "send_telegram_media", "status": "ok", "duration_ms": 3100},
     ]
@@ -1421,6 +1425,11 @@ def live_eval_summarizes_fake_trace_and_writes_report():
         raise AssertionError(data["latency_buckets"])
     if not data["most_failed_tools"] or data["most_failed_tools"][0]["tool"] != "execute_command":
         raise AssertionError(data["most_failed_tools"])
+    self_repair = data["self_repair"]
+    if self_repair["trigger_count"] != 3 or self_repair["result_count"] != 1 or self_repair["success_count"] != 1:
+        raise AssertionError(self_repair)
+    if self_repair["top_tools"][0]["tool"] != "execute_python":
+        raise AssertionError(self_repair)
     written = write_eval_report(report, report_path)
     if not os.path.exists(written):
         raise AssertionError("report was not written")
@@ -1428,7 +1437,10 @@ def live_eval_summarizes_fake_trace_and_writes_report():
         loaded = json.load(file)
     if loaded["knowledge"]["empty_count"] != 1:
         raise AssertionError(loaded["knowledge"])
-    return report.to_text().splitlines()[0]
+    text = report.to_text()
+    if "Self repair:" not in text:
+        raise AssertionError(text)
+    return text.splitlines()[0]
 
 
 def live_eval_writes_permission_health():
