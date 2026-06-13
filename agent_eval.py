@@ -42,6 +42,7 @@ class LiveEvalReport:
     context: dict[str, Any] = field(default_factory=dict)
     subagents: dict[str, Any] = field(default_factory=dict)
     persona: dict[str, Any] = field(default_factory=dict)
+    source_health: dict[str, Any] = field(default_factory=dict)
     permission_policy: dict[str, Any] = field(default_factory=dict)
     render: dict[str, Any] = field(default_factory=dict)
     telegram: dict[str, Any] = field(default_factory=dict)
@@ -67,6 +68,7 @@ class LiveEvalReport:
             f"Subagent health: {self.subagents.get('ok_count', 0)}/{self.subagents.get('run_count', 0)} ok",
             f"Context budget: {self.context.get('last_total_after', 0)}/{self.context.get('last_max_chars', 0)} chars",
             f"Persona health: {self.persona.get('status', 'unknown')}",
+            f"Source health: {self.source_health.get('status', 'unknown')}",
             f"Permission policy: {self.permission_policy.get('status', 'unknown')}",
             f"Render dedupe: {self.render.get('deduped_count', 0)} artifacts deduped",
             f"Repeated failure cases: {self.repeated_failure_count}",
@@ -92,7 +94,7 @@ class LiveEvalReport:
 
 
 def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None = 2000, include_repo: bool = True) -> LiveEvalReport:
-    events = load_trace_events(trace_path, limit=limit)
+    events = _current_session_events(load_trace_events(trace_path, limit=limit))
     tool_calls: Counter[str] = Counter()
     tool_errors: Counter[str] = Counter()
     permission_replay: Counter[str] = Counter()
@@ -261,6 +263,7 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
     knowledge_hit_rate = 1.0 if knowledge_searches == 0 else knowledge_hits / knowledge_searches
     repo_hygiene = check_repo_hygiene() if include_repo else {"status": "skipped", "tracked_private_files": []}
     persona = _load_persona_health()
+    source_health = check_user_facing_source_health()
     permission_policy = _permission_policy_health()
     render = _load_render_dedupe()
     started_count = len(workflow_started)
@@ -280,6 +283,7 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
         repeated_failure_count=repeated_failure_count,
         workflow_success_rate=workflow_success_rate,
         worker_success_rate=worker_success_rate,
+        source_health=source_health,
     )
 
     return LiveEvalReport(
@@ -326,6 +330,7 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
         context={"budget_events": context_events, "last_total_after": last_context_after, "last_max_chars": last_context_max},
         subagents={"run_count": sum(subagent_runs.values()), "ok_count": subagent_runs.get("ok", 0), "by_status": dict(sorted(subagent_runs.items()))},
         persona=persona,
+        source_health=source_health,
         permission_policy=permission_policy,
         render=render,
         telegram={"events": dict(sorted(telegram_events.items()))},
@@ -343,6 +348,13 @@ def write_eval_report(report: LiveEvalReport, path: str = EVAL_REPORT_FILE) -> s
     return path
 
 
+def _current_session_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for index in range(len(events) - 1, -1, -1):
+        if str(events[index].get("event") or "") == "SessionStart":
+            return events[index:]
+    return events
+
+
 def check_repo_hygiene(root_dir: str = ROOT_DIR) -> dict[str, Any]:
     if not os.path.isdir(os.path.join(root_dir, ".git")):
         return {"status": "skipped", "tracked_private_files": []}
@@ -356,6 +368,53 @@ def check_repo_hygiene(root_dir: str = ROOT_DIR) -> dict[str, Any]:
         if path in PRIVATE_GIT_EXACT or path.endswith(".pyc") or any(path == prefix or path.startswith(prefix) for prefix in PRIVATE_GIT_PREFIXES)
     ]
     return {"status": "pass" if not leaked else "fail", "tracked_private_files": leaked[:50]}
+
+
+USER_FACING_SOURCE_FILES = (
+    "agent_user_voice.py",
+    "agent_outcome.py",
+    "agent_latency.py",
+    "agent_tool_runtime.py",
+    "agent_tool_loop.py",
+    "main.py",
+)
+
+SOURCE_MOJIBAKE_MARKERS = ("鍓", "鐪", "绲", "鎴", "锛", "灞", "闆", "铻", "妯", "楹", "�")
+
+SOURCE_REQUIRED_PHRASES = {
+    "agent_user_voice.py": ("我先不直接跑", "可以", "繼續"),
+    "agent_outcome.py": ("有結果", "發給我", "分析一下", "繼續"),
+    "agent_latency.py": ("我先看一下", "我先處理一下", "收到"),
+    "agent_tool_runtime.py": ("你可以說「繼續」接回原任務"),
+    "agent_tool_loop.py": ("系統截圖",),
+}
+
+
+def check_user_facing_source_health(root_dir: str = ROOT_DIR) -> dict[str, Any]:
+    checked: list[str] = []
+    issues: list[dict[str, Any]] = []
+    for filename in USER_FACING_SOURCE_FILES:
+        path = os.path.join(root_dir, filename)
+        checked.append(filename)
+        if not os.path.exists(path):
+            issues.append({"file": filename, "kind": "missing"})
+            continue
+        try:
+            with open(path, "rb") as file:
+                raw = file.read()
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            issues.append({"file": filename, "kind": "invalid_utf8", "message": str(exc)})
+            continue
+        if "????" in text:
+            issues.append({"file": filename, "kind": "question_mark_mojibake"})
+        markers = [marker for marker in SOURCE_MOJIBAKE_MARKERS if marker in text]
+        if markers:
+            issues.append({"file": filename, "kind": "mojibake_markers", "markers": markers[:8]})
+        for phrase in SOURCE_REQUIRED_PHRASES.get(filename, ()):
+            if phrase not in text:
+                issues.append({"file": filename, "kind": "missing_phrase", "phrase": phrase})
+    return {"status": "pass" if not issues else "fail", "checked_files": checked, "issues": issues[:20]}
 
 
 def _load_persona_health() -> dict[str, Any]:
@@ -415,11 +474,21 @@ def _load_render_dedupe() -> dict[str, Any]:
     return {"deduped_count": deduped, "by_kind": dict(sorted(counts.items()))}
 
 
-def _gate_status(tool_success_rate: float, replay_success_rate: float, repo_hygiene: dict[str, Any], repeated_failure_count: int, workflow_success_rate: float = 1.0, worker_success_rate: float = 1.0) -> dict[str, Any]:
+def _gate_status(
+    tool_success_rate: float,
+    replay_success_rate: float,
+    repo_hygiene: dict[str, Any],
+    repeated_failure_count: int,
+    workflow_success_rate: float = 1.0,
+    worker_success_rate: float = 1.0,
+    source_health: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     blockers: list[str] = []
     warnings: list[str] = []
     if repo_hygiene.get("status") == "fail":
         blockers.append("private runtime files are tracked by Git")
+    if source_health and source_health.get("status") == "fail":
+        blockers.append("user-facing source text health failed")
     if tool_success_rate < 0.8:
         blockers.append("tool success rate is below 80%")
     elif tool_success_rate < 0.95:

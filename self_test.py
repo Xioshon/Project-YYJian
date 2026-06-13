@@ -3,12 +3,14 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 import core_tools
+import agent_eval
 import main as main_module
 from agent_latency import (
     DEFAULT_MEDIA_CACHE,
@@ -42,7 +44,7 @@ from agent_knowledge import (
     reindex_workspace,
     search_knowledge,
 )
-from agent_eval import EVAL_REPORT_FILE, PERMISSION_HEALTH_FILE, build_live_eval_report, check_repo_hygiene, write_eval_report
+from agent_eval import EVAL_REPORT_FILE, PERMISSION_HEALTH_FILE, build_live_eval_report, check_repo_hygiene, check_user_facing_source_health, write_eval_report
 from agent_observability import summarize_trace
 from agent_protocol import STICKER_MARKER_LABEL, classify_approval, screenshot_marker, sticker_marker, sticker_pattern
 from agent_runtime_context import build_runtime_context, should_include_task_context
@@ -1405,6 +1407,27 @@ def live_eval_handles_missing_trace():
     return "empty trace eval ok"
 
 
+def live_eval_gate_uses_current_session_window():
+    trace_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "eval_current_session_trace.jsonl")
+    events = [
+        {"event": "SessionStart", "session_id": "old"},
+        {"event": "PostToolUse", "tool": "execute_python", "status": "error", "result": "old failure"},
+        {"event": "ToolError", "tool": "execute_python", "error": "old failure"},
+        {"event": "SessionStart", "session_id": "new"},
+        {"event": "context.budget", "mode": "chat", "total_after": 1000, "max_chars": 9000},
+    ]
+    with open(trace_path, "w", encoding="utf-8") as file:
+        for event in events:
+            file.write(json.dumps(event, ensure_ascii=False) + "\n")
+    report = build_live_eval_report(trace_path, include_repo=False)
+    data = report.to_dict()
+    if data["total_events"] != 2 or data["tool_errors"] != 0:
+        raise AssertionError(data)
+    if data["next_stage_gate"]["status"] != "pass":
+        raise AssertionError(data["next_stage_gate"])
+    return "live eval uses latest session window"
+
+
 def live_eval_repo_hygiene_allows_env_example():
     hygiene = check_repo_hygiene()
     if hygiene.get("status") != "pass":
@@ -1482,6 +1505,58 @@ def live_eval_writes_permission_health():
     if not os.path.exists(PERMISSION_HEALTH_FILE):
         raise AssertionError("permission_health.json was not written")
     return policy.get("principle")
+
+
+def live_eval_reports_user_facing_source_health():
+    health = check_user_facing_source_health()
+    if health.get("status") != "pass":
+        raise AssertionError(health)
+    report = build_live_eval_report(include_repo=False)
+    data = report.to_dict()
+    if data.get("source_health", {}).get("status") != "pass":
+        raise AssertionError(data.get("source_health"))
+    text = report.to_text()
+    if "Source health: pass" not in text:
+        raise AssertionError(text)
+    if data["next_stage_gate"]["status"] != "pass":
+        raise AssertionError(data["next_stage_gate"])
+    return "source health is part of live eval"
+
+
+def source_health_detects_bad_user_facing_text():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for filename in [
+            "agent_user_voice.py",
+            "agent_outcome.py",
+            "agent_latency.py",
+            "agent_tool_runtime.py",
+            "agent_tool_loop.py",
+            "main.py",
+        ]:
+            with open(os.path.join(temp_dir, filename), "w", encoding="utf-8") as file:
+                file.write("# placeholder\n")
+        with open(os.path.join(temp_dir, "agent_user_voice.py"), "w", encoding="utf-8") as file:
+            file.write("BROKEN ????\n")
+        health = check_user_facing_source_health(temp_dir)
+    if health.get("status") != "fail":
+        raise AssertionError(health)
+    kinds = {issue.get("kind") for issue in health.get("issues", [])}
+    if "question_mark_mojibake" not in kinds or "missing_phrase" not in kinds:
+        raise AssertionError(health)
+    return "bad user-facing source health is detected"
+
+
+def source_health_failure_blocks_next_stage_gate():
+    gate = agent_eval._gate_status(
+        tool_success_rate=1.0,
+        replay_success_rate=1.0,
+        repo_hygiene={"status": "pass", "tracked_private_files": []},
+        repeated_failure_count=0,
+        source_health={"status": "fail", "issues": [{"file": "agent_user_voice.py"}]},
+    )
+    if gate.get("status") != "block" or "user-facing source text health failed" not in gate.get("blockers", []):
+        raise AssertionError(gate)
+    return "source health failure blocks the next-stage gate"
 
 
 def action_verification_checks_file_write_and_delete():
@@ -3392,9 +3467,13 @@ def main():
         ("replay_harness_detailed_results_and_failures", replay_harness_detailed_results_and_failures),
         ("observability_summarizes_trace_health", observability_summarizes_trace_health),
         ("live_eval_handles_missing_trace", live_eval_handles_missing_trace),
+        ("live_eval_gate_uses_current_session_window", live_eval_gate_uses_current_session_window),
         ("live_eval_repo_hygiene_allows_env_example", live_eval_repo_hygiene_allows_env_example),
         ("live_eval_summarizes_fake_trace_and_writes_report", live_eval_summarizes_fake_trace_and_writes_report),
         ("live_eval_writes_permission_health", live_eval_writes_permission_health),
+        ("live_eval_reports_user_facing_source_health", live_eval_reports_user_facing_source_health),
+        ("source_health_detects_bad_user_facing_text", source_health_detects_bad_user_facing_text),
+        ("source_health_failure_blocks_next_stage_gate", source_health_failure_blocks_next_stage_gate),
         ("action_verification_checks_file_write_and_delete", action_verification_checks_file_write_and_delete),
         ("task_transaction_records_tool_result", task_transaction_records_tool_result),
         ("task_graph_creates_persists_and_summarizes_steps", task_graph_creates_persists_and_summarizes_steps),
