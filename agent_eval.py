@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from agent_benchmark import load_latest_benchmark_report
 from agent_hooks import TRACE_LOG_FILE
 from agent_observability import load_trace_events
 from core_tools import PROJECT_CACHE_DIR, ROOT_DIR
@@ -41,6 +42,7 @@ class LiveEvalReport:
     planner: dict[str, Any] = field(default_factory=dict)
     context: dict[str, Any] = field(default_factory=dict)
     subagents: dict[str, Any] = field(default_factory=dict)
+    benchmark: dict[str, Any] = field(default_factory=dict)
     persona: dict[str, Any] = field(default_factory=dict)
     source_health: dict[str, Any] = field(default_factory=dict)
     permission_policy: dict[str, Any] = field(default_factory=dict)
@@ -67,6 +69,7 @@ class LiveEvalReport:
             f"Verified waiting workflows: {self.workflow.get('verified_waiting_count', 0)}",
             f"Worker assimilation: {self.worker.get('assimilated_count', 0)} results assimilated",
             f"Subagent health: {self.subagents.get('ok_count', 0)}/{self.subagents.get('run_count', 0)} ok",
+            f"Task benchmark: {self.benchmark.get('passed', 0)}/{self.benchmark.get('total', 0)} passed ({self.benchmark.get('success_rate', 1.0):.1%})",
             f"Context budget: {self.context.get('last_total_after', 0)}/{self.context.get('last_max_chars', 0)} chars",
             f"Persona health: {self.persona.get('status', 'unknown')}",
             f"Source health: {self.source_health.get('status', 'unknown')}",
@@ -271,6 +274,7 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
     source_health = check_user_facing_source_health()
     permission_policy = _permission_policy_health()
     render = _load_render_dedupe()
+    benchmark = load_latest_benchmark_report()
     started_count = len(workflow_started)
     completed_count = len(workflow_completed)
     verified_waiting = (workflow_verified - workflow_completed) - workflow_blocked
@@ -291,6 +295,8 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
         workflow_success_rate=workflow_success_rate,
         worker_success_rate=worker_success_rate,
         source_health=source_health,
+        benchmark_success_rate=float(benchmark.get("success_rate", 1.0) or 1.0),
+        benchmark_failed=int(benchmark.get("failed", 0) or 0),
     )
 
     return LiveEvalReport(
@@ -338,6 +344,7 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
         planner={"plan_count": planner_plans, "planned_step_count": planner_steps, "observe_needed_count": observe_needed},
         context={"budget_events": context_events, "last_total_after": last_context_after, "last_max_chars": last_context_max},
         subagents={"run_count": sum(subagent_runs.values()), "ok_count": subagent_runs.get("ok", 0), "by_status": dict(sorted(subagent_runs.items()))},
+        benchmark=benchmark,
         persona=persona,
         source_health=source_health,
         permission_policy=permission_policy,
@@ -522,6 +529,8 @@ def _gate_status(
     workflow_success_rate: float = 1.0,
     worker_success_rate: float = 1.0,
     source_health: dict[str, Any] | None = None,
+    benchmark_success_rate: float = 1.0,
+    benchmark_failed: int = 0,
 ) -> dict[str, Any]:
     blockers: list[str] = []
     warnings: list[str] = []
@@ -543,6 +552,10 @@ def _gate_status(
         warnings.append("failure replay cases exist; review them before major workflow expansion")
     if worker_success_rate < 0.8:
         warnings.append("background verifier worker success rate is below 80%")
+    if benchmark_failed > 0:
+        blockers.append("task benchmark has failing cases")
+    elif benchmark_success_rate < 1.0:
+        warnings.append("task benchmark is not fully passing")
     return {"status": "pass" if not blockers else "block", "blockers": blockers, "warnings": warnings}
 
 

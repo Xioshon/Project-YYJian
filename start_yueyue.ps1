@@ -185,6 +185,7 @@ try {
             "agent_memory.py",
             "agent_knowledge.py",
             "agent_eval.py",
+            "agent_benchmark.py",
             "agent_task_graph.py",
             "agent_worker.py",
             "agent_planner.py",

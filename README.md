@@ -91,6 +91,8 @@ It does not index `.env`, Telegram chat ids, full `workspace/chat_history/`, scr
 
 It reports tool success rate, permission replay success, permission policy health, planner coverage, workflow success rate, observe-needed counts, background worker success/timeout/assimilation rate, subagent health, persona health, render dedupe, context budget, repeated failure cases, latency buckets, knowledge search hit rate, recent errors, and Git hygiene status. Use it after significant runtime changes before moving to larger workflow or social-layer work.
 
+`agent_benchmark.py` runs a small deterministic local task benchmark and writes `workspace/project_cache/task_benchmark_report.json`. It does not touch Telegram or external services; it checks whether recovery planning, workflow verification evidence, blocked workflow handling, and knowledge search still work. `agent_eval.py` reads the latest benchmark report and treats failing benchmark cases as a next-stage gate blocker.
+
 ## Permission Model
 
 YueYue uses risk-tiered permission. Low-risk local/read-only tools, safe verifier commands, workspace media sending, and memory/profile updates with quality checks should feel smooth. Destructive actions, arbitrary commands, external file paths, downloads, and UI control still require explicit approval.

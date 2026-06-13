@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import core_tools
 import agent_eval
 import main as main_module
+from agent_benchmark import TASK_BENCHMARK_FILE, build_default_benchmark
 from agent_latency import (
     DEFAULT_MEDIA_CACHE,
     InteractionMode,
@@ -87,6 +88,7 @@ _knowledge_manifest_backup = None
 _knowledge_chunks_backup = None
 _knowledge_index_backup = None
 _eval_report_backup = None
+_task_benchmark_backup = None
 _task_graphs_backup = None
 _workflow_replay_backup = None
 _worker_jobs_backup = None
@@ -1545,6 +1547,48 @@ def replay_harness_detailed_results_and_failures():
     if summary["failures"][0]["name"] != "fail" or "boom" not in summary["failures"][0]["message"]:
         raise AssertionError(summary)
     return summary
+
+
+def task_benchmark_runs_default_cases():
+    report_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "task_benchmark_self_test.json")
+    harness = build_default_benchmark()
+    report = harness.write_report(report_path)
+    if report["total"] < 5 or report["failed"] != 0 or report["success_rate"] != 1.0:
+        raise AssertionError(report)
+    categories = set(report.get("by_category", {}))
+    if not {"recovery", "workflow", "knowledge"}.issubset(categories):
+        raise AssertionError(report.get("by_category"))
+    if not os.path.exists(report_path):
+        raise AssertionError("benchmark report was not written")
+    return f"{report['passed']}/{report['total']} benchmark cases passed"
+
+
+def live_eval_reads_task_benchmark_report():
+    previous = _read_optional_file(TASK_BENCHMARK_FILE)
+    payload = {
+        "generated_at": "self-test",
+        "total": 2,
+        "passed": 1,
+        "failed": 1,
+        "success_rate": 0.5,
+        "by_category": {"workflow": {"total": 2, "passed": 1, "failed": 1}},
+        "results": [{"name": "fake", "status": "fail"}],
+    }
+    try:
+        os.makedirs(os.path.dirname(TASK_BENCHMARK_FILE), exist_ok=True)
+        with open(TASK_BENCHMARK_FILE, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False)
+        report = build_live_eval_report(include_repo=False)
+        data = report.to_dict()
+        if data["benchmark"]["failed"] != 1 or data["benchmark"]["success_rate"] != 0.5:
+            raise AssertionError(data["benchmark"])
+        if "task benchmark has failing cases" not in data["next_stage_gate"]["blockers"]:
+            raise AssertionError(data["next_stage_gate"])
+        if "Task benchmark: 1/2 passed" not in report.to_text():
+            raise AssertionError(report.to_text())
+        return data["benchmark"]
+    finally:
+        _restore_optional_file(TASK_BENCHMARK_FILE, previous)
 
 
 def observability_summarizes_trace_health():
@@ -3422,7 +3466,7 @@ def backup_session_brain():
 def backup_reliability_state():
     global _transactions_backup, _failure_replay_backup, _rolling_summary_backup, _memory_compiled_backup, _memory_health_backup
     global _knowledge_manifest_backup, _knowledge_chunks_backup, _knowledge_index_backup
-    global _eval_report_backup
+    global _eval_report_backup, _task_benchmark_backup
     global _task_graphs_backup, _workflow_replay_backup
     global _worker_jobs_backup, _worker_results_backup
     global _context_budget_report_backup, _subagent_runs_backup
@@ -3437,6 +3481,7 @@ def backup_reliability_state():
     _knowledge_chunks_backup = _read_optional_file(KNOWLEDGE_CHUNKS_FILE)
     _knowledge_index_backup = _read_optional_file(KNOWLEDGE_INDEX_FILE)
     _eval_report_backup = _read_optional_file(EVAL_REPORT_FILE)
+    _task_benchmark_backup = _read_optional_file(TASK_BENCHMARK_FILE)
     _task_graphs_backup = _read_optional_file(TASK_GRAPHS_FILE)
     _workflow_replay_backup = _read_optional_file(WORKFLOW_REPLAY_FILE)
     _worker_jobs_backup = _read_optional_file(WORKER_JOBS_FILE)
@@ -3492,6 +3537,7 @@ def restore_reliability_state():
     _restore_optional_file(KNOWLEDGE_CHUNKS_FILE, _knowledge_chunks_backup)
     _restore_optional_file(KNOWLEDGE_INDEX_FILE, _knowledge_index_backup)
     _restore_optional_file(EVAL_REPORT_FILE, _eval_report_backup)
+    _restore_optional_file(TASK_BENCHMARK_FILE, _task_benchmark_backup)
     _restore_optional_file(TASK_GRAPHS_FILE, _task_graphs_backup)
     _restore_optional_file(WORKFLOW_REPLAY_FILE, _workflow_replay_backup)
     _restore_optional_file(WORKER_JOBS_FILE, _worker_jobs_backup)
@@ -3520,7 +3566,7 @@ def _restore_optional_file(path: str, content: str | None) -> None:
 
 
 def cleanup_self_test_files():
-    for name in ("self_test.txt", "permission_test.txt", "wrong_tool.txt", "turn.txt", "delete_me_self_test.txt", "download_test.html", "dedupe_screen.png", "observability_trace_test.jsonl", "eval_trace_test.jsonl", "eval_missing_trace.jsonl", "eval_report_test.json", "workflow_eval_trace_test.jsonl", "worker_eval_trace_test.jsonl", "control_plane_eval_trace_test.jsonl", "worker_jobs_test.jsonl", "worker_results_test.jsonl", "worker_fail_jobs_test.jsonl", "worker_fail_results_test.jsonl", "worker_timeout_jobs_test.jsonl", "worker_timeout_results_test.jsonl", "worker_reject_jobs_test.jsonl", "worker_reject_results_test.jsonl", "worker_subagent_jobs_test.jsonl", "worker_subagent_results_test.jsonl", "continue_worker_jobs_test.jsonl", "continue_worker_results_test.jsonl", "continue_reject_jobs_test.jsonl", "continue_reject_results_test.jsonl", "action_verify.txt", "transaction_test.txt", "transaction_test.json", "task_graph_test.json", "task_graph_permission_test.json", "planner_graph_test.json", "planner_tool_graph_test.json", "worker_assim_graph_test.json", "observe_graph_test.json", "workflow_replay_graph_test.json", "workflow_replay_test.jsonl", "graph_file.txt", "failure_replay_test.jsonl"):
+    for name in ("self_test.txt", "permission_test.txt", "wrong_tool.txt", "turn.txt", "delete_me_self_test.txt", "download_test.html", "dedupe_screen.png", "observability_trace_test.jsonl", "eval_trace_test.jsonl", "eval_missing_trace.jsonl", "eval_report_test.json", "task_benchmark_self_test.json", "benchmark_task_graph.json", "benchmark_blocked_graph.json", "workflow_eval_trace_test.jsonl", "worker_eval_trace_test.jsonl", "control_plane_eval_trace_test.jsonl", "worker_jobs_test.jsonl", "worker_results_test.jsonl", "worker_fail_jobs_test.jsonl", "worker_fail_results_test.jsonl", "worker_timeout_jobs_test.jsonl", "worker_timeout_results_test.jsonl", "worker_reject_jobs_test.jsonl", "worker_reject_results_test.jsonl", "worker_subagent_jobs_test.jsonl", "worker_subagent_results_test.jsonl", "continue_worker_jobs_test.jsonl", "continue_worker_results_test.jsonl", "continue_reject_jobs_test.jsonl", "continue_reject_results_test.jsonl", "action_verify.txt", "transaction_test.txt", "transaction_test.json", "task_graph_test.json", "task_graph_permission_test.json", "planner_graph_test.json", "planner_tool_graph_test.json", "worker_assim_graph_test.json", "observe_graph_test.json", "workflow_replay_graph_test.json", "workflow_replay_test.jsonl", "graph_file.txt", "failure_replay_test.jsonl"):
         try:
             os.remove(os.path.join(core_tools.PROJECT_CACHE_DIR, name))
         except FileNotFoundError:
@@ -3846,6 +3892,8 @@ def main():
         ("soul_persona_keeps_catgirl_without_legacy_rules", soul_persona_keeps_catgirl_without_legacy_rules),
         ("replay_harness_runs_cases", replay_harness_runs_cases),
         ("replay_harness_detailed_results_and_failures", replay_harness_detailed_results_and_failures),
+        ("task_benchmark_runs_default_cases", task_benchmark_runs_default_cases),
+        ("live_eval_reads_task_benchmark_report", live_eval_reads_task_benchmark_report),
         ("observability_summarizes_trace_health", observability_summarizes_trace_health),
         ("live_eval_handles_missing_trace", live_eval_handles_missing_trace),
         ("live_eval_gate_uses_current_session_window", live_eval_gate_uses_current_session_window),

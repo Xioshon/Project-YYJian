@@ -108,6 +108,9 @@ This project should be treated as a small agent runtime, not as a pile of prompt
 - `agent_eval.py`
   Builds the live evaluation gate from trace events: tool success/failure, permission replay success, permission policy health, planner coverage, workflow success, observe-needed counts, worker health, worker assimilation, subagent health, persona health, render dedupe, context budget, recovery count, repeated failures, latency buckets, knowledge hit rate, recent errors, Telegram activity, and Git hygiene.
 
+- `agent_benchmark.py`
+  Runs a deterministic local task benchmark for the control plane. It checks recovery planning, workflow verification evidence, blocked workflow behavior, and knowledge search, then writes `workspace/project_cache/task_benchmark_report.json`. `agent_eval.py` reads this report so benchmark failures become next-stage gate blockers.
+
 - `SocialStickerIndex`
   Builds a local emotion index for stickers, catalogs incoming Telegram stickers as metadata, and supports deterministic sticker selection before LLM fallback.
   Incoming candidates store Telegram emoji, sticker set name, file unique id, media type, and content hash for tagging and duplicate detection. They remain unapproved until curated.
@@ -197,8 +200,9 @@ Before trusting a change:
 ```powershell
 cd C:\Agent
 python -m py_compile core_tools.py core_agent.py main.py self_test.py agent_turns.py agent_session.py agent_context.py agent_memory.py agent_knowledge.py agent_eval.py
-python -m py_compile agent_task_graph.py
+python -m py_compile agent_task_graph.py agent_benchmark.py
 python self_test.py
+python agent_benchmark.py
 python agent_eval.py
 ```
 
