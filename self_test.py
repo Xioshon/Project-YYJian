@@ -91,6 +91,7 @@ _worker_jobs_backup = None
 _worker_results_backup = None
 _context_budget_report_backup = None
 _subagent_runs_backup = None
+_trace_log_backup = None
 
 
 def result_text(value):
@@ -529,6 +530,33 @@ def outcome_intent_helpers_are_deterministic_and_bounded():
     if "execute_python" not in reply or "outcome_format_artifact.png" not in reply:
         raise AssertionError(reply)
     return "outcome helper boundary held"
+
+
+def unicode_intent_routing_uses_real_chinese_not_mojibake():
+    samples = {
+        "result_followup": "\u6709\u7d50\u679c\u55ce",
+        "continue": "\u7e7c\u7e8c",
+        "send_artifact": "\u767c\u7d66\u6211",
+        "analyze": "\u5206\u6790\u4e00\u4e0b",
+        "screen": "\u5e6b\u6211\u622a\u53d6\u96fb\u8166\u5c4f\u5e55\u7684\u756b\u9762",
+        "tool": "\u5e6b\u6211\u4fee bug",
+        "vision": "\u5206\u6790\u9019\u5f35\u5716",
+    }
+    if not is_result_followup(samples["result_followup"]):
+        raise AssertionError("Chinese result follow-up was not detected")
+    if detect_outcome_action(samples["continue"]) != "continue_task":
+        raise AssertionError("Chinese continue intent was not detected")
+    if detect_outcome_action(samples["send_artifact"]) != "send_artifact":
+        raise AssertionError("Chinese send-artifact intent was not detected")
+    if detect_outcome_action(samples["analyze"]) != "analyze_artifact":
+        raise AssertionError("Chinese analyze intent was not detected")
+    if classify_interaction(samples["screen"], False) != InteractionMode.SCREEN_OBSERVE:
+        raise AssertionError("Chinese screen intent should route to screen_observe")
+    if classify_interaction(samples["tool"], False) != InteractionMode.TOOL_TASK:
+        raise AssertionError("Chinese tool intent should route to tool_task")
+    if classify_interaction(samples["vision"], True, "photo") != InteractionMode.VISION_TASK:
+        raise AssertionError("Chinese vision intent with media should route to vision_task")
+    return "unicode intent routing is stable"
 
 
 def outcome_continue_starts_allowlisted_verifier_worker():
@@ -2921,6 +2949,8 @@ def backup_reliability_state():
     global _task_graphs_backup, _workflow_replay_backup
     global _worker_jobs_backup, _worker_results_backup
     global _context_budget_report_backup, _subagent_runs_backup
+    global _trace_log_backup
+    _trace_log_backup = _read_optional_file(TRACE_LOG_FILE)
     _transactions_backup = _read_optional_file(TASK_TRANSACTIONS_FILE)
     _failure_replay_backup = _read_optional_file(FAILURE_REPLAY_FILE)
     _rolling_summary_backup = _read_optional_file(ROLLING_SUMMARY_FILE)
@@ -2975,6 +3005,7 @@ def restore_session_brain():
 
 
 def restore_reliability_state():
+    _restore_optional_file(TRACE_LOG_FILE, _trace_log_backup)
     _restore_optional_file(TASK_TRANSACTIONS_FILE, _transactions_backup)
     _restore_optional_file(FAILURE_REPLAY_FILE, _failure_replay_backup)
     _restore_optional_file(ROLLING_SUMMARY_FILE, _rolling_summary_backup)
@@ -3253,6 +3284,7 @@ def main():
         ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),
         ("outcome_action_without_artifact_is_clear", outcome_action_without_artifact_is_clear),
         ("outcome_intent_helpers_are_deterministic_and_bounded", outcome_intent_helpers_are_deterministic_and_bounded),
+        ("unicode_intent_routing_uses_real_chinese_not_mojibake", unicode_intent_routing_uses_real_chinese_not_mojibake),
         ("outcome_continue_starts_allowlisted_verifier_worker", outcome_continue_starts_allowlisted_verifier_worker),
         ("outcome_continue_rejects_non_allowlisted_verifier_plan", outcome_continue_rejects_non_allowlisted_verifier_plan),
         ("single_approval_does_not_allow_unrelated_tool", single_approval_does_not_allow_unrelated_tool),

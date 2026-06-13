@@ -90,7 +90,18 @@ def dedupe_existing_paths(candidates: list[str]) -> list[str]:
 
 def is_result_followup(text: str) -> bool:
     normalized = (text or "").strip().casefold()
-    markers = ["結果", "有結果", "怎麼樣", "截圖呢", "圖呢", "result", "status"]
+    markers = [
+        "結果",
+        "有結果",
+        "怎麼樣",
+        "截圖呢",
+        "圖呢",
+        "跑完了嗎",
+        "好了嗎",
+        "成功了嗎",
+        "status",
+        "result",
+    ]
     return bool(normalized) and len(normalized) <= 120 and any(marker.casefold() in normalized for marker in markers)
 
 
@@ -98,11 +109,11 @@ def detect_outcome_action(text: str) -> str:
     normalized = (text or "").strip().casefold()
     if not normalized or len(normalized) > 140:
         return ""
-    if any(marker in normalized for marker in ["發給我", "傳給我", "上傳給我", "發圖", "傳圖", "send it", "send file"]):
+    if any(marker in normalized for marker in ["發給我", "传给我", "傳給我", "上傳給我", "发图", "發圖", "send it", "send file"]):
         return "send_artifact"
-    if any(marker in normalized for marker in ["分析一下", "分析下", "這是什麼", "这是什么", "analyze it"]):
+    if any(marker in normalized for marker in ["分析一下", "分析下", "這是什麼", "这是什么", "看看內容", "看看内容", "analyze it"]):
         return "analyze_artifact"
-    if any(marker in normalized for marker in ["繼續", "继续", "下一步", "跑吧", "continue", "next step"]):
+    if any(marker in normalized for marker in ["繼續", "继续", "下一步", "跑吧", "接著", "接着", "再試", "再试", "重試", "重试", "continue", "next step"]):
         return "continue_task"
     return ""
 
@@ -110,7 +121,7 @@ def detect_outcome_action(text: str) -> str:
 def format_last_outcome_reply(brain: SessionBrain) -> str:
     state = brain.state
     if not state.last_tool:
-        return "剛剛沒有可回報的工具結果喵。你要我繼續哪個任務，可以直接說一下。"
+        return "剛剛沒有可回報的工具結果喔。你要我接著哪個任務，可以直接說一下。"
     lines = [f"剛剛 `{state.last_tool}` 的結果是：{state.last_tool_status or 'unknown'}"]
     if state.last_tool_summary:
         lines.append(state.last_tool_summary[-1400:])
@@ -118,7 +129,7 @@ def format_last_outcome_reply(brain: SessionBrain) -> str:
         lines.append("我看到的產物：")
         lines.extend(f"- {item}" for item in state.last_artifacts[-5:])
     if state.pending_validation:
-        lines.append("目前還在等待後續確認：" + " | ".join(state.pending_validation[-3:]))
+        lines.append("目前還在等後續確認：" + " | ".join(state.pending_validation[-3:]))
     return "\n".join(lines)
 
 
@@ -167,7 +178,7 @@ class OutcomeController:
     def maybe_handle(self, action: str, user_input: str, tool_callback: Callable | None) -> OutcomeHandled | None:
         artifact = artifact_for_action(self.session_brain)
         if action in {"send_artifact", "analyze_artifact"} and not artifact:
-            return self._finish(user_input, "剛剛沒有找到可用的產物檔案喵。你要我重新截圖或重跑剛剛的步驟，可以直接說「重試」。")
+            return self._finish(user_input, "剛剛沒有找到可用的產物檔案喔。你要我重新截圖或重跑前面的步驟，可以直接說「重試」。")
         if action == "send_artifact":
             return self._send_artifact(user_input, artifact, tool_callback)
         if action == "analyze_artifact":
@@ -180,13 +191,13 @@ class OutcomeController:
         return self._finish(user_input, format_last_outcome_reply(self.session_brain))
 
     def _send_artifact(self, user_input: str, artifact: str, tool_callback: Callable | None) -> OutcomeHandled:
-        args = {"file_path": artifact, "caption": "剛剛的結果喵"}
+        args = {"file_path": artifact, "caption": "剛剛的結果喔"}
         result = self.executor.execute("send_telegram_media", args, tool_callback, None)
         verification, replay_case = self.after_tool_result("send_telegram_media", args, result)
         if result.status == "ok":
-            final_reply = f"發給你啦喵：{os.path.basename(artifact)}"
+            final_reply = f"發給你啦：{os.path.basename(artifact)}"
         elif replay_case:
-            final_reply = f"`send_telegram_media` 重複卡住，我先停下來了。Replay case: {replay_case.get('name')}"
+            final_reply = f"`send_telegram_media` 重複卡住，我先停一下。replay case: {replay_case.get('name')}"
         elif result.requires_permission:
             self.session_brain.mark_permission_needed("send_telegram_media", self.turn_id_getter(), self.session_id)
             final_reply = f"發送這個檔案需要你確認一下：{os.path.basename(artifact)}"
@@ -202,9 +213,9 @@ class OutcomeController:
         verification, replay_case = self.after_tool_result("analyze_media", args, result)
         if result.status == "ok":
             summary = result.data.get("summary") if isinstance(result.data, dict) else ""
-            final_reply = f"我看完啦喵。\n{summary or result.message}"
+            final_reply = f"我看完啦。\n{summary or result.message}"
         elif replay_case:
-            final_reply = f"`analyze_media` 重複卡住，我先停下來了。Replay case: {replay_case.get('name')}"
+            final_reply = f"`analyze_media` 重複卡住，我先停一下。replay case: {replay_case.get('name')}"
         else:
             final_reply = f"我想分析剛剛的產物，但失敗了：{result.message}"
             if result.error:
@@ -226,7 +237,7 @@ class OutcomeController:
                     },
                 )
                 final_reply = (
-                    f"好，我接著跑 `{verifier_name}` 驗證喵。\n"
+                    f"好，我接著跑 `{verifier_name}` 驗證喔。\n"
                     f"job: {job.job_id}\n"
                     "我先讓背景 verifier 跑，下一輪我會吸收結果再告訴你。"
                 )
@@ -234,7 +245,7 @@ class OutcomeController:
                 final_reply = f"我想接著跑驗證，但 verifier 啟動失敗了：{exc}"
         else:
             final_reply = format_last_outcome_reply(self.session_brain)
-            final_reply += "\n目前沒有明確下一步。你可以說「發給我」「分析一下」或直接補一句新目標。"
+            final_reply += "\n目前沒有明確下一步。你可以說「發給我」「分析一下」，或直接補一句新的目標。"
         return self._finish(user_input, final_reply)
 
     def _finish(self, user_input: str, final_reply: str, **trace_fields: Any) -> OutcomeHandled:
