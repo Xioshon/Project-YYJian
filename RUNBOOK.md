@@ -286,7 +286,7 @@ State separation:
 - Run `python agent_eval.py` after substantial runtime changes and before starting a larger phase.
 - Run `python agent_benchmark.py` before `agent_eval.py` when you want an active local task benchmark rather than only a trace summary.
 - The CLI prints a human-readable gate report and writes `C:\Agent\workspace\project_cache\eval_report.json`.
-- `agent_benchmark.py` writes `C:\Agent\workspace\project_cache\task_benchmark_report.json` and checks deterministic recovery planning, workflow verification evidence, blocked workflow handling, and knowledge search without touching Telegram or live external services.
+- `agent_benchmark.py` writes `C:\Agent\workspace\project_cache\task_benchmark_report.json` and checks deterministic recovery planning, permission replay, route policy, workflow verification evidence, blocked workflow handling, outcome follow-ups, and knowledge search without touching Telegram or live external services.
 - The report includes tool success/failure rate, most failed tools, permission replay success, permission policy health, planner coverage, workflow success rate, observe-needed counts, background worker success/timeout/assimilation rate, subagent health, task benchmark status, persona health, render dedupe, context budget, recovery count, repeated failure replay count, latency buckets, knowledge search hit/empty rate, Telegram media/reaction events, recent errors, and Git hygiene.
 - Passing the next-stage gate means no private runtime files are tracked, tool success rate is at least 80%, and permission/repeated-failure issues are visible instead of hidden.
 - Before a major phase, still run:

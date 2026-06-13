@@ -86,6 +86,14 @@ class LiveEvalReport:
             for group, buckets in sorted(self.latency_buckets.items()):
                 parts.append(group + "[" + ", ".join(f"{name}={count}" for name, count in sorted(buckets.items())) + "]")
             lines.append("Latency: " + "; ".join(parts))
+        benchmark_categories = self.benchmark.get("by_category") or {}
+        if benchmark_categories:
+            parts = []
+            for category, counts in sorted(benchmark_categories.items()):
+                if isinstance(counts, dict):
+                    parts.append(f"{category}={counts.get('passed', 0)}/{counts.get('total', 0)}")
+            if parts:
+                lines.append("Benchmark categories: " + ", ".join(parts))
         blockers = self.next_stage_gate.get("blockers") or []
         if blockers:
             lines.append("Blockers:")

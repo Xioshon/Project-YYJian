@@ -5,12 +5,15 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
+from agent_outcome import detect_outcome_action, is_result_followup
 from agent_action_verification import verify_action
 from agent_hooks import emit_trace
 from agent_knowledge import search_knowledge
+from agent_latency import InteractionMode, response_policy_for
 from agent_self_recovery import diagnose_tool_error, plan_recovery
 from agent_task_graph import TaskGraphManager
-from core_tools import PROJECT_CACHE_DIR, ToolResult
+from agent_tool_runtime import PermissionManager, ToolExecutor, ToolRegistry
+from core_tools import ALL_TOOLS, PROJECT_CACHE_DIR, ToolResult
 
 
 TASK_BENCHMARK_FILE = os.path.join(PROJECT_CACHE_DIR, "task_benchmark_report.json")
@@ -172,6 +175,38 @@ def build_default_benchmark() -> TaskBenchmarkHarness:
             runner=_case_knowledge_search_permission_replay,
         )
     )
+    harness.register(
+        BenchmarkCase(
+            name="permission_single_replay_exact_action",
+            description="single approval preserves and exposes the original pending action",
+            category="permission",
+            runner=_case_permission_single_replay_exact_action,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
+            name="screen_route_allows_safe_verifier",
+            description="screen_observe route allows safe verifier commands instead of blocking recovery",
+            category="route",
+            runner=_case_screen_route_allows_safe_verifier,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
+            name="transient_error_plans_safe_retry",
+            description="transient Telegram/network style errors produce bounded exact retry plans",
+            category="recovery",
+            runner=_case_transient_error_plans_safe_retry,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
+            name="outcome_followup_intent_stays_available",
+            description="terse result/continue followups remain classified without replanning",
+            category="conversation",
+            runner=_case_outcome_followup_intent_stays_available,
+        )
+    )
     return harness
 
 
@@ -256,6 +291,53 @@ def _case_knowledge_search_permission_replay() -> dict[str, Any]:
     hits = search_knowledge("permission replay execute_command cwd recovery", limit=3)
     ok = bool(hits)
     return {"ok": ok, "message": f"{len(hits)} hits", "hit_count": len(hits), "top_hit": hits[0]["title"] if hits else ""}
+
+
+def _case_permission_single_replay_exact_action() -> dict[str, Any]:
+    manager = PermissionManager(session_id="benchmark")
+    original_args = {"code": "print('benchmark')", "timeout": 5}
+    manager.record_blocked("execute_python", original_args, turn_id=1)
+    grant = manager.classify_user_reply("可以", turn_id=2)
+    action = manager.pop_approved_action()
+    exact = bool(action and action.tool_name == "execute_python" and action.arguments == original_args)
+    no_second_action = manager.pop_approved_action() is None
+    return {"ok": grant == "single" and exact and no_second_action, "message": grant, "tool": getattr(action, "tool_name", ""), "exact": exact}
+
+
+def _case_screen_route_allows_safe_verifier() -> dict[str, Any]:
+    registry = ToolRegistry()
+    for tool in ALL_TOOLS:
+        registry.add(tool)
+    permissions = PermissionManager(session_id="benchmark")
+    executor = ToolExecutor(registry, permissions, interactive_mode=False, session_id="benchmark")
+    policy = response_policy_for(InteractionMode.SCREEN_OBSERVE)
+    result = executor.execute("execute_command", {"command": "python -m py_compile core_tools.py", "timeout": 30}, None, policy)
+    return {"ok": result.status == "ok", "message": result.message, "returncode": (result.data or {}).get("returncode") if isinstance(result.data, dict) else None}
+
+
+def _case_transient_error_plans_safe_retry() -> dict[str, Any]:
+    result = ToolResult(
+        "error",
+        "Telegram send failed.",
+        error="('Connection aborted.', ConnectionResetError(10054, 'remote host closed an existing connection', None, 10054, None))",
+    )
+    args = {"file_path": os.path.join(PROJECT_CACHE_DIR, "benchmark.png"), "caption": "benchmark"}
+    diagnosis = diagnose_tool_error("send_telegram_media", args, result)
+    plan = plan_recovery("send_telegram_media", args, result, diagnosis, max_transient_retries=2)
+    ok = bool(plan and plan.strategy == "transient_retry" and plan.max_attempts == 2)
+    return {"ok": ok, "message": diagnosis.category, "recovery_used": bool(plan), "strategy": getattr(plan, "strategy", ""), "max_attempts": getattr(plan, "max_attempts", 0)}
+
+
+def _case_outcome_followup_intent_stays_available() -> dict[str, Any]:
+    checks = {
+        "continue_traditional": detect_outcome_action("繼續") == "continue_task",
+        "continue_simplified": detect_outcome_action("继续") == "continue_task",
+        "retry": detect_outcome_action("再試一次") == "continue_task",
+        "result_followup": is_result_followup("有結果嗎"),
+        "result_followup_short": is_result_followup("結果呢"),
+    }
+    ok = all(checks.values())
+    return {"ok": ok, "message": "ok" if ok else str({key: value for key, value in checks.items() if not value}), **checks}
 
 
 def _group_by_category(results: list[BenchmarkResult]) -> dict[str, list[BenchmarkResult]]:
