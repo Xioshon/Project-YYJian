@@ -148,6 +148,13 @@ class PermissionManager:
         return "none"
 
     def can_execute(self, tool_name: str, arguments: dict, turn_id: int = 0) -> bool:
+        if self.grant.scope == "repair" and self.grant.remaining_uses > 0:
+            if tool_name == self.grant.tool_name:
+                self.grant.remaining_uses -= 1
+                self.hooks.emit("PermissionConsumed", session_id=self.session_id, turn_id=turn_id, scope="repair", tool=tool_name, remaining_uses=self.grant.remaining_uses)
+                return True
+            self.hooks.emit("PermissionDeniedMismatch", session_id=self.session_id, turn_id=turn_id, scope="repair", expected_tool=self.grant.tool_name, tool=tool_name)
+            return False
         if self.grant.scope == "turn" and self.grant.remaining_uses > 0:
             if self.grant.allowed_tools and tool_name not in self.grant.allowed_tools:
                 self.hooks.emit(
@@ -179,8 +186,12 @@ class PermissionManager:
         return action
 
     def reset_after_turn(self) -> None:
-        if self.grant.scope == "turn" or self.grant.remaining_uses <= 0:
+        if self.grant.scope in {"turn", "repair"} or self.grant.remaining_uses <= 0:
             self.grant = PermissionGrant()
+
+    def grant_repair_tool(self, tool_name: str, turn_id: int = 0) -> None:
+        self.grant = PermissionGrant(scope="repair", tool_name=tool_name, remaining_uses=1)
+        self.hooks.emit("PermissionGranted", session_id=self.session_id, turn_id=turn_id, scope="repair", tool=tool_name)
 
 
 class ToolRegistry:

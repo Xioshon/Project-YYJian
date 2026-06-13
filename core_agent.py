@@ -172,7 +172,7 @@ class CompanionAgent:
             turn_id_getter=lambda: self.turn_id,
         )
 
-    def _permission_replay_controller(self, turn_intent: str, worker_results: list[dict[str, Any]]) -> PermissionReplayController:
+    def _permission_replay_controller(self, turn_intent: str, worker_results: list[dict[str, Any]], response_policy: ResponsePolicy) -> PermissionReplayController:
         return PermissionReplayController(
             permission_manager=self.permission_manager,
             session_brain=self.session_brain,
@@ -181,6 +181,9 @@ class CompanionAgent:
             after_tool_result=self._after_tool_result,
             append_user_context=lambda text: self._append_user_context_message(text, turn_intent, worker_results, include_task_context=True),
             append_assistant_reply=self._append_assistant_only,
+            memory=self.memory,
+            continue_after_error=lambda tool_callback: self._tool_loop_controller(response_policy).run(self.memory, "permission replay repair", tool_callback),
+            response_policy=response_policy,
             reset_turn_state=self._reset_after_deterministic_turn,
             session_id=self.session_id,
             turn_id_getter=lambda: self.turn_id,
@@ -280,7 +283,7 @@ class CompanionAgent:
             self.hooks.emit("Stop", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
             return {"content": final_reply, "reasoning": ""}
         if grant == "single":
-            replayed = self._permission_replay_controller(turn_classification.intent, assimilated_worker_results).maybe_replay(grant, user_input, tool_callback)
+            replayed = self._permission_replay_controller(turn_classification.intent, assimilated_worker_results, response_policy).maybe_replay(grant, user_input, tool_callback)
             if replayed is not None:
                 self._remember_turn_summary(user_input, replayed.content)
                 return replayed.to_chat_result()

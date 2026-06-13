@@ -245,6 +245,37 @@ class PermissionReplayPythonAdapter:
         return {"role": "assistant", "content": "unexpected replanning"}
 
 
+class PermissionReplayRepairAdapter:
+    def __init__(self):
+        self.calls = 0
+        self.saw_repair_prompt = False
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            args = {"code": "import mss\nprint('capture screen')"}
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_py_missing_mss", "name": "execute_python", "arguments": args, "raw_arguments": json.dumps(args)}],
+            }
+        tool_text = "\n".join(message.get("content", "") for message in messages if message.get("role") == "tool")
+        if "fallback screenshot ok" in tool_text or '"status": "ok"' in tool_text:
+            return {"role": "assistant", "content": "我自己換了 fallback 截圖方式，已經跑通了"}
+        system_text = "\n".join(message.get("content", "") for message in messages if message.get("role") == "system")
+        if "[SelfRepair]" in system_text:
+            self.saw_repair_prompt = True
+            args = {"code": "print('fallback screenshot ok')"}
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_py_fallback", "name": "execute_python", "arguments": args, "raw_arguments": json.dumps(args)}],
+            }
+        if "requires_permission" in tool_text or '"status": "blocked"' in tool_text:
+            return {"role": "assistant", "content": "需要你確認一下權限喔，可以嗎？"}
+        return {"role": "assistant", "content": "沒有進入 replay repair"}
+
+
 def permission_replay_bypasses_chat_route_policy():
     agent = CompanionAgent(PermissionReplayPythonAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "permission_python_route_test.json"))
     agent.interactive_mode = False
@@ -261,6 +292,38 @@ def permission_replay_bypasses_chat_route_policy():
     if agent.llm.calls != 2:
         raise AssertionError(f"approval should replay without replanning; calls={agent.llm.calls}")
     return "approved pending python replay bypassed chat route policy"
+
+
+def permission_replay_failed_python_enters_self_repair_loop():
+    attempts = {"count": 0}
+
+    def fake_python(code: str, timeout: int = 30):
+        attempts["count"] += 1
+        if "import mss" in code:
+            return core_tools.ToolResult(
+                "error",
+                "Python failed.",
+                data={"returncode": 1, "stdout": "", "stderr": "ModuleNotFoundError: No module named 'mss'"},
+                error="ModuleNotFoundError: No module named 'mss'",
+            )
+        return core_tools.ToolResult("ok", "Python completed.", data={"returncode": 0, "stdout": "fallback screenshot ok", "stderr": ""})
+
+    agent = CompanionAgent(PermissionReplayRepairAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "permission_replay_repair_test.json"))
+    agent.interactive_mode = False
+    agent.add_tool(core_tools.AgentTool("execute_python", "fake python", fake_python, {"type": "object", "properties": {"code": {"type": "string"}, "timeout": {"type": "integer"}}}, True))
+    first = agent.chat("請截圖看看", response_policy=response_policy_for(InteractionMode.TOOL_TASK))
+    if "可以" not in first["content"] and "requires approval" not in first["content"]:
+        raise AssertionError(first)
+    second = agent.chat("可以", response_policy=response_policy_for(InteractionMode.CHAT))
+    if "fallback" not in second["content"] and "跑通" not in second["content"]:
+        raise AssertionError(second)
+    if attempts["count"] != 2:
+        raise AssertionError(f"expected failed replay plus one repair attempt, got {attempts['count']}")
+    if not agent.llm.saw_repair_prompt:
+        raise AssertionError("replay failure did not present self-repair prompt")
+    if any("[SelfRepair]" in message.get("content", "") for message in agent.memory if message.get("role") == "system"):
+        raise AssertionError("transient self-repair leaked into memory")
+    return "failed permission replay entered bounded self-repair loop"
 
 
 def permission_replay_lives_in_controller_not_core_loop():
@@ -3166,6 +3229,7 @@ def main():
         ("unknown_tool_fallback", unknown_tool_fallback),
         ("permission_followup_allows_exact_tool", permission_followup_allows_exact_tool),
         ("permission_replay_bypasses_chat_route_policy", permission_replay_bypasses_chat_route_policy),
+        ("permission_replay_failed_python_enters_self_repair_loop", permission_replay_failed_python_enters_self_repair_loop),
         ("permission_replay_lives_in_controller_not_core_loop", permission_replay_lives_in_controller_not_core_loop),
         ("tool_loop_lives_in_controller_not_core_loop", tool_loop_lives_in_controller_not_core_loop),
         ("tool_runtime_services_are_outside_core_agent", tool_runtime_services_are_outside_core_agent),
