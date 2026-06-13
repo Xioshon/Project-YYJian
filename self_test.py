@@ -2012,6 +2012,36 @@ def user_visible_tool_blocks_hide_internal_route_terms():
     return result.message
 
 
+def user_voice_strings_are_unicode_safe():
+    import agent_user_voice
+
+    runtime_source = open(os.path.join(os.path.dirname(__file__), "agent_tool_runtime.py"), "r", encoding="utf-8").read()
+    loop_source = open(os.path.join(os.path.dirname(__file__), "agent_tool_loop.py"), "r", encoding="utf-8").read()
+    samples = [
+        agent_user_voice.friendly_tool_block("execute_python"),
+        agent_user_voice.friendly_tool_block("read_file", core_tools.ToolResult("blocked", "Need a cleaner path.", data={"retry_hint": "請換一個檔案路徑。"})),
+        agent_user_voice.repeated_tool_stop_reply("execute_python", "case_1"),
+        agent_user_voice.failsafe_reply(" [系統截圖: screen.png]"),
+        agent_user_voice.failure_replay_reply("execute_command", "case_2", "trace.jsonl"),
+        agent_user_voice.tool_loop_timeout_reply(),
+        agent_user_voice.empty_reply_fallback(),
+        agent_user_voice.permission_request_reply("execute_command"),
+    ]
+    bad_markers = ["鍓", "鐪", "绲", "鎴", "锛", "灞", "�"]
+    for sample in samples:
+        if any(marker in sample for marker in bad_markers):
+            raise AssertionError(sample)
+    combined = "\n".join(samples)
+    for expected in ["可以", "繼續", "系統截圖", "主人"]:
+        if expected not in combined:
+            raise AssertionError(combined)
+    if "你可以說「繼續」接回原任務" not in runtime_source:
+        raise AssertionError("runtime retry hint is not Unicode-safe")
+    if "[系統截圖: {screen}]" not in loop_source:
+        raise AssertionError("failsafe screenshot marker is not Unicode-safe")
+    return "user-visible runtime voice is unicode-safe"
+
+
 def semantic_intent_upgrades_chat_policy_without_user_modes():
     chat_policy = response_policy_for(InteractionMode.CHAT)
     upgraded = policy_for_semantic_intent("task_continuation", chat_policy)
@@ -3357,6 +3387,7 @@ def main():
         ("latency_policy_classifies_modes", latency_policy_classifies_modes),
         ("chat_policy_blocks_vision_tool", chat_policy_blocks_vision_tool),
         ("user_visible_tool_blocks_hide_internal_route_terms", user_visible_tool_blocks_hide_internal_route_terms),
+        ("user_voice_strings_are_unicode_safe", user_voice_strings_are_unicode_safe),
         ("semantic_intent_upgrades_chat_policy_without_user_modes", semantic_intent_upgrades_chat_policy_without_user_modes),
         ("safe_verifier_command_runs_in_screen_observe_route", safe_verifier_command_runs_in_screen_observe_route),
         ("arbitrary_command_still_requires_permission", arbitrary_command_still_requires_permission),

@@ -52,7 +52,7 @@ def tool_loop_timeout_reply() -> str:
 
 
 def empty_reply_fallback() -> str:
-    return "主人，我處理好了喵。"
+    return "主人，我處理好了喔。"
 
 
 def permission_request_reply(tool_name: str, arguments: dict[str, Any] | None = None) -> str:
