@@ -183,6 +183,7 @@ class CompanionAgent:
             append_assistant_reply=self._append_assistant_only,
             memory=self.memory,
             continue_after_error=lambda tool_callback: self._tool_loop_controller(response_policy).run(self.memory, "permission replay repair", tool_callback),
+            recover_tool_result=self._recover_tool_result,
             response_policy=response_policy,
             reset_turn_state=self._reset_after_deterministic_turn,
             session_id=self.session_id,

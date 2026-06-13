@@ -279,6 +279,25 @@ class PermissionReplayRepairAdapter:
         return {"role": "assistant", "content": "沒有進入 replay repair"}
 
 
+class PermissionReplayTransientAdapter:
+    def __init__(self):
+        self.calls = 0
+        self.args = {"query": "telegram send"}
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_flaky", "name": "fake_flaky_search", "arguments": self.args, "raw_arguments": json.dumps(self.args)}],
+            }
+        tool_text = "\n".join(message.get("content", "") for message in messages if message.get("role") == "tool")
+        if "requires_permission" in tool_text or '"status": "blocked"' in tool_text:
+            return {"role": "assistant", "content": "這一步需要你確認一下，可以嗎？"}
+        return {"role": "assistant", "content": "unexpected replanning"}
+
+
 def permission_replay_bypasses_chat_route_policy():
     agent = CompanionAgent(PermissionReplayPythonAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "permission_python_route_test.json"))
     agent.interactive_mode = False
@@ -295,6 +314,34 @@ def permission_replay_bypasses_chat_route_policy():
     if agent.llm.calls != 2:
         raise AssertionError(f"approval should replay without replanning; calls={agent.llm.calls}")
     return "approved pending python replay bypassed chat route policy"
+
+
+def permission_replay_recovers_transient_error_before_reply():
+    attempts = {"count": 0}
+
+    def flaky_search(query: str):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+        return core_tools.ToolResult("ok", "Search completed.", data=["recovered result"])
+
+    agent = CompanionAgent(PermissionReplayTransientAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "permission_replay_transient_test.json"))
+    agent.interactive_mode = False
+    agent.add_tool(core_tools.AgentTool("fake_flaky_search", "fake flaky guarded search", flaky_search, {"type": "object", "properties": {"query": {"type": "string"}}}, True))
+    agent.self_recovery = SelfRecoveryController(executor=agent.executor, hooks=agent.hooks, session_id=agent.session_id)
+    agent.self_recovery._can_retry_exactly = lambda tool_name, arguments: tool_name == "fake_flaky_search"
+    first = agent.chat("幫我跑一個會暫時斷線的任務", response_policy=response_policy_for(InteractionMode.TOOL_TASK))
+    if "可以" not in first["content"] and "requires approval" not in first["content"]:
+        raise AssertionError(first)
+    calls_before_approval = agent.llm.calls
+    second = agent.chat("可以", response_policy=response_policy_for(InteractionMode.CHAT))
+    if attempts["count"] != 2:
+        raise AssertionError(f"expected replay plus automatic retry, got {attempts['count']}")
+    if "Search completed" not in second["content"]:
+        raise AssertionError(second)
+    if agent.llm.calls != calls_before_approval:
+        raise AssertionError(f"approval replay should not ask the model to replan; calls={agent.llm.calls}")
+    return "permission replay recovered transient error before replying"
 
 
 def permission_replay_failed_python_enters_self_repair_loop():
@@ -1426,6 +1473,25 @@ def live_eval_gate_uses_current_session_window():
     if data["next_stage_gate"]["status"] != "pass":
         raise AssertionError(data["next_stage_gate"])
     return "live eval uses latest session window"
+
+
+def live_eval_ignores_self_test_sessions_for_gate():
+    trace_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "eval_self_test_trace.jsonl")
+    events = [
+        {"event": "SessionStart", "session_id": "debug_perm_replay", "history_file": "workspace/history/debug_perm_replay.json"},
+        {"event": "PostToolUse", "tool": "execute_python", "status": "error", "result": "intentional self-test failure"},
+        {"event": "ToolError", "tool": "execute_python", "error": "intentional self-test failure"},
+    ]
+    with open(trace_path, "w", encoding="utf-8") as file:
+        for event in events:
+            file.write(json.dumps(event, ensure_ascii=False) + "\n")
+    report = build_live_eval_report(trace_path, include_repo=False)
+    data = report.to_dict()
+    if data["total_events"] != 0 or data["tool_errors"] != 0:
+        raise AssertionError(data)
+    if data["next_stage_gate"]["status"] != "pass":
+        raise AssertionError(data["next_stage_gate"])
+    return "self-test sessions do not pollute live eval"
 
 
 def live_eval_repo_hygiene_allows_env_example():
@@ -3414,6 +3480,7 @@ def main():
         ("unknown_tool_fallback", unknown_tool_fallback),
         ("permission_followup_allows_exact_tool", permission_followup_allows_exact_tool),
         ("permission_replay_bypasses_chat_route_policy", permission_replay_bypasses_chat_route_policy),
+        ("permission_replay_recovers_transient_error_before_reply", permission_replay_recovers_transient_error_before_reply),
         ("permission_replay_failed_python_enters_self_repair_loop", permission_replay_failed_python_enters_self_repair_loop),
         ("permission_replay_lives_in_controller_not_core_loop", permission_replay_lives_in_controller_not_core_loop),
         ("tool_loop_lives_in_controller_not_core_loop", tool_loop_lives_in_controller_not_core_loop),
@@ -3468,6 +3535,7 @@ def main():
         ("observability_summarizes_trace_health", observability_summarizes_trace_health),
         ("live_eval_handles_missing_trace", live_eval_handles_missing_trace),
         ("live_eval_gate_uses_current_session_window", live_eval_gate_uses_current_session_window),
+        ("live_eval_ignores_self_test_sessions_for_gate", live_eval_ignores_self_test_sessions_for_gate),
         ("live_eval_repo_hygiene_allows_env_example", live_eval_repo_hygiene_allows_env_example),
         ("live_eval_summarizes_fake_trace_and_writes_report", live_eval_summarizes_fake_trace_and_writes_report),
         ("live_eval_writes_permission_health", live_eval_writes_permission_health),

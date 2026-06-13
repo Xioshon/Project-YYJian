@@ -350,9 +350,22 @@ def write_eval_report(report: LiveEvalReport, path: str = EVAL_REPORT_FILE) -> s
 
 def _current_session_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for index in range(len(events) - 1, -1, -1):
-        if str(events[index].get("event") or "") == "SessionStart":
+        if str(events[index].get("event") or "") == "SessionStart" and not _is_test_session(events[index]):
             return events[index:]
+    if any(str(event.get("event") or "") == "SessionStart" for event in events):
+        return []
     return events
+
+
+def _is_test_session(event: dict[str, Any]) -> bool:
+    session_id = str(event.get("session_id") or "").casefold()
+    history_file = str(event.get("history_file") or "").replace("\\", "/").casefold()
+    markers = ("test", "self_test", "debug")
+    return (
+        any(marker in session_id for marker in markers)
+        or any(marker in history_file for marker in markers)
+        or "workspace/history/" in history_file
+    )
 
 
 def check_repo_hygiene(root_dir: str = ROOT_DIR) -> dict[str, Any]:

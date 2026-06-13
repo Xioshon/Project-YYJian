@@ -31,6 +31,7 @@ class PermissionReplayController:
         append_assistant_reply: Callable[[str], None],
         memory: list[dict[str, Any]] | None = None,
         continue_after_error: Callable[[Callable | None], Any] | None = None,
+        recover_tool_result: Callable[[str, dict, ToolResult, Callable | None, Any], tuple[ToolResult, dict[str, Any] | None]] | None = None,
         response_policy: Any = None,
         reset_turn_state: Callable[[], None],
         session_id: str,
@@ -41,6 +42,7 @@ class PermissionReplayController:
         self.executor = executor
         self.hooks = hooks
         self.after_tool_result = after_tool_result
+        self.recover_tool_result = recover_tool_result
         self.append_user_context = append_user_context
         self.append_assistant_reply = append_assistant_reply
         self.memory = memory
@@ -67,6 +69,16 @@ class PermissionReplayController:
             arguments=approved_action.arguments,
         )
         result = self.executor.execute(approved_action.tool_name, approved_action.arguments, tool_callback, None)
+        if self.recover_tool_result is not None:
+            if result.status == "error" and hasattr(self.permission_manager, "grant_repair_tool"):
+                self.permission_manager.grant_repair_tool(approved_action.tool_name, turn_id)
+            result, _recovery = self.recover_tool_result(
+                approved_action.tool_name,
+                approved_action.arguments,
+                result,
+                tool_callback,
+                self.response_policy,
+            )
         verification, replay_case = self.after_tool_result(approved_action.tool_name, approved_action.arguments, result)
         self.hooks.emit(
             "PermissionReplayResult",
