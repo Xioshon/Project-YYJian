@@ -319,6 +319,8 @@ python -c "import agent_knowledge; print(agent_knowledge.reindex_workspace())"
 - Other cwd values are rejected.
 - Command results include `cwd`, `resolved_cwd`, `project_root`, `returncode`, and `retry_hint`.
 - If `execute_command` fails from `cwd="workspace"` because a project-root file is missing, `CompanionAgent` retries once with `cwd="project"` and emits `ToolRecoveryAttempt` / `ToolRecoveryResult`.
+- Self recovery now follows a small diagnose -> plan -> execute flow. Known safe plans include cwd retry, missing-`mss` screenshot fallback through `pyautogui`/PIL, and exact retry for transient errors on idempotent tools or allowlisted verifier commands.
+- Unknown dependency failures, unsafe Python, destructive commands, and non-idempotent retries do not get automatic recovery plans; YueYue should explain what is needed instead of pretending it succeeded.
 
 ## Tool Count
 

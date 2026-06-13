@@ -42,8 +42,8 @@ This project should be treated as a small agent runtime, not as a pile of prompt
 - `ToolExecutor`
   Applies confirmation policy, invokes tools, catches exceptions, emits trace events, and normalizes results.
 
-- `ExecutionRecovery`
-  Lets the agent recover from clear cwd-related `execute_command` failures by retrying once from the project root and recording recovery events.
+- `SelfRecoveryController`
+  Diagnoses structured tool failures, selects a bounded recovery plan, and records recovery evidence before the agent asks the owner for help. Current deterministic strategies cover cwd/path retry for safe commands, missing-`mss` screenshot fallback through available local screenshot libraries, and exact retry for transient errors on idempotent tools or allowlisted verifier commands. Unknown or unsafe failures do not get automatic recovery plans.
 
 - `TaskTransactionManager`
   Stores local JSON task transactions with objective, current step, created files, cleanup intent, tool results, and verification status.

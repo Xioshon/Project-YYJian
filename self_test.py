@@ -50,7 +50,7 @@ from agent_protocol import STICKER_MARKER_LABEL, classify_approval, screenshot_m
 from agent_runtime_context import build_runtime_context, should_include_task_context
 from agent_action_verification import verify_action
 from agent_replay import FAILURE_REPLAY_FILE, ReplayCase, ReplayHarness, record_failure_replay
-from agent_self_recovery import SelfRecoveryController, _looks_like_screenshot_code, _missing_module_name
+from agent_self_recovery import SelfRecoveryController, _looks_like_screenshot_code, _missing_module_name, diagnose_tool_error, plan_recovery
 from agent_session import SESSION_BRAIN_FILE, SessionBrain
 from agent_skills import DEFAULT_SKILL_REGISTRY
 from agent_social import SocialCurationReminder, SocialSessionManager, SocialStickerIndex, infer_intent_tags, infer_metadata_tags, infer_social_mode, infer_sticker_tags, is_safe_sticker, social_reply_policy_for
@@ -920,6 +920,53 @@ def missing_mss_screenshot_recovery_uses_safe_fallback():
     if "fullscreen_screenshot.png" not in attempts["fallback_code"]:
         raise AssertionError(attempts["fallback_code"])
     return "missing mss screenshot recovered through safe fallback"
+
+
+def self_recovery_diagnoses_and_plans_known_errors():
+    cwd_result = core_tools.ToolResult(
+        "error",
+        "Command failed.",
+        data={"cwd": "workspace", "retry_hint": "Command could not find a file. Verify cwd and paths."},
+    )
+    cwd_args = {"command": "python -m py_compile ../core_tools.py", "cwd": "workspace"}
+    cwd_diagnosis = diagnose_tool_error("execute_command", cwd_args, cwd_result)
+    cwd_plan = plan_recovery("execute_command", cwd_args, cwd_result, cwd_diagnosis)
+    if cwd_diagnosis.category != "cwd_or_path_mismatch" or not cwd_plan or cwd_plan.strategy != "cwd_retry":
+        raise AssertionError((cwd_diagnosis, cwd_plan))
+    if cwd_plan.retry_args.get("cwd") != "project":
+        raise AssertionError(cwd_plan)
+
+    mss_result = core_tools.ToolResult("error", "Python failed.", error="ModuleNotFoundError: No module named 'mss'")
+    mss_args = {"code": "import mss\nsct.grab(sct.monitors[0]).save('screen.png')", "timeout": 30}
+    mss_diagnosis = diagnose_tool_error("execute_python", mss_args, mss_result)
+    mss_plan = plan_recovery("execute_python", mss_args, mss_result, mss_diagnosis)
+    if mss_diagnosis.category != "missing_python_module" or not mss_plan or mss_plan.strategy != "missing_mss_screenshot_fallback":
+        raise AssertionError((mss_diagnosis, mss_plan))
+
+    transient = core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+    transient_args = {"query": "hello"}
+    transient_diagnosis = diagnose_tool_error("search_knowledge", transient_args, transient)
+    transient_plan = plan_recovery("search_knowledge", transient_args, transient, transient_diagnosis, max_transient_retries=2)
+    if transient_diagnosis.category != "transient_external_error" or not transient_plan or transient_plan.max_attempts != 2:
+        raise AssertionError((transient_diagnosis, transient_plan))
+    return "known recovery errors diagnose and plan deterministically"
+
+
+def self_recovery_does_not_plan_unsafe_unknown_errors():
+    result = core_tools.ToolResult("error", "Python failed.", error="ModuleNotFoundError: No module named 'numpy'")
+    args = {"code": "import numpy\nprint('x')"}
+    diagnosis = diagnose_tool_error("execute_python", args, result)
+    plan = plan_recovery("execute_python", args, result, diagnosis)
+    if diagnosis.safe_to_auto_repair or plan is not None:
+        raise AssertionError((diagnosis, plan))
+
+    transient = core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+    unsafe_args = {"code": "print('x')"}
+    unsafe_diagnosis = diagnose_tool_error("execute_python", unsafe_args, transient)
+    unsafe_plan = plan_recovery("execute_python", unsafe_args, transient, unsafe_diagnosis)
+    if unsafe_diagnosis.safe_to_auto_repair or unsafe_plan is not None:
+        raise AssertionError((unsafe_diagnosis, unsafe_plan))
+    return "unknown or unsafe errors do not create auto-recovery plans"
 
 
 def missing_mss_recovery_bypasses_chat_route_allowlist():
@@ -3717,6 +3764,8 @@ def main():
         ("transient_tool_error_recovers_before_user_followup", transient_tool_error_recovers_before_user_followup),
         ("self_recovery_does_not_retry_unsafe_python", self_recovery_does_not_retry_unsafe_python),
         ("missing_mss_screenshot_recovery_uses_safe_fallback", missing_mss_screenshot_recovery_uses_safe_fallback),
+        ("self_recovery_diagnoses_and_plans_known_errors", self_recovery_diagnoses_and_plans_known_errors),
+        ("self_recovery_does_not_plan_unsafe_unknown_errors", self_recovery_does_not_plan_unsafe_unknown_errors),
         ("missing_mss_recovery_bypasses_chat_route_allowlist", missing_mss_recovery_bypasses_chat_route_allowlist),
         ("missing_module_recovery_is_narrow", missing_module_recovery_is_narrow),
         ("tool_loop_prompts_self_repair_before_user_followup", tool_loop_prompts_self_repair_before_user_followup),
