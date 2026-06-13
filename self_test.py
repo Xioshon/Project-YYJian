@@ -1876,12 +1876,36 @@ def live_eval_counts_workflow_metrics():
     workflow = report.to_dict()["workflow"]
     if workflow["started_count"] != 2 or workflow["completed_count"] != 1 or workflow["blocked_count"] != 1:
         raise AssertionError(workflow)
+    if workflow["verified_waiting_count"] != 0 or workflow["effective_success_count"] != 1:
+        raise AssertionError(workflow)
     if workflow["success_rate"] != 0.5 or workflow["recovery_count"] != 1:
         raise AssertionError(workflow)
     if workflow["top_failure_steps"][0]["tool"] != "execute_command":
         raise AssertionError(workflow)
     if report.next_stage_gate["status"] != "pass" or not report.next_stage_gate["warnings"]:
         raise AssertionError(report.next_stage_gate)
+    return workflow
+
+
+def live_eval_counts_verified_waiting_workflow_as_healthy():
+    trace_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "workflow_verified_waiting_trace_test.jsonl")
+    events = [
+        {"event": "workflow.started", "task_id": "wf_verified"},
+        {"event": "workflow.step_recorded", "task_id": "wf_verified", "tool": "write_file", "status": "verified"},
+    ]
+    with open(trace_path, "w", encoding="utf-8") as file:
+        for event in events:
+            file.write(json.dumps(event, ensure_ascii=False) + "\n")
+    report = build_live_eval_report(trace_path, include_repo=False)
+    workflow = report.to_dict()["workflow"]
+    if workflow["completed_count"] != 0 or workflow["verified_waiting_count"] != 1:
+        raise AssertionError(workflow)
+    if workflow["effective_success_count"] != 1 or workflow["success_rate"] != 1.0:
+        raise AssertionError(workflow)
+    if report.next_stage_gate["status"] != "pass":
+        raise AssertionError(report.next_stage_gate)
+    if "Verified waiting workflows: 1" not in report.to_text():
+        raise AssertionError(report.to_text())
     return workflow
 
 
@@ -3660,6 +3684,7 @@ def main():
         ("observe_needed_stays_awaiting_validation", observe_needed_stays_awaiting_validation),
         ("workflow_replay_records_blocked_graph", workflow_replay_records_blocked_graph),
         ("live_eval_counts_workflow_metrics", live_eval_counts_workflow_metrics),
+        ("live_eval_counts_verified_waiting_workflow_as_healthy", live_eval_counts_verified_waiting_workflow_as_healthy),
         ("worker_queue_submits_and_runs_success_job", worker_queue_submits_and_runs_success_job),
         ("worker_records_failed_command_evidence", worker_records_failed_command_evidence),
         ("worker_timeout_is_structured", worker_timeout_is_structured),

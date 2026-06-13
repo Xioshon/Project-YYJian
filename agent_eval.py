@@ -64,6 +64,7 @@ class LiveEvalReport:
             f"Self repair: {self.self_repair.get('trigger_count', 0)} triggers, deterministic {self.self_repair.get('deterministic_success_rate', 1.0):.1%} success",
             f"Worker success rate: {self.worker.get('success_rate', 1.0):.1%} ({self.worker.get('done_count', 0)}/{self.worker.get('total_results', 0)})",
             f"Planner coverage: {self.planner.get('plan_count', 0)} plans, {self.planner.get('planned_step_count', 0)} planned steps",
+            f"Verified waiting workflows: {self.workflow.get('verified_waiting_count', 0)}",
             f"Worker assimilation: {self.worker.get('assimilated_count', 0)} results assimilated",
             f"Subagent health: {self.subagents.get('ok_count', 0)}/{self.subagents.get('run_count', 0)} ok",
             f"Context budget: {self.context.get('last_total_after', 0)}/{self.context.get('last_max_chars', 0)} chars",
@@ -107,6 +108,7 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
     workflow_started: set[str] = set()
     workflow_completed: set[str] = set()
     workflow_blocked: set[str] = set()
+    workflow_verified: set[str] = set()
     workflow_steps: Counter[str] = Counter()
     workflow_failures: Counter[str] = Counter()
     recovery_count = 0
@@ -184,7 +186,10 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
             if task_id:
                 workflow_started.add(task_id)
                 workflow_steps[task_id] += 1
-            if str(event.get("status") or "") in {"fail", "blocked"}:
+            step_status = str(event.get("status") or "")
+            if task_id and step_status in {"verified", "done"}:
+                workflow_verified.add(task_id)
+            if step_status in {"fail", "blocked"}:
                 workflow_failures[tool or str(event.get("tool") or "unknown")] += 1
         elif name in {"SelfRecoveryAttempt", "SelfRepairPrompt", "PermissionReplaySelfRepair"}:
             self_repair_triggers += 1
@@ -268,7 +273,9 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
     render = _load_render_dedupe()
     started_count = len(workflow_started)
     completed_count = len(workflow_completed)
-    workflow_success_rate = 1.0 if started_count == 0 else completed_count / started_count
+    verified_waiting = (workflow_verified - workflow_completed) - workflow_blocked
+    effective_success_count = len(workflow_completed | verified_waiting)
+    workflow_success_rate = 1.0 if started_count == 0 else effective_success_count / started_count
     average_steps = 0.0 if not workflow_steps else sum(workflow_steps.values()) / len(workflow_steps)
     worker_total = sum(worker_results.values())
     worker_done = worker_results.get("done", 0)
@@ -301,6 +308,8 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
         workflow={
             "started_count": started_count,
             "completed_count": completed_count,
+            "verified_waiting_count": len(verified_waiting),
+            "effective_success_count": effective_success_count,
             "blocked_count": len(workflow_blocked),
             "success_rate": round(workflow_success_rate, 4),
             "recovery_count": recovery_count,
