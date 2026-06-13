@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from agent_hooks import HookManager
 from agent_tool_runtime import is_safe_verifier_command
-from core_tools import ToolResult
+from core_tools import PROJECT_CACHE_DIR, ToolResult
 
 
 TRANSIENT_ERROR_MARKERS = [
@@ -99,6 +100,10 @@ class SelfRecoveryController:
         if cwd_retry[1] is not None:
             return cwd_retry
 
+        python_fallback = self._recover_missing_python_dependency(tool_name, arguments, result, tool_callback, response_policy, turn_id)
+        if python_fallback[1] is not None:
+            return python_fallback
+
         transient_retry = self._recover_transient(tool_name, arguments, result, tool_callback, response_policy, turn_id)
         if transient_retry[1] is not None:
             return transient_retry
@@ -134,6 +139,50 @@ class SelfRecoveryController:
             original_error=result.error,
             attempts=1,
             details={"original_cwd": original_cwd, "retry_cwd": "project", "retry_hint": retry_hint},
+        )
+        self._emit_attempt(tool_name, turn_id, evidence)
+        recovered = self.executor.execute(tool_name, retry_args, tool_callback, response_policy)
+        evidence.retry_status = recovered.status
+        evidence.retry_message = recovered.message
+        if isinstance(recovered.data, dict):
+            recovered.data["recovered_from"] = evidence.to_dict()
+        self._emit_result(tool_name, turn_id, evidence)
+        if recovered.status == "ok":
+            return recovered, evidence.to_dict()
+        return result, evidence.to_dict()
+
+    def _recover_missing_python_dependency(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: ToolResult,
+        tool_callback: Callable | None,
+        response_policy: Any,
+        turn_id: int,
+    ) -> tuple[ToolResult, dict[str, Any] | None]:
+        if tool_name != "execute_python":
+            return result, None
+        module_name = _missing_module_name(result)
+        if module_name != "mss" or not _looks_like_screenshot_code(str(arguments.get("code") or "")):
+            return result, None
+        fallback_path = os.path.join(PROJECT_CACHE_DIR, "fullscreen_screenshot.png")
+        fallback_code = _mss_screenshot_fallback_code(fallback_path)
+        try:
+            timeout = min(max(1, int(arguments.get("timeout") or 30)), 30)
+        except Exception:
+            timeout = 30
+        retry_args = {"code": fallback_code, "timeout": timeout}
+        key = self._key(tool_name, retry_args, "missing_mss_screenshot_fallback")
+        if key in self._attempted:
+            return result, None
+        self._attempted.add(key)
+        evidence = RecoveryEvidence(
+            reason="missing_mss_screenshot_fallback",
+            original_status=result.status,
+            original_message=result.message,
+            original_error=result.error,
+            attempts=1,
+            details={"missing_module": module_name, "fallback_path": fallback_path},
         )
         self._emit_attempt(tool_name, turn_id, evidence)
         recovered = self.executor.execute(tool_name, retry_args, tool_callback, response_policy)
@@ -218,6 +267,47 @@ def should_prompt_self_repair(tool_name: str, result: ToolResult, response_polic
     return True
 
 
+def _missing_module_name(result: ToolResult) -> str:
+    text = " ".join(str(part or "") for part in [result.message, result.error, result.data])
+    marker = "No module named "
+    if marker not in text:
+        return ""
+    tail = text.split(marker, 1)[1].strip()
+    if not tail:
+        return ""
+    quote = tail[0] if tail[0] in {"'", '"'} else ""
+    if quote:
+        tail = tail[1:].split(quote, 1)[0]
+    else:
+        tail = tail.split()[0].strip(".,:;")
+    return tail.strip().casefold()
+
+
+def _looks_like_screenshot_code(code: str) -> bool:
+    lowered = (code or "").casefold()
+    if "import mss" not in lowered and "from mss" not in lowered:
+        return False
+    return any(marker in lowered for marker in ["screenshot", "screen", "monitor", "grab", ".png", ".jpg", ".jpeg"])
+
+
+def _mss_screenshot_fallback_code(output_path: str) -> str:
+    escaped = output_path.replace("\\", "\\\\")
+    return (
+        "from pathlib import Path\n"
+        f"output = Path(r'{escaped}')\n"
+        "output.parent.mkdir(parents=True, exist_ok=True)\n"
+        "try:\n"
+        "    import pyautogui\n"
+        "    image = pyautogui.screenshot()\n"
+        "    image.save(output)\n"
+        "except Exception:\n"
+        "    from PIL import ImageGrab\n"
+        "    image = ImageGrab.grab()\n"
+        "    image.save(output)\n"
+        "print(str(output))\n"
+    )
+
+
 def self_repair_instruction(tool_name: str, arguments: dict[str, Any], result: ToolResult) -> str:
     data = result.data if isinstance(result.data, dict) else {}
     retry_hint = str(data.get("retry_hint") or "").strip()
@@ -235,6 +325,11 @@ def self_repair_instruction(tool_name: str, arguments: dict[str, Any], result: T
         parts.append(f"stderr: {stderr[:900]}")
     elif stdout:
         parts.append(f"stdout: {stdout[:900]}")
+    missing_module = _missing_module_name(result)
+    if missing_module:
+        parts.append(
+            f"diagnosis: Python dependency `{missing_module}` is missing. Prefer a safe fallback using already available libraries; do not install packages unless the owner explicitly approves."
+        )
     if arguments:
         parts.append(f"failed_arguments: {repr(arguments)[:900]}")
     return "\n".join(parts)

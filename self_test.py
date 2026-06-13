@@ -50,7 +50,7 @@ from agent_protocol import STICKER_MARKER_LABEL, classify_approval, screenshot_m
 from agent_runtime_context import build_runtime_context, should_include_task_context
 from agent_action_verification import verify_action
 from agent_replay import FAILURE_REPLAY_FILE, ReplayCase, ReplayHarness, record_failure_replay
-from agent_self_recovery import SelfRecoveryController
+from agent_self_recovery import SelfRecoveryController, _looks_like_screenshot_code, _missing_module_name
 from agent_session import SESSION_BRAIN_FILE, SessionBrain
 from agent_skills import DEFAULT_SKILL_REGISTRY
 from agent_social import SocialCurationReminder, SocialSessionManager, SocialStickerIndex, infer_intent_tags, infer_metadata_tags, infer_social_mode, infer_sticker_tags, is_safe_sticker, social_reply_policy_for
@@ -256,11 +256,11 @@ class PermissionReplayRepairAdapter:
     def chat_with_tools(self, messages, tools):
         self.calls += 1
         if self.calls == 1:
-            args = {"code": "import mss\nprint('capture screen')"}
+            args = {"code": "raise RuntimeError('boom before fallback')"}
             return {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{"id": "call_py_missing_mss", "name": "execute_python", "arguments": args, "raw_arguments": json.dumps(args)}],
+                "tool_calls": [{"id": "call_py_runtime_error", "name": "execute_python", "arguments": args, "raw_arguments": json.dumps(args)}],
             }
         tool_text = "\n".join(message.get("content", "") for message in messages if message.get("role") == "tool")
         if "fallback screenshot ok" in tool_text or '"status": "ok"' in tool_text:
@@ -349,12 +349,12 @@ def permission_replay_failed_python_enters_self_repair_loop():
 
     def fake_python(code: str, timeout: int = 30):
         attempts["count"] += 1
-        if "import mss" in code:
+        if "boom before fallback" in code:
             return core_tools.ToolResult(
                 "error",
                 "Python failed.",
-                data={"returncode": 1, "stdout": "", "stderr": "ModuleNotFoundError: No module named 'mss'"},
-                error="ModuleNotFoundError: No module named 'mss'",
+                data={"returncode": 1, "stdout": "", "stderr": "RuntimeError: boom before fallback"},
+                error="RuntimeError: boom before fallback",
             )
         return core_tools.ToolResult("ok", "Python completed.", data={"returncode": 0, "stdout": "fallback screenshot ok", "stderr": ""})
 
@@ -870,6 +870,55 @@ def self_recovery_does_not_retry_unsafe_python():
     if attempts["count"] != 0:
         raise AssertionError("unsafe python should not be retried")
     return "unsafe python was not auto-retried"
+
+
+def missing_mss_screenshot_recovery_uses_safe_fallback():
+    attempts = {"count": 0, "fallback_code": ""}
+
+    class Executor:
+        def execute(self, tool_name, arguments, callback=None, response_policy=None):
+            attempts["count"] += 1
+            attempts["fallback_code"] = arguments.get("code", "")
+            if "pyautogui.screenshot" not in attempts["fallback_code"] or "ImageGrab.grab" not in attempts["fallback_code"]:
+                return core_tools.ToolResult("error", "bad fallback", error="bad fallback")
+            return core_tools.ToolResult("ok", "Python completed.", data={"stdout": "fullscreen_screenshot.png", "stderr": ""})
+
+    recovery = SelfRecoveryController(executor=Executor(), hooks=DEFAULT_HOOK_MANAGER, session_id="self_test")
+    original = core_tools.ToolResult(
+        "error",
+        "Python failed.",
+        data={"stderr": "ModuleNotFoundError: No module named 'mss'"},
+        error="ModuleNotFoundError: No module named 'mss'",
+    )
+    args = {"code": "import mss\n# take screenshot of monitor and save .png", "timeout": 30}
+    recovered, evidence = recovery.recover("execute_python", args, original, None, response_policy_for(InteractionMode.TOOL_TASK), 1)
+    if recovered.status != "ok" or not evidence or evidence.get("reason") != "missing_mss_screenshot_fallback":
+        raise AssertionError((recovered.to_text(), evidence))
+    if attempts["count"] != 1:
+        raise AssertionError(attempts)
+    if "fullscreen_screenshot.png" not in attempts["fallback_code"]:
+        raise AssertionError(attempts["fallback_code"])
+    return "missing mss screenshot recovered through safe fallback"
+
+
+def missing_module_recovery_is_narrow():
+    result = core_tools.ToolResult("error", "Python failed.", error="ModuleNotFoundError: No module named 'mss'")
+    if _missing_module_name(result) != "mss":
+        raise AssertionError("missing module parser failed")
+    if not _looks_like_screenshot_code("import mss\nimg = sct.grab(monitor)\nimg.save('screen.png')"):
+        raise AssertionError("screenshot detector missed mss screenshot code")
+    if _looks_like_screenshot_code("import mss\nprint('hello')"):
+        raise AssertionError("mss fallback should stay narrow")
+
+    class Executor:
+        def execute(self, tool_name, arguments, callback=None, response_policy=None):
+            raise AssertionError("narrow recovery should not execute fallback")
+
+    recovery = SelfRecoveryController(executor=Executor(), hooks=DEFAULT_HOOK_MANAGER, session_id="self_test")
+    recovered, evidence = recovery.recover("execute_python", {"code": "import numpy\nprint('x')"}, result, None, response_policy_for(InteractionMode.TOOL_TASK), 1)
+    if recovered is not result or evidence is not None:
+        raise AssertionError((recovered.to_text(), evidence))
+    return "missing module recovery stayed narrow"
 
 
 def tool_loop_prompts_self_repair_before_user_followup():
@@ -3501,6 +3550,8 @@ def main():
         ("command_cwd_failure_recovers_inside_agent_loop", command_cwd_failure_recovers_inside_agent_loop),
         ("transient_tool_error_recovers_before_user_followup", transient_tool_error_recovers_before_user_followup),
         ("self_recovery_does_not_retry_unsafe_python", self_recovery_does_not_retry_unsafe_python),
+        ("missing_mss_screenshot_recovery_uses_safe_fallback", missing_mss_screenshot_recovery_uses_safe_fallback),
+        ("missing_module_recovery_is_narrow", missing_module_recovery_is_narrow),
         ("tool_loop_prompts_self_repair_before_user_followup", tool_loop_prompts_self_repair_before_user_followup),
         ("trace_log_records_tool_events", trace_log_records_tool_events),
         ("session_brain_plain_chat_stays_idle", session_brain_plain_chat_stays_idle),
