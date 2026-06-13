@@ -3508,6 +3508,43 @@ def git_index_excludes_private_runtime_files():
     return "git index excludes private runtime files"
 
 
+def launcher_script_has_single_instance_guard():
+    path = os.path.join(os.path.dirname(__file__), "start_yueyue.ps1")
+    with open(path, "r", encoding="utf-8") as file:
+        text = file.read()
+    required = [
+        "[switch]$Restart",
+        "yueyue_launcher.pid",
+        "Assert-SingleLauncher",
+        "Write-LauncherPid",
+        "Clear-LauncherPid",
+        "Test-ProcessAlive",
+        "Stop-ProcessTree",
+        "ParentProcessId",
+        "Use -Restart",
+    ]
+    missing = [item for item in required if item not in text]
+    if missing:
+        raise AssertionError(missing)
+    if "if (-not $CheckOnly) {\n        Assert-SingleLauncher" not in text:
+        raise AssertionError("single-instance guard should not run in CheckOnly mode")
+    return "launcher has duplicate-start and restart guard"
+
+
+def launcher_docs_explain_restart():
+    root = os.path.dirname(__file__)
+    with open(os.path.join(root, "README.md"), "r", encoding="utf-8") as file:
+        readme = file.read()
+    with open(os.path.join(root, "RUNBOOK.md"), "r", encoding="utf-8") as file:
+        runbook = file.read()
+    for text, name in ((readme, "README.md"), (runbook, "RUNBOOK.md")):
+        if "-Restart" not in text:
+            raise AssertionError(f"{name} does not document -Restart")
+    if "yueyue_launcher.pid" not in runbook:
+        raise AssertionError("RUNBOOK.md does not explain launcher pid file")
+    return "launcher restart documented"
+
+
 def live_telegram_smoke():
     if os.getenv("RUN_LIVE_TELEGRAM_SMOKE") != "1":
         return "skipped; set RUN_LIVE_TELEGRAM_SMOKE=1 to send real Telegram smoke messages"
@@ -3597,6 +3634,8 @@ def main():
         ("execute_command_missing_file_has_retry_hint", execute_command_missing_file_has_retry_hint),
         ("gitignore_exists_for_private_runtime_files", gitignore_exists_for_private_runtime_files),
         ("git_index_excludes_private_runtime_files", git_index_excludes_private_runtime_files),
+        ("launcher_script_has_single_instance_guard", launcher_script_has_single_instance_guard),
+        ("launcher_docs_explain_restart", launcher_docs_explain_restart),
         ("create_plan", lambda: result_text(core_tools.real_create_plan("self test objective", ["step one", "step two"]))),
         ("update_plan", lambda: result_text(core_tools.real_update_plan(1, "完成", "self test ok"))),
         ("update_memory", lambda: result_text(core_tools.real_update_memory("self test memory entry"))),

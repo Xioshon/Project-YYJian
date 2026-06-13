@@ -397,6 +397,8 @@ One-click Windows launcher:
 - Double-click `C:\Agent\start_yueyue.bat` to check resources and start Telegram bot mode directly.
 - Run `C:\Agent\start_yueyue.bat -SelfTest` to run the full regression suite before starting.
 - Run `C:\Agent\start_yueyue.bat -CheckOnly` to verify Python, required files, workspace folders, health, and compilation without starting the bot.
+- Run `powershell -ExecutionPolicy Bypass -File C:\Agent\start_yueyue.ps1 -Restart` when you intentionally want to replace a running YueYue service.
+- The launcher writes `workspace\project_cache\yueyue_launcher.pid` and refuses accidental duplicate starts. `-Restart` stops the recorded launcher process tree before starting a fresh service.
 - Startup logs are written under `C:\Agent\workspace\logs`.
 
 Direct non-interactive modes:

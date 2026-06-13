@@ -22,6 +22,12 @@ Check startup without launching Telegram:
 powershell -ExecutionPolicy Bypass -File .\start_yueyue.ps1 -CheckOnly
 ```
 
+Restart the Telegram service cleanly if a previous launcher is still running:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start_yueyue.ps1 -Restart
+```
+
 Run the regression suite:
 
 ```powershell

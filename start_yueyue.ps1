@@ -1,7 +1,8 @@
 param(
     [switch]$SelfTest,
     [switch]$NoCompile,
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$Restart
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,6 +12,8 @@ Set-Location $Root
 $LogDir = Join-Path $Root "workspace\logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $LogFile = Join-Path $LogDir ("startup_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$ProjectCacheDir = Join-Path $Root "workspace\project_cache"
+$LauncherPidFile = Join-Path $ProjectCacheDir "yueyue_launcher.pid"
 
 function Write-Step {
     param([string]$Message)
@@ -47,12 +50,86 @@ function Invoke-Python {
     }
 }
 
+function Test-ProcessAlive {
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) {
+        return $false
+    }
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        return -not $process.HasExited
+    } catch {
+        return $false
+    }
+}
+
+function Read-LauncherPid {
+    if (-not (Test-Path $LauncherPidFile)) {
+        return 0
+    }
+    try {
+        $raw = (Get-Content -LiteralPath $LauncherPidFile -ErrorAction Stop | Select-Object -First 1).Trim()
+        $pidValue = 0
+        if ([int]::TryParse($raw, [ref]$pidValue)) {
+            return $pidValue
+        }
+    } catch {
+    }
+    return 0
+}
+
+function Clear-LauncherPid {
+    try {
+        Remove-Item -LiteralPath $LauncherPidFile -Force -ErrorAction SilentlyContinue
+    } catch {
+    }
+}
+
+function Stop-ProcessTree {
+    param([int]$TargetPid)
+    if ($TargetPid -le 0) {
+        return
+    }
+    try {
+        $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$TargetPid" -ErrorAction SilentlyContinue
+        foreach ($child in $children) {
+            Stop-ProcessTree -TargetPid ([int]$child.ProcessId)
+        }
+    } catch {
+    }
+    Stop-Process -Id $TargetPid -Force -ErrorAction SilentlyContinue
+}
+
+function Assert-SingleLauncher {
+    $existingPid = Read-LauncherPid
+    if (-not (Test-ProcessAlive -ProcessId $existingPid)) {
+        Clear-LauncherPid
+        return
+    }
+    if ($Restart) {
+        Write-Host "Existing YueYue launcher detected (PID $existingPid). Restart requested; stopping it first." -ForegroundColor Yellow
+        Stop-ProcessTree -TargetPid $existingPid
+        Start-Sleep -Seconds 2
+        Clear-LauncherPid
+        return
+    }
+    throw "YueYue appears to be already running for this folder (launcher PID $existingPid). Use -Restart if you want to replace it."
+}
+
+function Write-LauncherPid {
+    New-Item -ItemType Directory -Force -Path $ProjectCacheDir | Out-Null
+    Set-Content -LiteralPath $LauncherPidFile -Value ([string]$PID) -Encoding ASCII
+}
+
 try {
     Start-Transcript -Path $LogFile -Append | Out-Null
 
     Write-Host "YueYue Agent one-click launcher" -ForegroundColor Green
     Write-Host "Root: $Root"
     Write-Host "Log : $LogFile"
+    if (-not $CheckOnly) {
+        Assert-SingleLauncher
+    }
 
     Write-Step "Checking Python"
     $Python = Resolve-Python
@@ -136,6 +213,7 @@ try {
     }
 
     Write-Step "Starting Telegram bot"
+    Write-LauncherPid
     Write-Host "Press Ctrl+C in this window to stop YueYue."
     Invoke-Python -Python $Python -Arguments @("main.py", "--telegram")
 } catch {
@@ -143,6 +221,12 @@ try {
     Write-Host ("Launcher failed: " + $_.Exception.Message) -ForegroundColor Red
     exit 1
 } finally {
+    if (-not $CheckOnly) {
+        $existingPid = Read-LauncherPid
+        if ($existingPid -eq $PID) {
+            Clear-LauncherPid
+        }
+    }
     try {
         Stop-Transcript | Out-Null
     } catch {
