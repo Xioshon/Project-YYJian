@@ -179,10 +179,12 @@ def infer_route_from_messages(messages: list[dict[str, Any]]) -> str:
         if message.get("role") != "user":
             continue
         content = str(message.get("content") or "")
-        marker = "turn_intent:"
-        if marker in content:
+        for marker in ("turn_intent:", "intent:"):
+            if marker not in content:
+                continue
             tail = content.rsplit(marker, 1)[-1].strip().splitlines()[0].strip()
             return tail or "chat"
-        if "[SessionBrain]" not in content and "[TaskGraph]" not in content:
+        task_markers = ("[SessionBrain]", "[TaskGraph]", "[目前任務筆記]", "[目前步驟]")
+        if not any(marker in content for marker in task_markers):
             return "chat"
     return "task"

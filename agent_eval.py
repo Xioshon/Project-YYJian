@@ -395,7 +395,7 @@ USER_FACING_SOURCE_FILES = (
 SOURCE_MOJIBAKE_MARKERS = ("鍓", "鐪", "绲", "鎴", "锛", "灞", "闆", "铻", "妯", "楹", "�")
 
 SOURCE_REQUIRED_PHRASES = {
-    "agent_user_voice.py": ("我先不直接跑", "可以", "繼續"),
+    "agent_user_voice.py": ("我先等你點頭", "可以", "繼續"),
     "agent_outcome.py": ("有結果", "發給我", "分析一下", "繼續"),
     "agent_latency.py": ("我先看一下", "我先處理一下", "收到"),
     "agent_tool_runtime.py": ("你可以說「繼續」接回原任務"),

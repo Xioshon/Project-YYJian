@@ -223,6 +223,10 @@ def permission_followup_allows_exact_tool():
     second = agent.chat("可以")
     if "write_file" not in second["content"]:
         raise AssertionError(second)
+    if _contains_internal_policy_leak(second["content"]) or "replay case" in second["content"].casefold():
+        raise AssertionError(second)
+    if "我跑完你剛剛點頭" not in second["content"]:
+        raise AssertionError(second)
     if not os.path.exists(target):
         raise AssertionError("file was not written after permission")
     if agent.llm.calls != 2:
@@ -454,9 +458,9 @@ def routed_llm_adapter_selects_fast_chat_and_strong_task_models():
         raise AssertionError("tool route should use strong task model")
     if adapter.model_for_route("screen_observe") != "vision-task":
         raise AssertionError("screen route should use vision model")
-    messages = [{"role": "user", "content": "hi\n\n[SessionBrain]\nstate\nturn_intent: task_continuation"}]
+    messages = [{"role": "user", "content": "hi\n\n[目前任務筆記]\nstate\nintent: task_continuation"}]
     if infer_route_from_messages(messages) != "task_continuation":
-        raise AssertionError("turn_intent route not inferred")
+        raise AssertionError("task intent route not inferred")
     return "routed model policy selected expected models"
 
 
@@ -986,10 +990,11 @@ class CaptureReplyAdapter:
 
 
 def reset_session_brain_file():
-    try:
-        os.remove(SESSION_BRAIN_FILE)
-    except FileNotFoundError:
-        pass
+    for path in [SESSION_BRAIN_FILE, TASK_GRAPHS_FILE]:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 def session_brain_plain_chat_stays_idle():
@@ -1014,7 +1019,7 @@ def runtime_context_keeps_plain_chat_lightweight():
     if not user_messages:
         raise AssertionError("no user message captured")
     last_user = user_messages[-1]
-    forbidden = ["[SessionBrain]", "[TaskGraph]", "turn_intent:"]
+    forbidden = ["[SessionBrain]", "[TaskGraph]", "[目前任務筆記]", "[目前步驟]", "turn_intent:", "intent:"]
     leaked = [item for item in forbidden if item in last_user]
     if leaked:
         raise AssertionError(f"plain chat leaked task context: {leaked}\n{last_user}")
@@ -1030,10 +1035,13 @@ def runtime_context_keeps_task_state_for_tasks():
     agent.chat("please implement a small fix")
     user_messages = [message["content"] for message in adapter.last_messages if message.get("role") == "user"]
     last_user = user_messages[-1]
-    required = ["[SessionBrain]", "[TaskGraph]", "turn_intent:"]
+    required = ["[目前任務筆記]", "[目前步驟]", "intent:"]
     missing = [item for item in required if item not in last_user]
     if missing:
         raise AssertionError(f"task context missing: {missing}\n{last_user}")
+    leaked = [item for item in ["[SessionBrain]", "[TaskGraph]", "turn_intent:"] if item in last_user]
+    if leaked:
+        raise AssertionError(f"task context leaked framework labels: {leaked}\n{last_user}")
     if infer_route_from_messages(adapter.last_messages) == "chat":
         raise AssertionError("task turn should not route to chat model")
     return "task runtime context preserved"
@@ -1042,9 +1050,11 @@ def runtime_context_keeps_task_state_for_tasks():
 def runtime_context_builder_policy_is_explicit():
     chat = build_runtime_context("hi", turn_intent="chat", session_summary="state", task_summary="task", include_task_context=False)
     task = build_runtime_context("fix", turn_intent="task", session_summary="state", task_summary="task", include_task_context=True)
-    if "[SessionBrain]" in chat or "[TaskGraph]" in chat:
+    if any(marker in chat for marker in ["[SessionBrain]", "[TaskGraph]", "[目前任務筆記]", "[目前步驟]"]):
         raise AssertionError(chat)
-    if "[SessionBrain]" not in task or "turn_intent: task" not in task:
+    if "[目前任務筆記]" not in task or "intent: task" not in task:
+        raise AssertionError(task)
+    if "[SessionBrain]" in task or "turn_intent:" in task:
         raise AssertionError(task)
     if should_include_task_context("chat"):
         raise AssertionError("chat should not include task context by default")
@@ -2217,6 +2227,9 @@ def user_voice_strings_are_unicode_safe():
         agent_user_voice.tool_loop_timeout_reply(),
         agent_user_voice.empty_reply_fallback(),
         agent_user_voice.permission_request_reply("execute_command"),
+        agent_user_voice.approved_tool_success_reply("execute_python", "Python completed.", "stdout: ok", True),
+        agent_user_voice.approved_tool_blocked_reply("execute_python", core_tools.ToolResult("blocked", "needs permission", requires_permission=True)),
+        agent_user_voice.approved_tool_error_reply("execute_python", core_tools.ToolResult("error", "Python failed.", error="RuntimeError: boom")),
     ]
     bad_markers = ["鍓", "鐪", "绲", "鎴", "锛", "灞", "�"]
     for sample in samples:
@@ -2226,6 +2239,8 @@ def user_voice_strings_are_unicode_safe():
     for expected in ["可以", "繼續", "系統截圖", "主人"]:
         if expected not in combined:
             raise AssertionError(combined)
+    if any(_contains_internal_policy_leak(sample) for sample in samples):
+        raise AssertionError(combined)
     if "你可以說「繼續」接回原任務" not in runtime_source:
         raise AssertionError("runtime retry hint is not Unicode-safe")
     if "[系統截圖: {screen}]" not in loop_source:
@@ -2237,19 +2252,27 @@ def user_facing_source_files_are_unicode_safe():
     root = os.path.dirname(__file__)
     files = [
         "agent_user_voice.py",
+        "agent_permission_replay.py",
         "agent_outcome.py",
         "agent_latency.py",
+        "agent_runtime_context.py",
         "agent_tool_runtime.py",
         "agent_tool_loop.py",
+        "core_agent.py",
+        "agent_llm.py",
         "main.py",
     ]
     bad_markers = ["鍓", "鐪", "绲", "鎴", "锛", "灞", "闆", "铻", "妯", "楹", "�"]
     required_pairs = {
-        "agent_user_voice.py": ["我先不直接跑", "可以", "繼續"],
+        "agent_user_voice.py": ["我先等你點頭", "可以", "繼續"],
+        "agent_permission_replay.py": ["approved_tool_success_reply"],
         "agent_outcome.py": ["有結果", "發給我", "分析一下", "繼續"],
         "agent_latency.py": ["我先看一下", "我先處理一下", "收到"],
+        "agent_runtime_context.py": ["目前任務筆記", "目前步驟", "驗證結果"],
         "agent_tool_runtime.py": ["你可以說「繼續」接回原任務"],
         "agent_tool_loop.py": ["系統截圖"],
+        "core_agent.py": ["任務提醒"],
+        "agent_llm.py": ["目前任務筆記"],
     }
     for filename in files:
         path = os.path.join(root, filename)
@@ -2267,6 +2290,28 @@ def user_facing_source_files_are_unicode_safe():
             if expected not in text:
                 raise AssertionError(f"{filename} is missing expected phrase: {expected}")
     return "user-facing source files are UTF-8 and voice-safe"
+
+
+def runtime_context_uses_owner_facing_labels():
+    task = build_runtime_context(
+        "繼續",
+        turn_intent="task_continuation",
+        session_summary="state: awaiting_validation",
+        task_summary="step: verify screenshot",
+        worker_results=[{"step_id": "step_1", "status": "done", "job_id": "job_1"}],
+        include_task_context=True,
+    )
+    required = ["[目前任務筆記]", "[目前步驟]", "[驗證結果]", "intent: task_continuation"]
+    missing = [item for item in required if item not in task]
+    if missing:
+        raise AssertionError((missing, task))
+    forbidden = ["[SessionBrain]", "[TaskGraph]", "[WorkerEvidence]", "turn_intent:", "worker="]
+    leaked = [item for item in forbidden if item in task]
+    if leaked:
+        raise AssertionError((leaked, task))
+    if infer_route_from_messages([{"role": "user", "content": task}]) != "task_continuation":
+        raise AssertionError(task)
+    return "runtime context uses owner-facing labels"
 
 
 def semantic_intent_upgrades_chat_policy_without_user_modes():
@@ -3624,6 +3669,7 @@ def main():
         ("user_visible_tool_blocks_hide_internal_route_terms", user_visible_tool_blocks_hide_internal_route_terms),
         ("user_voice_strings_are_unicode_safe", user_voice_strings_are_unicode_safe),
         ("user_facing_source_files_are_unicode_safe", user_facing_source_files_are_unicode_safe),
+        ("runtime_context_uses_owner_facing_labels", runtime_context_uses_owner_facing_labels),
         ("semantic_intent_upgrades_chat_policy_without_user_modes", semantic_intent_upgrades_chat_policy_without_user_modes),
         ("safe_verifier_command_runs_in_screen_observe_route", safe_verifier_command_runs_in_screen_observe_route),
         ("arbitrary_command_still_requires_permission", arbitrary_command_still_requires_permission),

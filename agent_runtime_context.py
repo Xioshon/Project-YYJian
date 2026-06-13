@@ -23,7 +23,7 @@ def worker_context(items: list[dict[str, Any]] | None) -> str:
         return ""
     lines = []
     for item in items[-5:]:
-        lines.append(f"{item.get('step_id', 'step')} worker={item.get('status', 'unknown')} job={item.get('job_id', '')}")
+        lines.append(f"{item.get('step_id', 'step')} verification={item.get('status', 'unknown')} id={item.get('job_id', '')}")
     return "\n".join(lines)
 
 
@@ -63,8 +63,8 @@ def build_runtime_context(
 ) -> str:
     enriched = user_input
     if include_task_context:
-        enriched += f"\n\n[SessionBrain]\n{session_summary}\n\n[TaskGraph]\n{task_summary}\nturn_intent: {turn_intent}"
+        enriched += f"\n\n[目前任務筆記]\n{session_summary}\n\n[目前步驟]\n{task_summary}\nintent: {turn_intent}"
     worker_summary = worker_context(worker_results)
     if worker_summary:
-        enriched += f"\n\n[WorkerEvidence]\n{worker_summary}"
+        enriched += f"\n\n[驗證結果]\n{worker_summary}"
     return enriched

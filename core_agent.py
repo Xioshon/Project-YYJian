@@ -289,11 +289,11 @@ class CompanionAgent:
                 self._remember_turn_summary(user_input, replayed.content)
                 return replayed.to_chat_result()
         if grant == "single":
-            user_input += "\n\n[System notice: owner approved the previously blocked exact tool call once. Retry that same tool call if it is still needed.]"
+            user_input += "\n\n[任務提醒：主人剛剛只批准了上一個被暫停的工具動作；如果還需要，就只重試那一步。]"
         elif grant == "turn":
-            user_input += "\n\n[System notice: owner approved tool use for this task turn. Use only necessary tools and report results.]"
+            user_input += "\n\n[任務提醒：主人允許這一輪需要的工具；只做必要步驟，完成後說清楚結果。]"
         elif grant == "deny":
-            user_input += "\n\n[System notice: owner rejected the pending tool action. Do not retry it.]"
+            user_input += "\n\n[任務提醒：主人拒絕了剛剛那個工具動作，不要再重試它。]"
         include_task_context = should_include_task_context(
             turn_classification.intent,
             pending_permission=pending_before,

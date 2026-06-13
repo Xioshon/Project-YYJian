@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from agent_outcome import tool_result_outcome
 from agent_self_recovery import self_repair_instruction, should_prompt_self_repair
+from agent_user_voice import approved_tool_blocked_reply, approved_tool_error_reply, approved_tool_success_reply, failure_replay_reply
 from core_tools import ToolResult
 
 
@@ -141,19 +142,11 @@ class PermissionReplayController:
                 evidence=[tool_name],
             )
             outcome_summary, artifacts = tool_result_outcome(tool_name, result)
-            final_reply = f"我已經跑了你剛剛確認的 `{tool_name}`：{result.message}"
-            if outcome_summary:
-                final_reply += "\n" + outcome_summary
-            if artifacts:
-                final_reply += "\n如果你要我發送或分析這些產物，直接說「發給我」或「分析一下」就好。"
-            return final_reply
+            return approved_tool_success_reply(tool_name, result.message, outcome_summary, bool(artifacts))
         if replay_case:
-            return f"主人，我發現 `{tool_name}` 重複卡住，所以先停下來了。replay case: {replay_case.get('name')}"
+            return failure_replay_reply(tool_name, replay_case.get("name", ""))
         if result.status == "blocked":
             if result.requires_permission:
                 self.session_brain.mark_permission_needed(tool_name, self.turn_id_getter(), self.session_id)
-            return f"`{tool_name}` 還需要你再確認一下：{result.message}"
-        final_reply = f"`{tool_name}` 執行失敗：{result.message}"
-        if result.error:
-            final_reply += f"\n{result.error[:800]}"
-        return final_reply
+            return approved_tool_blocked_reply(tool_name, result)
+        return approved_tool_error_reply(tool_name, result)
