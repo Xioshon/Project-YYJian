@@ -1553,10 +1553,10 @@ def task_benchmark_runs_default_cases():
     report_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "task_benchmark_self_test.json")
     harness = build_default_benchmark()
     report = harness.write_report(report_path)
-    if report["total"] < 9 or report["failed"] != 0 or report["success_rate"] != 1.0:
+    if report["total"] < 10 or report["failed"] != 0 or report["success_rate"] != 1.0:
         raise AssertionError(report)
     categories = set(report.get("by_category", {}))
-    if not {"recovery", "workflow", "knowledge", "permission", "route", "conversation"}.issubset(categories):
+    if not {"recovery", "workflow", "knowledge", "permission", "route", "conversation", "voice"}.issubset(categories):
         raise AssertionError(report.get("by_category"))
     if not os.path.exists(report_path):
         raise AssertionError("benchmark report was not written")

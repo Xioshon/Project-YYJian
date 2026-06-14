@@ -13,6 +13,7 @@ from agent_latency import InteractionMode, response_policy_for
 from agent_self_recovery import diagnose_tool_error, plan_recovery
 from agent_task_graph import TaskGraphManager
 from agent_tool_runtime import PermissionManager, ToolExecutor, ToolRegistry
+from agent_user_voice import friendly_tool_block, permission_request_reply, repeated_tool_stop_reply
 from core_tools import ALL_TOOLS, PROJECT_CACHE_DIR, ToolResult
 
 
@@ -207,6 +208,14 @@ def build_default_benchmark() -> TaskBenchmarkHarness:
             runner=_case_outcome_followup_intent_stays_available,
         )
     )
+    harness.register(
+        BenchmarkCase(
+            name="user_voice_hides_internal_control_plane",
+            description="owner-facing block/retry text stays warm and does not expose route/policy internals",
+            category="voice",
+            runner=_case_user_voice_hides_internal_control_plane,
+        )
+    )
     return harness
 
 
@@ -338,6 +347,35 @@ def _case_outcome_followup_intent_stays_available() -> dict[str, Any]:
     }
     ok = all(checks.values())
     return {"ok": ok, "message": "ok" if ok else str({key: value for key, value in checks.items() if not value}), **checks}
+
+
+def _case_user_voice_hides_internal_control_plane() -> dict[str, Any]:
+    samples = [
+        friendly_tool_block("execute_python"),
+        friendly_tool_block("analyze_media"),
+        friendly_tool_block("execute_command", ToolResult("blocked", "execute_command skipped by chat route policy.", data={"route": "chat", "retry_hint": "你可以說「繼續」接回原任務。"})),
+        repeated_tool_stop_reply("execute_python", "case_1"),
+        permission_request_reply("execute_command", {"command": "python self_test.py"}),
+    ]
+    combined = "\n".join(samples)
+    leaks = [
+        "route policy",
+        "chat route",
+        "screen_observe",
+        "tool_task",
+        "social_sticker",
+        "skipped by",
+        "response policy",
+        "loop controller",
+        "tool_not_allowed_for_route",
+    ]
+    bad_markers = [chr(code) for code in [0x9345, 0x9435, 0x7EF2, 0x93B4, 0x952B, 0x707A, 0x95C6, 0x94FB, 0x59AF, 0x6979, 0xFFFD]]
+    leaked = [item for item in leaks if item in combined.casefold()]
+    mojibake = [hex(ord(item)) for item in bad_markers if item in combined]
+    expected = {"主人", "可以", "繼續"}
+    missing = sorted(item for item in expected if item not in combined)
+    ok = not leaked and not mojibake and not missing
+    return {"ok": ok, "message": "ok" if ok else "voice leak", "leaked": leaked, "mojibake": mojibake, "missing": missing}
 
 
 def _group_by_category(results: list[BenchmarkResult]) -> dict[str, list[BenchmarkResult]]:
