@@ -10,11 +10,13 @@ from agent_action_verification import verify_action
 from agent_hooks import emit_trace
 from agent_knowledge import search_knowledge
 from agent_latency import InteractionMode, response_policy_for
+from agent_permission_replay import PermissionReplayController
 from agent_self_recovery import diagnose_tool_error, plan_recovery
+from agent_session import SessionBrain
 from agent_task_graph import TaskGraphManager
 from agent_tool_runtime import PermissionManager, ToolExecutor, ToolRegistry
 from agent_user_voice import friendly_tool_block, permission_request_reply, repeated_tool_stop_reply
-from core_tools import ALL_TOOLS, PROJECT_CACHE_DIR, ToolResult
+from core_tools import ALL_TOOLS, PROJECT_CACHE_DIR, AgentTool, ToolResult
 
 
 TASK_BENCHMARK_FILE = os.path.join(PROJECT_CACHE_DIR, "task_benchmark_report.json")
@@ -188,6 +190,14 @@ def build_default_benchmark() -> TaskBenchmarkHarness:
     )
     harness.register(
         BenchmarkCase(
+            name="permission_replay_delivers_safe_artifact",
+            description="approved replay delivers safe generated media instead of stopping at tool completion",
+            category="permission",
+            runner=_case_permission_replay_delivers_safe_artifact,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
             name="screen_route_allows_safe_verifier",
             description="screen_observe route allows safe verifier commands instead of blocking recovery",
             category="route",
@@ -313,6 +323,53 @@ def _case_permission_single_replay_exact_action() -> dict[str, Any]:
     exact = bool(action and action.tool_name == "execute_python" and action.arguments == original_args)
     no_second_action = manager.pop_approved_action() is None
     return {"ok": grant == "single" and exact and no_second_action, "message": grant, "tool": getattr(action, "tool_name", ""), "exact": exact}
+
+
+def _case_permission_replay_delivers_safe_artifact() -> dict[str, Any]:
+    artifact = os.path.join(PROJECT_CACHE_DIR, "benchmark_permission_artifact.png")
+    with open(artifact, "wb") as file:
+        file.write(b"\x89PNG\r\n\x1a\n")
+    sent: list[str] = []
+
+    def fake_execute_python(code: str, timeout: int = 30):
+        return ToolResult("ok", "Python completed.", data={"returncode": 0, "stdout": artifact, "stderr": ""})
+
+    def fake_send_telegram_media(file_path: str, caption: str = ""):
+        sent.append(os.path.abspath(file_path))
+        return ToolResult("ok", "fake media sent", data={"file_path": file_path, "caption": caption})
+
+    registry = ToolRegistry()
+    for tool in ALL_TOOLS:
+        registry.add(tool)
+    registry.add(AgentTool("execute_python", "fake python", fake_execute_python, {"type": "object", "properties": {}}, True))
+    registry.add(AgentTool("send_telegram_media", "fake send", fake_send_telegram_media, {"type": "object", "properties": {}}))
+
+    permissions = PermissionManager(session_id="benchmark")
+    permissions.record_blocked("execute_python", {"code": "make screenshot"}, turn_id=1)
+    grant = permissions.classify_user_reply("可以", turn_id=2)
+    executor = ToolExecutor(registry, permissions, interactive_mode=False, session_id="benchmark")
+    brain = SessionBrain()
+    replies: list[str] = []
+
+    def after_tool_result(tool_name: str, arguments: dict, result: ToolResult):
+        return verify_action(tool_name, arguments, result, "benchmark", 2), None
+
+    controller = PermissionReplayController(
+        permission_manager=permissions,
+        session_brain=brain,
+        executor=executor,
+        hooks=type("Hooks", (), {"emit": lambda self, *args, **kwargs: type("Decision", (), {"annotate": ""})()})(),
+        after_tool_result=after_tool_result,
+        append_user_context=lambda text: text,
+        append_assistant_reply=replies.append,
+        reset_turn_state=lambda: None,
+        session_id="benchmark",
+        turn_id_getter=lambda: 2,
+    )
+    handled = controller.maybe_replay(grant, "可以", None)
+    content = handled.content if handled else ""
+    ok = bool(sent and sent[-1] == os.path.abspath(artifact) and "順手" in content)
+    return {"ok": ok, "message": "delivered" if ok else content, "sent": sent[-1] if sent else "", "workflow_verified": ok}
 
 
 def _case_screen_route_allows_safe_verifier() -> dict[str, Any]:

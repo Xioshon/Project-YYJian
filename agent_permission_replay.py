@@ -1,3 +1,4 @@
+import os
 import json
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -5,6 +6,7 @@ from typing import Any, Callable
 from agent_outcome import tool_result_outcome
 from agent_self_recovery import self_repair_instruction, should_prompt_self_repair
 from agent_user_voice import approved_tool_blocked_reply, approved_tool_error_reply, approved_tool_success_reply, failure_replay_reply
+from agent_tool_runtime import is_safe_workspace_media
 from core_tools import ToolResult
 
 
@@ -89,10 +91,15 @@ class PermissionReplayController:
             status=result.status,
             verification_status=getattr(verification, "status", ""),
         )
+        delivery_note = ""
+        if result.status == "ok" and not replay_case:
+            delivery_note, _delivery_result = self._deliver_safe_artifact_after_success(approved_action.tool_name, result, tool_callback)
         repaired = self._maybe_continue_after_error(approved_action, result, replay_case, tool_callback)
         if repaired is not None:
             return repaired
         final_reply = self._format_replay_reply(approved_action, result, replay_case)
+        if delivery_note:
+            final_reply += delivery_note
         reply_decision = self.hooks.emit("BeforeReply", session_id=self.session_id, turn_id=turn_id, content_preview=final_reply[:160])
         if reply_decision.annotate:
             final_reply += reply_decision.annotate
@@ -150,3 +157,27 @@ class PermissionReplayController:
                 self.session_brain.mark_permission_needed(tool_name, self.turn_id_getter(), self.session_id)
             return approved_tool_blocked_reply(tool_name, result)
         return approved_tool_error_reply(tool_name, result)
+
+    def _deliver_safe_artifact_after_success(self, tool_name: str, result: ToolResult, tool_callback: Callable | None) -> tuple[str, ToolResult | None]:
+        _outcome_summary, artifacts = tool_result_outcome(tool_name, result)
+        artifact = _first_safe_media_artifact(artifacts)
+        if not artifact:
+            return "", None
+        args = {"file_path": artifact, "caption": "剛剛的結果喔"}
+        delivered = self.executor.execute("send_telegram_media", args, tool_callback, None)
+        self.after_tool_result("send_telegram_media", args, delivered)
+        if delivered.status == "ok":
+            return f"\n我也順手把 `{os.path.basename(artifact)}` 發給你了。", delivered
+        if delivered.requires_permission:
+            self.session_brain.mark_permission_needed("send_telegram_media", self.turn_id_getter(), self.session_id)
+            return f"\n結果檔案已經生成了，不過發送 `{os.path.basename(artifact)}` 還需要你點頭一下。", delivered
+        return f"\n結果檔案已經生成了，但我發送時卡住了：{delivered.message}", delivered
+
+
+def _first_safe_media_artifact(artifacts: list[str]) -> str:
+    media_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".tgs", ".webm", ".mp4"}
+    for artifact in artifacts or []:
+        ext = os.path.splitext(artifact)[1].casefold()
+        if ext in media_exts and is_safe_workspace_media(artifact):
+            return artifact
+    return ""

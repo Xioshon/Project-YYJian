@@ -322,6 +322,39 @@ def permission_replay_bypasses_chat_route_policy():
     return "approved pending python replay bypassed chat route policy"
 
 
+def permission_replay_delivers_safe_artifact_after_success():
+    artifact = os.path.join(core_tools.PROJECT_CACHE_DIR, "permission_replay_auto_artifact.png")
+    with open(artifact, "wb") as file:
+        file.write(b"\x89PNG\r\n\x1a\n")
+    sent: list[str] = []
+
+    def fake_execute_python(code: str, timeout: int = 30):
+        return core_tools.ToolResult("ok", "Python completed.", data={"returncode": 0, "stdout": artifact, "stderr": ""})
+
+    def fake_send_telegram_media(file_path: str, caption: str = ""):
+        sent.append(os.path.abspath(file_path))
+        return core_tools.ToolResult("ok", "fake media sent", data={"file_path": file_path, "caption": caption})
+
+    agent = CompanionAgent(PermissionReplayPythonAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "permission_replay_artifact_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.add_tool(core_tools.AgentTool("execute_python", "fake python", fake_execute_python, {"type": "object", "properties": {}}, True))
+    agent.add_tool(core_tools.AgentTool("send_telegram_media", "fake send", fake_send_telegram_media, {"type": "object", "properties": {}}))
+
+    first = agent.chat("幫我截圖", response_policy=response_policy_for(InteractionMode.TOOL_TASK))
+    if "可以" not in first["content"] and "確認" not in first["content"]:
+        raise AssertionError(first)
+    second = agent.chat("可以", response_policy=response_policy_for(InteractionMode.CHAT))
+    if not sent or sent[-1] != os.path.abspath(artifact):
+        raise AssertionError({"reply": second, "sent": sent})
+    if "順手" not in second["content"] or "permission_replay_auto_artifact.png" not in second["content"]:
+        raise AssertionError(second)
+    if agent.llm.calls != 2:
+        raise AssertionError(f"approval should replay and deliver without replanning; calls={agent.llm.calls}")
+    return "approved replay delivered generated screenshot artifact"
+
+
 def permission_replay_recovers_transient_error_before_reply():
     attempts = {"count": 0}
 
@@ -3862,6 +3895,7 @@ def main():
         ("unknown_tool_fallback", unknown_tool_fallback),
         ("permission_followup_allows_exact_tool", permission_followup_allows_exact_tool),
         ("permission_replay_bypasses_chat_route_policy", permission_replay_bypasses_chat_route_policy),
+        ("permission_replay_delivers_safe_artifact_after_success", permission_replay_delivers_safe_artifact_after_success),
         ("permission_replay_recovers_transient_error_before_reply", permission_replay_recovers_transient_error_before_reply),
         ("permission_replay_failed_python_enters_self_repair_loop", permission_replay_failed_python_enters_self_repair_loop),
         ("permission_replay_lives_in_controller_not_core_loop", permission_replay_lives_in_controller_not_core_loop),

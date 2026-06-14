@@ -243,6 +243,7 @@ Single-action approval replay:
 - When a protected tool is blocked, `PermissionManager` stores the full pending action: tool name, arguments, and timestamp.
 - If the owner replies with a single approval such as `可以` or `ok`, the runtime executes that saved pending action directly.
 - The model is not asked to regenerate the tool call, which prevents approval from drifting into a different tool or different arguments.
+- If the replayed action generates a safe workspace media artifact such as a screenshot, the runtime delivers it through `send_telegram_media` automatically instead of stopping at `Python completed`.
 
 State separation:
 
