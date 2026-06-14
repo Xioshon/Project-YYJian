@@ -948,13 +948,44 @@ def missing_mss_screenshot_recovery_uses_safe_fallback():
     )
     args = {"code": "import mss\n# take screenshot of monitor and save .png", "timeout": 30}
     recovered, evidence = recovery.recover("execute_python", args, original, None, response_policy_for(InteractionMode.TOOL_TASK), 1)
-    if recovered.status != "ok" or not evidence or evidence.get("reason") != "missing_mss_screenshot_fallback":
+    if recovered.status != "ok" or not evidence or evidence.get("reason") != "screenshot_capture_fallback":
         raise AssertionError((recovered.to_text(), evidence))
     if attempts["count"] != 1:
         raise AssertionError(attempts)
     if "fullscreen_screenshot.png" not in attempts["fallback_code"]:
         raise AssertionError(attempts["fallback_code"])
     return "missing mss screenshot recovered through safe fallback"
+
+
+def screenshot_runtime_error_recovery_uses_safe_fallback():
+    attempts = {"count": 0, "fallback_code": ""}
+
+    class Executor:
+        def execute(self, tool_name, arguments, callback=None, response_policy=None):
+            attempts["count"] += 1
+            attempts["fallback_code"] = arguments.get("code", "")
+            if "pyautogui.screenshot" not in attempts["fallback_code"] or "ImageGrab.grab" not in attempts["fallback_code"]:
+                return core_tools.ToolResult("error", "bad fallback", error="bad fallback")
+            return core_tools.ToolResult("ok", "Python completed.", data={"stdout": "fullscreen_screenshot.png", "stderr": ""})
+
+    recovery = SelfRecoveryController(executor=Executor(), hooks=DEFAULT_HOOK_MANAGER, session_id="self_test")
+    original = core_tools.ToolResult(
+        "error",
+        "Python failed.",
+        data={"stderr": "AttributeError: 'ScreenShot' object has no attribute 'save'"},
+        error="AttributeError: 'ScreenShot' object has no attribute 'save'",
+    )
+    args = {"code": "import mss\nwith mss.mss() as sct:\n    img = sct.grab(sct.monitors[0])\n    img.save('screen.png')", "timeout": 30}
+    diagnosis = diagnose_tool_error("execute_python", args, original)
+    plan = plan_recovery("execute_python", args, original, diagnosis)
+    if diagnosis.category != "screenshot_python_failure" or not plan or plan.strategy != "screenshot_capture_fallback":
+        raise AssertionError((diagnosis, plan))
+    recovered, evidence = recovery.recover("execute_python", args, original, None, response_policy_for(InteractionMode.TOOL_TASK), 1)
+    if recovered.status != "ok" or not evidence or evidence.get("reason") != "screenshot_capture_fallback":
+        raise AssertionError((recovered.to_text(), evidence))
+    if attempts["count"] != 1:
+        raise AssertionError(attempts)
+    return "screenshot runtime error recovered through safe fallback"
 
 
 def self_recovery_diagnoses_and_plans_known_errors():
@@ -975,7 +1006,7 @@ def self_recovery_diagnoses_and_plans_known_errors():
     mss_args = {"code": "import mss\nsct.grab(sct.monitors[0]).save('screen.png')", "timeout": 30}
     mss_diagnosis = diagnose_tool_error("execute_python", mss_args, mss_result)
     mss_plan = plan_recovery("execute_python", mss_args, mss_result, mss_diagnosis)
-    if mss_diagnosis.category != "missing_python_module" or not mss_plan or mss_plan.strategy != "missing_mss_screenshot_fallback":
+    if mss_diagnosis.category != "missing_python_module" or not mss_plan or mss_plan.strategy != "screenshot_capture_fallback":
         raise AssertionError((mss_diagnosis, mss_plan))
 
     transient = core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
@@ -1913,8 +1944,8 @@ def action_verification_preserves_recovery_evidence():
         data={
             "returncode": 0,
             "recovered_from": {
-                "reason": "missing_mss_screenshot_fallback",
-                "details": {"strategy": "missing_mss_screenshot_fallback", "diagnosis": "missing_python_module"},
+                "reason": "screenshot_capture_fallback",
+                "details": {"strategy": "screenshot_capture_fallback", "diagnosis": "missing_python_module"},
             },
         },
     )
@@ -1922,7 +1953,7 @@ def action_verification_preserves_recovery_evidence():
     recovery = verification.details.get("recovery")
     if verification.status != "pass" or not verification.details.get("recovered") or not recovery:
         raise AssertionError(verification)
-    if recovery.get("reason") != "missing_mss_screenshot_fallback":
+    if recovery.get("reason") != "screenshot_capture_fallback":
         raise AssertionError(recovery)
     return "action verification carried recovery evidence"
 
@@ -1979,15 +2010,15 @@ def task_graph_records_recovery_evidence_on_step():
         data={
             "returncode": 0,
             "recovered_from": {
-                "reason": "missing_mss_screenshot_fallback",
-                "details": {"strategy": "missing_mss_screenshot_fallback", "diagnosis": "missing_python_module"},
+                "reason": "screenshot_capture_fallback",
+                "details": {"strategy": "screenshot_capture_fallback", "diagnosis": "missing_python_module"},
             },
         },
     )
     verification = verify_action("execute_python", {"code": "fallback"}, result, "self_test", 1)
     graph = manager.record_tool_result("execute_python", {"code": "fallback"}, result, verification, "self_test", 1, objective="recover screenshot")
     evidence = graph.steps[0].evidence
-    if "recovered" not in evidence or "recovery:missing_mss_screenshot_fallback" not in evidence or "diagnosis:missing_python_module" not in evidence:
+    if "recovered" not in evidence or "recovery:screenshot_capture_fallback" not in evidence or "diagnosis:missing_python_module" not in evidence:
         raise AssertionError(evidence)
     return "task graph recorded recovery evidence"
 
@@ -3919,6 +3950,7 @@ def main():
         ("transient_tool_error_recovers_before_user_followup", transient_tool_error_recovers_before_user_followup),
         ("self_recovery_does_not_retry_unsafe_python", self_recovery_does_not_retry_unsafe_python),
         ("missing_mss_screenshot_recovery_uses_safe_fallback", missing_mss_screenshot_recovery_uses_safe_fallback),
+        ("screenshot_runtime_error_recovery_uses_safe_fallback", screenshot_runtime_error_recovery_uses_safe_fallback),
         ("self_recovery_diagnoses_and_plans_known_errors", self_recovery_diagnoses_and_plans_known_errors),
         ("self_recovery_does_not_plan_unsafe_unknown_errors", self_recovery_does_not_plan_unsafe_unknown_errors),
         ("missing_mss_recovery_bypasses_chat_route_allowlist", missing_mss_recovery_bypasses_chat_route_allowlist),

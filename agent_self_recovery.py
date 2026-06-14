@@ -131,7 +131,7 @@ class SelfRecoveryController:
         if plan.strategy == "cwd_retry":
             return self._recover_command_cwd(tool_name, arguments, result, tool_callback, response_policy, turn_id, diagnosis, plan)
 
-        if plan.strategy == "missing_mss_screenshot_fallback":
+        if plan.strategy == "screenshot_capture_fallback":
             return self._recover_missing_python_dependency(tool_name, arguments, result, tool_callback, response_policy, turn_id, diagnosis, plan)
 
         if plan.strategy == "transient_retry":
@@ -314,9 +314,19 @@ def diagnose_tool_error(tool_name: str, arguments: dict[str, Any], result: ToolR
             "missing_python_module",
             0.95,
             detail=missing_module,
-            retryable=screenshot_context and missing_module == "mss",
-            safe_to_auto_repair=screenshot_context and missing_module == "mss",
+            retryable=screenshot_context and missing_module in {"mss", "pyautogui", "pyscreeze", "pil", "pillow"},
+            safe_to_auto_repair=screenshot_context and missing_module in {"mss", "pyautogui", "pyscreeze", "pil", "pillow"},
             evidence={"missing_module": missing_module, "screenshot_context": screenshot_context},
+        )
+
+    if tool_name == "execute_python" and _looks_like_screenshot_code(str(arguments.get("code") or "")) and _looks_like_screenshot_runtime_error(result):
+        return ErrorDiagnosis(
+            "screenshot_python_failure",
+            0.86,
+            detail="screenshot capture code failed",
+            retryable=True,
+            safe_to_auto_repair=True,
+            evidence={"screenshot_context": True, "error_family": "screen_capture"},
         )
 
     if _is_transient_result(result):
@@ -353,17 +363,17 @@ def plan_recovery(
             details={"retry_cwd": "project"},
         )
 
-    if diagnosis.category == "missing_python_module" and tool_name == "execute_python":
+    if diagnosis.category in {"missing_python_module", "screenshot_python_failure"} and tool_name == "execute_python":
         module_name = str(diagnosis.evidence.get("missing_module") or diagnosis.detail)
-        if module_name == "mss" and diagnosis.evidence.get("screenshot_context"):
+        if diagnosis.evidence.get("screenshot_context"):
             fallback_path = os.path.join(PROJECT_CACHE_DIR, "fullscreen_screenshot.png")
             try:
                 timeout = min(max(1, int((arguments or {}).get("timeout") or 30)), 30)
             except Exception:
                 timeout = 30
             return RecoveryPlan(
-                strategy="missing_mss_screenshot_fallback",
-                reason="missing_mss_screenshot_fallback",
+                strategy="screenshot_capture_fallback",
+                reason="screenshot_capture_fallback",
                 retry_args={"code": _mss_screenshot_fallback_code(fallback_path), "timeout": timeout},
                 details={"fallback_path": fallback_path, "missing_module": module_name},
             )
@@ -422,9 +432,34 @@ def _missing_module_name(result: ToolResult) -> str:
 
 def _looks_like_screenshot_code(code: str) -> bool:
     lowered = (code or "").casefold()
-    if "import mss" not in lowered and "from mss" not in lowered:
+    capture_imports = [
+        "import mss",
+        "from mss",
+        "import pyautogui",
+        "from pyautogui",
+        "imagegrab",
+        "from pil",
+    ]
+    if not any(marker in lowered for marker in capture_imports):
         return False
     return any(marker in lowered for marker in ["screenshot", "screen", "monitor", "grab", ".png", ".jpg", ".jpeg"])
+
+
+def _looks_like_screenshot_runtime_error(result: ToolResult) -> bool:
+    text = " ".join(str(part or "") for part in [result.message, result.error, result.data]).casefold()
+    markers = [
+        "attributeerror",
+        "typeerror",
+        "nameerror",
+        "screen shot",
+        "screenshot",
+        "grab",
+        "monitor",
+        "imagegrab",
+        "pyautogui",
+        "mss",
+    ]
+    return any(marker in text for marker in markers)
 
 
 def _mss_screenshot_fallback_code(output_path: str) -> str:

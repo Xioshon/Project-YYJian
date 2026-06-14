@@ -244,6 +244,7 @@ Single-action approval replay:
 - If the owner replies with a single approval such as `可以` or `ok`, the runtime executes that saved pending action directly.
 - The model is not asked to regenerate the tool call, which prevents approval from drifting into a different tool or different arguments.
 - If the replayed action generates a safe workspace media artifact such as a screenshot, the runtime delivers it through `send_telegram_media` automatically instead of stopping at `Python completed`.
+- Screenshot-oriented Python failures, including missing capture dependencies or common `mss` API/runtime errors, may be repaired with a bounded safe screenshot fallback before asking the owner what to do next.
 
 State separation:
 

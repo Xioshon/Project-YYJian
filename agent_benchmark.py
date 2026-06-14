@@ -150,10 +150,18 @@ def build_default_benchmark() -> TaskBenchmarkHarness:
     )
     harness.register(
         BenchmarkCase(
-            name="recovery_plan_mss_fallback",
-            description="missing mss during screenshot code produces a deterministic screenshot fallback",
+            name="recovery_plan_screenshot_fallback",
+            description="screenshot capture failures produce a deterministic screenshot fallback",
             category="recovery",
             runner=_case_recovery_plan_mss_fallback,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
+            name="recovery_plan_screenshot_runtime_error",
+            description="broken screenshot capture code can be recovered without owner follow-up",
+            category="recovery",
+            runner=_case_recovery_plan_screenshot_runtime_error,
         )
     )
     harness.register(
@@ -271,7 +279,18 @@ def _case_recovery_plan_mss_fallback() -> dict[str, Any]:
     diagnosis = diagnose_tool_error("execute_python", args, result)
     plan = plan_recovery("execute_python", args, result, diagnosis)
     retry_code = str((plan.retry_args or {}).get("code") if plan else "")
-    ok = bool(plan and plan.strategy == "missing_mss_screenshot_fallback" and "ImageGrab.grab" in retry_code)
+    ok = bool(plan and plan.strategy == "screenshot_capture_fallback" and "ImageGrab.grab" in retry_code)
+    return {"ok": ok, "message": diagnosis.category, "recovery_used": bool(plan), "strategy": getattr(plan, "strategy", "")}
+
+
+def _case_recovery_plan_screenshot_runtime_error() -> dict[str, Any]:
+    code = "import mss\nwith mss.mss() as sct:\n    img = sct.grab(sct.monitors[0])\n    img.save('screen.png')"
+    result = ToolResult("error", "Python failed.", error="AttributeError: 'ScreenShot' object has no attribute 'save'")
+    args = {"code": code, "timeout": 10}
+    diagnosis = diagnose_tool_error("execute_python", args, result)
+    plan = plan_recovery("execute_python", args, result, diagnosis)
+    retry_code = str((plan.retry_args or {}).get("code") if plan else "")
+    ok = bool(plan and plan.strategy == "screenshot_capture_fallback" and "ImageGrab.grab" in retry_code)
     return {"ok": ok, "message": diagnosis.category, "recovery_used": bool(plan), "strategy": getattr(plan, "strategy", "")}
 
 
