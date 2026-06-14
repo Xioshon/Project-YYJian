@@ -392,10 +392,13 @@ def _current_session_events(events: list[dict[str, Any]]) -> list[dict[str, Any]
 
 
 def _is_test_session(event: dict[str, Any]) -> bool:
+    event_name = str(event.get("event") or "").casefold()
     session_id = str(event.get("session_id") or "").casefold()
     history_file = str(event.get("history_file") or "").replace("\\", "/").casefold()
-    markers = ("test", "self_test", "debug")
+    markers = ("test", "self_test", "debug", "benchmark", "probe", "runtime_context", "route_voice")
     return (
+        event_name.startswith("benchmark.")
+        or
         any(marker in session_id for marker in markers)
         or any(marker in history_file for marker in markers)
         or "workspace/history/" in history_file

@@ -90,6 +90,8 @@ class TaskBenchmarkHarness:
             )
             emit_trace(
                 "benchmark.case",
+                session_id="benchmark",
+                turn_id=0,
                 name=result.name,
                 category=result.category,
                 status=result.status,
@@ -122,7 +124,7 @@ class TaskBenchmarkHarness:
             "by_category": by_category,
             "results": [item.to_dict() for item in results],
         }
-        emit_trace("benchmark.report", total=total, passed=passed, failed=total - passed, success_rate=report["success_rate"])
+        emit_trace("benchmark.report", session_id="benchmark", turn_id=0, total=total, passed=passed, failed=total - passed, success_rate=report["success_rate"])
         return report
 
     def write_report(self, path: str = TASK_BENCHMARK_FILE) -> dict[str, Any]:

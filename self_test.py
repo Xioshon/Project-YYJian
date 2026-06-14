@@ -1693,6 +1693,34 @@ def live_eval_ignores_self_test_sessions_for_gate():
     return "self-test sessions do not pollute live eval"
 
 
+def live_eval_ignores_benchmark_sessions_for_gate():
+    trace_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "eval_benchmark_trace_test.jsonl")
+    events = [
+        {"event": "SessionStart", "session_id": "live_owner_chat", "history_file": "workspace/chat_history/live_owner_chat.json"},
+        {"event": "context.budget", "mode": "chat", "total_after": 1000, "max_chars": 9000},
+        {"event": "benchmark.case", "status": "fail", "category": "workflow"},
+        {"event": "benchmark.case", "session_id": "benchmark", "status": "fail", "category": "workflow"},
+        {"event": "workflow.started", "session_id": "benchmark", "task_id": "bench_wf"},
+        {"event": "workflow.blocked", "session_id": "benchmark", "task_id": "bench_wf", "tool": "execute_command", "reason": "benchmark failure"},
+        {"event": "ToolError", "session_id": "benchmark", "tool": "execute_command", "error": "benchmark-only error"},
+        {"event": "SessionStart", "session_id": "trace_voice_probe", "history_file": "workspace/chat_history/trace_voice_probe.json"},
+        {"event": "workflow.started", "session_id": "trace_voice_probe", "task_id": "probe_wf"},
+        {"event": "ToolError", "session_id": "trace_voice_probe", "tool": "write_file", "error": "probe-only error"},
+    ]
+    with open(trace_path, "w", encoding="utf-8") as file:
+        for event in events:
+            file.write(json.dumps(event, ensure_ascii=False) + "\n")
+    report = build_live_eval_report(trace_path, include_repo=False)
+    data = report.to_dict()
+    if data["total_events"] != 2 or data["tool_errors"] != 0:
+        raise AssertionError(data)
+    if data["workflow"]["started_count"] != 0 or data["workflow"]["blocked_count"] != 0:
+        raise AssertionError(data["workflow"])
+    if data["next_stage_gate"]["status"] != "pass":
+        raise AssertionError(data["next_stage_gate"])
+    return "benchmark sessions do not pollute live eval"
+
+
 def live_eval_repo_hygiene_allows_env_example():
     hygiene = check_repo_hygiene()
     if hygiene.get("status") != "pass":
@@ -3566,7 +3594,7 @@ def _restore_optional_file(path: str, content: str | None) -> None:
 
 
 def cleanup_self_test_files():
-    for name in ("self_test.txt", "permission_test.txt", "wrong_tool.txt", "turn.txt", "delete_me_self_test.txt", "download_test.html", "dedupe_screen.png", "observability_trace_test.jsonl", "eval_trace_test.jsonl", "eval_missing_trace.jsonl", "eval_report_test.json", "task_benchmark_self_test.json", "benchmark_task_graph.json", "benchmark_blocked_graph.json", "workflow_eval_trace_test.jsonl", "worker_eval_trace_test.jsonl", "control_plane_eval_trace_test.jsonl", "worker_jobs_test.jsonl", "worker_results_test.jsonl", "worker_fail_jobs_test.jsonl", "worker_fail_results_test.jsonl", "worker_timeout_jobs_test.jsonl", "worker_timeout_results_test.jsonl", "worker_reject_jobs_test.jsonl", "worker_reject_results_test.jsonl", "worker_subagent_jobs_test.jsonl", "worker_subagent_results_test.jsonl", "continue_worker_jobs_test.jsonl", "continue_worker_results_test.jsonl", "continue_reject_jobs_test.jsonl", "continue_reject_results_test.jsonl", "action_verify.txt", "transaction_test.txt", "transaction_test.json", "task_graph_test.json", "task_graph_permission_test.json", "planner_graph_test.json", "planner_tool_graph_test.json", "worker_assim_graph_test.json", "observe_graph_test.json", "workflow_replay_graph_test.json", "workflow_replay_test.jsonl", "graph_file.txt", "failure_replay_test.jsonl"):
+    for name in ("self_test.txt", "permission_test.txt", "wrong_tool.txt", "turn.txt", "delete_me_self_test.txt", "download_test.html", "dedupe_screen.png", "observability_trace_test.jsonl", "eval_trace_test.jsonl", "eval_missing_trace.jsonl", "eval_benchmark_trace_test.jsonl", "eval_report_test.json", "task_benchmark_self_test.json", "benchmark_task_graph.json", "benchmark_blocked_graph.json", "workflow_eval_trace_test.jsonl", "worker_eval_trace_test.jsonl", "control_plane_eval_trace_test.jsonl", "worker_jobs_test.jsonl", "worker_results_test.jsonl", "worker_fail_jobs_test.jsonl", "worker_fail_results_test.jsonl", "worker_timeout_jobs_test.jsonl", "worker_timeout_results_test.jsonl", "worker_reject_jobs_test.jsonl", "worker_reject_results_test.jsonl", "worker_subagent_jobs_test.jsonl", "worker_subagent_results_test.jsonl", "continue_worker_jobs_test.jsonl", "continue_worker_results_test.jsonl", "continue_reject_jobs_test.jsonl", "continue_reject_results_test.jsonl", "action_verify.txt", "transaction_test.txt", "transaction_test.json", "task_graph_test.json", "task_graph_permission_test.json", "planner_graph_test.json", "planner_tool_graph_test.json", "worker_assim_graph_test.json", "observe_graph_test.json", "workflow_replay_graph_test.json", "workflow_replay_test.jsonl", "graph_file.txt", "failure_replay_test.jsonl"):
         try:
             os.remove(os.path.join(core_tools.PROJECT_CACHE_DIR, name))
         except FileNotFoundError:
@@ -3898,6 +3926,7 @@ def main():
         ("live_eval_handles_missing_trace", live_eval_handles_missing_trace),
         ("live_eval_gate_uses_current_session_window", live_eval_gate_uses_current_session_window),
         ("live_eval_ignores_self_test_sessions_for_gate", live_eval_ignores_self_test_sessions_for_gate),
+        ("live_eval_ignores_benchmark_sessions_for_gate", live_eval_ignores_benchmark_sessions_for_gate),
         ("live_eval_repo_hygiene_allows_env_example", live_eval_repo_hygiene_allows_env_example),
         ("live_eval_summarizes_fake_trace_and_writes_report", live_eval_summarizes_fake_trace_and_writes_report),
         ("live_eval_writes_permission_health", live_eval_writes_permission_health),
