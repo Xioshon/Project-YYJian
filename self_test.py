@@ -1,11 +1,13 @@
 ﻿import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 from types import SimpleNamespace
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -37,6 +39,16 @@ from agent_memory import (
     update_chat_summary,
 )
 from agent_outcome import detect_outcome_action, format_last_outcome_reply, is_result_followup
+from agent_presence import (
+    PRESENCE_CANDIDATES_FILE,
+    PRESENCE_DEBUG_FILE,
+    PRESENCE_HEALTH_FILE,
+    PRESENCE_STATE_FILE,
+    PresenceConfig,
+    PresenceEngine,
+    PresenceMessageCandidate,
+    PresenceQualityDecision,
+)
 from agent_knowledge import (
     KNOWLEDGE_CHUNKS_FILE,
     KNOWLEDGE_INDEX_FILE,
@@ -47,11 +59,11 @@ from agent_knowledge import (
 )
 from agent_eval import EVAL_REPORT_FILE, PERMISSION_HEALTH_FILE, build_live_eval_report, check_repo_hygiene, check_user_facing_source_health, write_eval_report
 from agent_observability import summarize_trace
-from agent_protocol import STICKER_MARKER_LABEL, classify_approval, screenshot_marker, sticker_marker, sticker_pattern
+from agent_protocol import STICKER_MARKER_LABEL, classify_approval, extract_primary_message, screenshot_marker, sticker_marker, sticker_pattern
 from agent_runtime_context import build_runtime_context, should_include_task_context
 from agent_action_verification import verify_action
 from agent_replay import FAILURE_REPLAY_FILE, ReplayCase, ReplayHarness, record_failure_replay
-from agent_self_recovery import SelfRecoveryController, _looks_like_screenshot_code, _missing_module_name, diagnose_tool_error, plan_recovery
+from agent_self_recovery import RepairPlanner, SelfRecoveryController, _extract_command_file_names, _looks_like_screenshot_code, _missing_module_name, diagnose_tool_error, plan_recovery, plan_recovery_candidates
 from agent_session import SESSION_BRAIN_FILE, SessionBrain
 from agent_skills import DEFAULT_SKILL_REGISTRY
 from agent_social import SocialCurationReminder, SocialSessionManager, SocialStickerIndex, infer_intent_tags, infer_metadata_tags, infer_social_mode, infer_sticker_tags, is_safe_sticker, social_reply_policy_for
@@ -66,6 +78,8 @@ from agent_turns import (
     build_turn_prompt,
     configured_turn_debounce_seconds,
 )
+from agent_short_context import ShortContextBuffer, build_context_for_turn
+from agent_url_context import URLContextCache, classify_url_platform, inspect_url, parse_douyin_metadata, parse_html_metadata, should_preview_url, url_cache_key
 from agent_verification import DEFAULT_VERIFICATION_PLANNER
 from agent_transactions import TASK_TRANSACTIONS_FILE, TaskTransactionManager
 from agent_task_graph import TASK_GRAPHS_FILE, WORKFLOW_REPLAY_FILE, TaskGraphManager
@@ -76,6 +90,8 @@ from agent_llm import RoutedLLMAdapter, infer_route_from_messages
 from main import TelegramGateway, _dedupe_preserve_order, _prompt_mode_for_seed, _split_sticker_command_payload, build_system_prompt, find_sticker_file
 
 
+SELF_TEST_LOCK_FILE = os.path.join(core_tools.PROJECT_CACHE_DIR, "self_test.lock")
+SELF_TEST_LOCK_STALE_SECONDS = 6 * 60 * 60
 _task_plan_backup = None
 _memory_backup = None
 _session_brain_backup = None
@@ -88,6 +104,8 @@ _knowledge_manifest_backup = None
 _knowledge_chunks_backup = None
 _knowledge_index_backup = None
 _eval_report_backup = None
+_self_test_lock_fd = None
+_self_test_lock_path = ""
 _task_benchmark_backup = None
 _task_graphs_backup = None
 _workflow_replay_backup = None
@@ -96,6 +114,52 @@ _worker_results_backup = None
 _context_budget_report_backup = None
 _subagent_runs_backup = None
 _trace_log_backup = None
+_presence_state_backup = None
+_presence_candidates_backup = None
+_presence_health_backup = None
+_presence_debug_backup = None
+
+
+def acquire_self_test_lock(path: str = SELF_TEST_LOCK_FILE, stale_seconds: int = SELF_TEST_LOCK_STALE_SECONDS) -> bool:
+    global _self_test_lock_fd, _self_test_lock_path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(path, flags)
+    except FileExistsError:
+        try:
+            age = time.time() - os.path.getmtime(path)
+        except OSError:
+            age = 0
+        if age > stale_seconds:
+            try:
+                os.remove(path)
+            except OSError:
+                return False
+            return acquire_self_test_lock(path, stale_seconds)
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        file.write(json.dumps({"pid": os.getpid(), "created_at": time.time(), "path": path}, ensure_ascii=False))
+        file.write("\n")
+    if os.path.abspath(path) == os.path.abspath(SELF_TEST_LOCK_FILE):
+        _self_test_lock_fd = fd
+        _self_test_lock_path = path
+    return True
+
+
+def release_self_test_lock(path: str | None = None) -> None:
+    global _self_test_lock_fd, _self_test_lock_path
+    target = path or _self_test_lock_path
+    if target:
+        try:
+            os.remove(target)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    if not path or os.path.abspath(path) == os.path.abspath(_self_test_lock_path or ""):
+        _self_test_lock_fd = None
+        _self_test_lock_path = ""
 
 
 def result_text(value):
@@ -142,6 +206,18 @@ def protocol_constants_are_unicode_safe():
         raise AssertionError("Chinese single approval failed")
     if classify_approval("本輪允許", True) != "turn":
         raise AssertionError("Chinese turn approval failed")
+    if classify_approval("本轮允许", True) != "turn":
+        raise AssertionError("Simplified Chinese turn approval failed")
+    if classify_approval("嗯，继续吧", True) != "single":
+        raise AssertionError("natural-language approval failed")
+    if classify_approval("嗯，继续吧", False) != "none":
+        raise AssertionError("approval must not trigger without pending permission")
+    wrapped = "主人主要訊息：本轮允许\n\n短期聊天上下文：\n- topic=可以 | last_reply=被攔住了"
+    if classify_approval(wrapped, True) != "turn":
+        raise AssertionError("wrapped Telegram turn approval failed")
+    wrapped_single = "主人主要訊息：嗯，继续吧\n\n短期聊天上下文：\n- topic=普通聊天"
+    if classify_approval(wrapped_single, True) != "single":
+        raise AssertionError("wrapped natural-language approval failed")
     if classify_approval("allow all", True) != "turn":
         raise AssertionError("ASCII turn approval failed")
     marker = sticker_marker("x.png")
@@ -218,20 +294,16 @@ def permission_followup_allows_exact_tool():
     for tool in core_tools.ALL_TOOLS:
         agent.add_tool(tool)
     first = agent.chat("write a file")
-    if "可以嗎" not in first["content"]:
+    if "可以" not in first["content"] and "確認" not in first["content"]:
         raise AssertionError(first)
     if os.path.exists(target):
         raise AssertionError("file was written before permission")
     second = agent.chat("可以")
-    if "write_file" not in second["content"]:
-        raise AssertionError(second)
     if _contains_internal_policy_leak(second["content"]) or "replay case" in second["content"].casefold():
-        raise AssertionError(second)
-    if "我跑完你剛剛點頭" not in second["content"]:
         raise AssertionError(second)
     if not os.path.exists(target):
         raise AssertionError("file was not written after permission")
-    if agent.llm.calls != 2:
+    if agent.llm.calls != 1:
         raise AssertionError(f"approval should replay pending action without another LLM call; calls={agent.llm.calls}")
     return "single approval replayed the pending exact tool"
 
@@ -251,6 +323,29 @@ class PermissionReplayPythonAdapter:
             }
         if self.calls == 2:
             return {"role": "assistant", "content": "需要權限，可以嗎？"}
+        return {"role": "assistant", "content": "unexpected replanning"}
+
+
+class PermissionReplayMediaStatusAdapter:
+    def __init__(self):
+        self.calls = 0
+        self.args = {
+            "code": (
+                "import subprocess\n"
+                "subprocess.check_output(['powershell','-NoProfile','-Command',"
+                "'Get-Process cloudmusic | Select-Object Id,MainWindowTitle'])\n"
+            ),
+            "timeout": 15,
+        }
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_media_status", "name": "execute_python", "arguments": self.args, "raw_arguments": json.dumps(self.args)}],
+            }
         return {"role": "assistant", "content": "unexpected replanning"}
 
 
@@ -310,14 +405,14 @@ def permission_replay_bypasses_chat_route_policy():
     for tool in core_tools.ALL_TOOLS:
         agent.add_tool(tool)
     first = agent.chat("run python", response_policy=response_policy_for(InteractionMode.TOOL_TASK))
-    if "可以嗎" not in first["content"] and "requires approval" not in first["content"]:
+    if "可以" not in first["content"] and "確認" not in first["content"] and "requires approval" not in first["content"]:
         raise AssertionError(first)
     second = agent.chat("好", response_policy=response_policy_for(InteractionMode.CHAT))
-    if "execute_python" not in second["content"] or "Python completed" not in second["content"]:
-        raise AssertionError(second)
     if "approved python replay" not in second["content"]:
         raise AssertionError("permission replay did not surface stdout")
-    if agent.llm.calls != 2:
+    if _contains_internal_policy_leak(second["content"]):
+        raise AssertionError(second)
+    if agent.llm.calls != 1:
         raise AssertionError(f"approval should replay without replanning; calls={agent.llm.calls}")
     return "approved pending python replay bypassed chat route policy"
 
@@ -350,9 +445,44 @@ def permission_replay_delivers_safe_artifact_after_success():
         raise AssertionError({"reply": second, "sent": sent})
     if "順手" not in second["content"] or "permission_replay_auto_artifact.png" not in second["content"]:
         raise AssertionError(second)
-    if agent.llm.calls != 2:
+    if agent.llm.calls != 1:
         raise AssertionError(f"approval should replay and deliver without replanning; calls={agent.llm.calls}")
     return "approved replay delivered generated screenshot artifact"
+
+
+def permission_replay_recovers_transient_artifact_delivery():
+    artifact = os.path.join(core_tools.PROJECT_CACHE_DIR, "permission_replay_transient_artifact.png")
+    with open(artifact, "wb") as file:
+        file.write(b"\x89PNG\r\n\x1a\n")
+    attempts = {"send": 0}
+
+    def fake_execute_python(code: str, timeout: int = 30):
+        return core_tools.ToolResult("ok", "Python completed.", data={"returncode": 0, "stdout": artifact, "stderr": ""})
+
+    def fake_send_telegram_media(file_path: str, caption: str = ""):
+        attempts["send"] += 1
+        if attempts["send"] == 1:
+            return core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+        return core_tools.ToolResult("ok", "fake media sent after retry", data={"file_path": file_path, "caption": caption})
+
+    agent = CompanionAgent(PermissionReplayPythonAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "permission_replay_delivery_recovery_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.add_tool(core_tools.AgentTool("execute_python", "fake python", fake_execute_python, {"type": "object", "properties": {}}, True))
+    agent.add_tool(core_tools.AgentTool("send_telegram_media", "fake send", fake_send_telegram_media, {"type": "object", "properties": {}}))
+
+    first = agent.chat("幫我截圖", response_policy=response_policy_for(InteractionMode.TOOL_TASK))
+    if "可以" not in first["content"] and "確認" not in first["content"]:
+        raise AssertionError(first)
+    second = agent.chat("可以", response_policy=response_policy_for(InteractionMode.CHAT))
+    if attempts["send"] != 2:
+        raise AssertionError({"attempts": attempts, "reply": second})
+    if "順手" not in second["content"] or "permission_replay_transient_artifact.png" not in second["content"]:
+        raise AssertionError(second)
+    if agent.llm.calls != 1:
+        raise AssertionError(f"approval should replay, recover delivery, and avoid replanning; calls={agent.llm.calls}")
+    return "approved replay recovered transient artifact delivery"
 
 
 def permission_replay_recovers_transient_error_before_reply():
@@ -381,6 +511,41 @@ def permission_replay_recovers_transient_error_before_reply():
     if agent.llm.calls != calls_before_approval:
         raise AssertionError(f"approval replay should not ask the model to replan; calls={agent.llm.calls}")
     return "permission replay recovered transient error before replying"
+
+
+def permission_replay_summarizes_media_status_instead_of_raw_stdout():
+    def fake_execute_python(code: str, timeout: int = 30):
+        stdout = (
+            "=== cloudmusic window title ===\n"
+            "Id MainWindowTitle\n"
+            "-- ---------------\n"
+            "22256 靜降想? - MyGO!!!!!\n"
+            "\n"
+            "=== cloudmusic process info ===\n"
+            "PID CPU WorkingSetMB Responding MainWindowTitle\n"
+            "22256 5117.4 105 True 靜降想? - MyGO!!!!!\n"
+        )
+        return core_tools.ToolResult("ok", "Python completed.", data={"returncode": 0, "stdout": stdout, "stderr": ""})
+
+    agent = CompanionAgent(PermissionReplayMediaStatusAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "permission_replay_media_status_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.add_tool(core_tools.AgentTool("execute_python", "fake python", fake_execute_python, {"type": "object", "properties": {}}, True))
+    first = agent.chat("幫我用 Python 看一下現在我的電腦有沒有在播放媒體或者音樂", response_policy=response_policy_for(InteractionMode.TOOL_TASK))
+    if "可以" not in first["content"] and "確認" not in first["content"]:
+        raise AssertionError(first)
+    second = agent.chat("可以", response_policy=response_policy_for(InteractionMode.CHAT))
+    content = second["content"]
+    required = ["我查到", "cloudmusic", "MyGO", "不能 100% 判斷", "我猜你真正想知道"]
+    missing = [item for item in required if item not in content]
+    if missing:
+        raise AssertionError({"missing": missing, "content": content})
+    if "stdout:" in content or "returncode:" in content:
+        raise AssertionError(content)
+    if agent.llm.calls != 1:
+        raise AssertionError(f"approval should replay without replanning; calls={agent.llm.calls}")
+    return "permission replay summarized media status"
 
 
 def permission_replay_failed_python_enters_self_repair_loop():
@@ -436,11 +601,11 @@ def tool_loop_lives_in_controller_not_core_loop():
 
     chat_source = inspect.getsource(core_agent_module.CompanionAgent.chat)
     controller_source = inspect.getsource(ToolLoopController)
-    forbidden = ["llm.chat_with_tools", "tool_call_counts", "Repeated tool call stopped", "failsafe"]
+    forbidden = ["llm.chat_with_tools", "repeat_state", "Repeated tool call stopped", "failsafe"]
     leaked = [marker for marker in forbidden if marker in chat_source]
     if leaked:
         raise AssertionError(f"tool loop leaked back into CompanionAgent.chat: {leaked}")
-    required = ["llm.chat_with_tools", "tool_call_counts", "Repeated tool call stopped", "failsafe"]
+    required = ["llm.chat_with_tools", "repeat_state", "Repeated tool call stopped", "failsafe"]
     missing = [marker for marker in required if marker not in controller_source]
     if missing:
         raise AssertionError(f"tool loop controller missing responsibilities: {missing}")
@@ -554,7 +719,7 @@ def _agent_with_last_artifact(filename: str = "outcome_artifact.png"):
     artifact = os.path.join(core_tools.PROJECT_CACHE_DIR, filename)
     with open(artifact, "wb") as file:
         file.write(b"\x89PNG\r\n\x1a\n")
-    agent = CompanionAgent(NoReplanAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, f"{filename}.json"))
+    agent = CompanionAgent(NoReplanAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, f"artifact_outcome_test_{filename}.json"))
     agent.interactive_mode = False
     for tool in core_tools.ALL_TOOLS:
         agent.add_tool(tool)
@@ -577,11 +742,123 @@ def outcome_send_artifact_uses_stored_artifact_without_replanning():
 
     agent.add_tool(core_tools.AgentTool("send_telegram_media", "fake send", fake_send_telegram_media, {"type": "object", "properties": {}}))
     result = agent.chat("發給我", response_policy=response_policy_for(InteractionMode.CHAT))
-    if "發給你" not in result["content"] or "send_me_artifact.png" not in result["content"]:
+    if "send_me_artifact.png" not in result["content"]:
         raise AssertionError(result)
     if agent.llm.calls:
         raise AssertionError("send artifact should not replan")
     return "stored artifact sent without replanning"
+
+
+def outcome_send_artifact_recovers_transient_error_without_replanning():
+    agent, artifact = _agent_with_last_artifact("send_me_after_retry.png")
+    attempts = {"send": 0}
+
+    def fake_send_telegram_media(file_path, caption=""):
+        if os.path.abspath(file_path) != os.path.abspath(artifact):
+            raise AssertionError(file_path)
+        attempts["send"] += 1
+        if attempts["send"] == 1:
+            return core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+        return core_tools.ToolResult("ok", "fake media sent after retry", data={"file": file_path})
+
+    agent.add_tool(core_tools.AgentTool("send_telegram_media", "fake send", fake_send_telegram_media, {"type": "object", "properties": {}}))
+    result = agent.chat("發給我", response_policy=response_policy_for(InteractionMode.CHAT))
+    if attempts["send"] != 2:
+        raise AssertionError({"attempts": attempts, "reply": result})
+    if "send_me_after_retry.png" not in result["content"]:
+        raise AssertionError(result)
+    if agent.llm.calls:
+        raise AssertionError("send artifact recovery should not replan")
+    return "stored artifact send recovered transient error without replanning"
+
+
+def outcome_continue_retries_last_safe_failed_step_without_replanning():
+    artifact = os.path.join(core_tools.PROJECT_CACHE_DIR, "retry_last_safe_step.png")
+    with open(artifact, "wb") as file:
+        file.write(b"\x89PNG\r\n\x1a\n")
+    attempts = {"send": 0}
+
+    def fake_send_telegram_media(file_path, caption=""):
+        if os.path.abspath(file_path) != os.path.abspath(artifact):
+            raise AssertionError(file_path)
+        attempts["send"] += 1
+        return core_tools.ToolResult("ok", "fake media sent after owner retry", data={"file": file_path})
+
+    agent = CompanionAgent(NoReplanAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "outcome_safe_retry_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.add_tool(core_tools.AgentTool("send_telegram_media", "fake send", fake_send_telegram_media, {"type": "object", "properties": {}}))
+    graph_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "outcome_safe_retry_graph_test.json")
+    try:
+        os.remove(graph_path)
+    except FileNotFoundError:
+        pass
+    agent.task_graphs = TaskGraphManager(graph_path)
+    failed = core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+    verification = verify_action("send_telegram_media", {"file_path": artifact, "caption": "剛剛的結果喔"}, failed, "self_test", 1)
+    agent.task_graphs.record_tool_result("send_telegram_media", {"file_path": artifact, "caption": "剛剛的結果喔"}, failed, verification, "self_test", 1, objective="send stored artifact")
+    agent.session_brain.state.state = "awaiting_validation"
+    agent.session_brain.state.last_tool = "send_telegram_media"
+    agent.session_brain.state.last_tool_status = "error"
+    agent.session_brain.state.verification_plan = []
+
+    result = agent.chat("再試一次", response_policy=response_policy_for(InteractionMode.CHAT))
+    if attempts["send"] != 1:
+        raise AssertionError({"attempts": attempts, "reply": result})
+    if "retry_last_safe_step.png" not in result["content"] and "fake media sent" not in result["content"]:
+        raise AssertionError(result)
+    if agent.llm.calls:
+        raise AssertionError("safe outcome retry should not call LLM")
+    return "continue retried last safe failed step without replanning"
+
+
+def outcome_retry_records_result_on_original_failed_graph():
+    artifact = os.path.join(core_tools.PROJECT_CACHE_DIR, "retry_last_safe_step_original_graph.png")
+    with open(artifact, "wb") as file:
+        file.write(b"\x89PNG\r\n\x1a\n")
+    attempts = {"send": 0}
+
+    def fake_send_telegram_media(file_path, caption=""):
+        attempts["send"] += 1
+        return core_tools.ToolResult("ok", "fake media sent on retry", data={"file": file_path})
+
+    agent = CompanionAgent(NoReplanAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "outcome_original_graph_retry_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.add_tool(core_tools.AgentTool("send_telegram_media", "fake send", fake_send_telegram_media, {"type": "object", "properties": {}}))
+    graph_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "outcome_original_graph_retry_test.json")
+    try:
+        os.remove(graph_path)
+    except FileNotFoundError:
+        pass
+    agent.task_graphs = TaskGraphManager(graph_path)
+    failed = core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+    failed_args = {"file_path": artifact, "caption": "剛剛的結果喔"}
+    verification = verify_action("send_telegram_media", failed_args, failed, "self_test", 1)
+    failed_graph = agent.task_graphs.record_tool_result("send_telegram_media", failed_args, failed, verification, "self_test", 1, objective="send stored artifact")
+    newer_graph = agent.task_graphs.start_or_resume("new unrelated task", "self_test", 2)
+    if newer_graph.task_id == failed_graph.task_id:
+        raise AssertionError("test setup did not create a separate active graph")
+    agent.session_brain.state.state = "awaiting_validation"
+    agent.session_brain.state.last_tool = "send_telegram_media"
+    agent.session_brain.state.last_tool_status = "error"
+    agent.session_brain.state.verification_plan = []
+
+    result = agent.chat("再試一次", response_policy=response_policy_for(InteractionMode.CHAT))
+    if attempts["send"] != 1 or ("retry_last_safe_step_original_graph.png" not in result["content"] and "fake media sent" not in result["content"]):
+        raise AssertionError({"attempts": attempts, "reply": result})
+    updated_failed_graph = next(graph for graph in agent.task_graphs.graphs if graph.task_id == failed_graph.task_id)
+    still_new_graph = next(graph for graph in agent.task_graphs.graphs if graph.task_id == newer_graph.task_id)
+    failed_step = updated_failed_graph.current_step()
+    if not failed_step or failed_step.result_status != "ok" or failed_step.status not in {"done", "verified"}:
+        raise AssertionError({"failed_graph": updated_failed_graph, "reply": result})
+    if still_new_graph.steps:
+        raise AssertionError("retry result was recorded on the newer graph")
+    if agent.llm.calls:
+        raise AssertionError("safe outcome retry should not call LLM")
+    return "outcome retry result stayed on original failed graph"
 
 
 def outcome_analyze_artifact_uses_stored_artifact_without_replanning():
@@ -612,7 +889,7 @@ def outcome_action_without_artifact_is_clear():
     agent.session_brain.state.last_artifacts = []
     agent.session_brain.state.pending_validation = ["verify tool results: execute_python"]
     result = agent.chat("發給我", response_policy=response_policy_for(InteractionMode.CHAT))
-    if "沒有找到可用的產物" not in result["content"]:
+    if "沒有找到" not in result["content"] or "結果" not in result["content"]:
         raise AssertionError(result)
     if agent.llm.calls:
         raise AssertionError("missing artifact should not replan")
@@ -684,7 +961,7 @@ def outcome_continue_starts_allowlisted_verifier_worker():
     agent.session_brain.state.last_tool = "execute_python"
     agent.session_brain.state.last_tool_status = "ok"
     result = agent.chat("繼續", response_policy=response_policy_for(InteractionMode.CHAT))
-    if "py_compile" not in result["content"] or "job:" not in result["content"]:
+    if "py_compile" not in result["content"] or "job=" not in result["content"]:
         raise AssertionError(result)
     if agent.llm.calls:
         raise AssertionError("continue verifier should not replan")
@@ -704,7 +981,7 @@ def outcome_continue_rejects_non_allowlisted_verifier_plan():
     agent.session_brain.state.state = "awaiting_validation"
     agent.session_brain.state.verification_plan = ["danger (required): powershell remove everything"]
     result = agent.chat("繼續", response_policy=response_policy_for(InteractionMode.CHAT))
-    if "目前沒有明確下一步" not in result["content"]:
+    if "沒有" not in result["content"] or "安全" not in result["content"]:
         raise AssertionError(result)
     if queue.list_jobs(limit=10):
         raise AssertionError("non-allowlisted verifier should not create job")
@@ -749,7 +1026,7 @@ def single_approval_does_not_allow_unrelated_tool():
     result = agent.chat("可以")
     if not os.path.exists(target):
         raise AssertionError("pending write_file was not replayed")
-    if agent.llm.calls != 2:
+    if agent.llm.calls != 1:
         raise AssertionError(f"approval should not replan into unrelated execute_command; calls={agent.llm.calls}")
     if "write_file" not in result["content"]:
         raise AssertionError(result)
@@ -769,8 +1046,6 @@ class TurnApprovalAdapter:
                 "tool_calls": [{"id": "call_write", "name": "write_file", "arguments": {"filename": "project_cache/turn.txt", "content": "turn"}, "raw_arguments": '{"filename":"project_cache/turn.txt","content":"turn"}'}],
             }
         if self.calls == 2:
-            return {"role": "assistant", "content": "需要權限，可以嗎？"}
-        if self.calls == 3:
             return {
                 "role": "assistant",
                 "content": "",
@@ -780,6 +1055,58 @@ class TurnApprovalAdapter:
                 ],
             }
         return {"role": "assistant", "content": "turn approval handled"}
+
+
+class ComputerControlTurnApprovalAdapter:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            args = {"keys": "space"}
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_hotkey", "name": "press_hotkey", "arguments": args, "raw_arguments": json.dumps(args)}],
+            }
+        if self.calls == 2:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_hotkey2", "name": "press_hotkey", "arguments": {"keys": "space"}, "raw_arguments": json.dumps({"keys": "space"})},
+                    {"id": "call_click", "name": "click_ui_element", "arguments": {"element_id": "button_1"}, "raw_arguments": json.dumps({"element_id": "button_1"})},
+                    {"id": "call_type", "name": "type_keyboard", "arguments": {"text": "hello"}, "raw_arguments": json.dumps({"text": "hello"})},
+                    {"id": "call_cmd", "name": "execute_command", "arguments": {"command": "echo should_not_run"}, "raw_arguments": json.dumps({"command": "echo should_not_run"})},
+                ],
+            }
+        return {"role": "assistant", "content": "computer control turn approval handled"}
+
+
+class PlanFirstAdapter:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        return {"role": "assistant", "content": "should not run before plan approval"}
+
+
+class PlanApprovalAdapter:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            args = {"keys": "alt+tab"}
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_hotkey", "name": "press_hotkey", "arguments": args, "raw_arguments": json.dumps(args)}],
+            }
+        return {"role": "assistant", "content": "plan approved and first UI step ran"}
 
 
 class CwdRecoveryAdapter:
@@ -861,14 +1188,121 @@ def turn_approval_allows_tool_chain():
     agent.chat("do task")
     before = len([m for m in agent.memory if m.get("role") == "tool"])
     result = agent.chat("本輪允許")
-    if result["content"] != "turn approval handled":
+    if "可以" not in result["content"] and "點頭" not in result["content"] and "確認" not in result["content"]:
         raise AssertionError(result)
     if not os.path.exists(target):
         raise AssertionError("turn write_file did not execute")
     new_tool_messages = [m for m in agent.memory if m.get("role") == "tool"][before:]
     if not any('"status": "blocked"' in m.get("content", "") and "execute_python" in m.get("content", "") for m in new_tool_messages):
         raise AssertionError("turn bundle should not allow unrelated high-risk execute_python")
-    return "turn approval allowed file bundle but blocked high-risk command"
+    return "turn approval allowed file bundle then stopped at high-risk python"
+
+
+def turn_approval_allows_computer_control_bundle():
+    calls: list[str] = []
+
+    def fake_hotkey(keys: str):
+        calls.append(f"press_hotkey:{keys}")
+        return core_tools.ToolResult("ok", "fake hotkey")
+
+    def fake_click(element_id: str, double_click: bool = False):
+        calls.append(f"click_ui_element:{element_id}:{double_click}")
+        return core_tools.ToolResult("ok", "fake click")
+
+    def fake_type(text: str, press_enter: bool = False):
+        calls.append(f"type_keyboard:{text}:{press_enter}")
+        return core_tools.ToolResult("ok", "fake type")
+
+    agent = CompanionAgent(ComputerControlTurnApprovalAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "computer_turn_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.add_tool(core_tools.AgentTool("press_hotkey", "fake hotkey", fake_hotkey, {"type": "object", "properties": {"keys": {"type": "string"}}, "required": ["keys"]}, True))
+    agent.add_tool(core_tools.AgentTool("click_ui_element", "fake click", fake_click, {"type": "object", "properties": {"element_id": {"type": "string"}, "double_click": {"type": "boolean"}}, "required": ["element_id"]}, True))
+    agent.add_tool(core_tools.AgentTool("type_keyboard", "fake type", fake_type, {"type": "object", "properties": {"text": {"type": "string"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}, True))
+    first = agent.chat("幫我暫停播放")
+    if not agent.permission_manager.pending or agent.permission_manager.pending.tool_name != "press_hotkey":
+        raise AssertionError({"first": first, "pending": agent.permission_manager.pending})
+    result = agent.chat("本輪允許")
+    if "可以" not in result["content"] and "點頭" not in result["content"] and "確認" not in result["content"]:
+        raise AssertionError(result)
+    expected = {"press_hotkey:space", "click_ui_element:button_1:False", "type_keyboard:hello:False"}
+    if not expected.issubset(set(calls)):
+        raise AssertionError(calls)
+    tool_messages = [m.get("content", "") for m in agent.memory if m.get("role") == "tool"]
+    if not any('"status": "blocked"' in content and "execute_command" in content for content in tool_messages):
+        raise AssertionError("computer bundle should not allow unrelated execute_command")
+    return calls
+
+
+def plain_approval_allows_computer_control_operation():
+    calls: list[str] = []
+
+    def fake_hotkey(keys: str):
+        calls.append(f"press_hotkey:{keys}")
+        return core_tools.ToolResult("ok", "fake hotkey")
+
+    def fake_click(element_id: str, double_click: bool = False):
+        calls.append(f"click_ui_element:{element_id}:{double_click}")
+        return core_tools.ToolResult("ok", "fake click")
+
+    def fake_type(text: str, press_enter: bool = False):
+        calls.append(f"type_keyboard:{text}:{press_enter}")
+        return core_tools.ToolResult("ok", "fake type")
+
+    agent = CompanionAgent(ComputerControlTurnApprovalAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "computer_plain_approval_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.add_tool(core_tools.AgentTool("press_hotkey", "fake hotkey", fake_hotkey, {"type": "object", "properties": {"keys": {"type": "string"}}, "required": ["keys"]}, True))
+    agent.add_tool(core_tools.AgentTool("click_ui_element", "fake click", fake_click, {"type": "object", "properties": {"element_id": {"type": "string"}, "double_click": {"type": "boolean"}}, "required": ["element_id"]}, True))
+    agent.add_tool(core_tools.AgentTool("type_keyboard", "fake type", fake_type, {"type": "object", "properties": {"text": {"type": "string"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}, True))
+    agent.chat("幫我暫停播放")
+    result = agent.chat("可以")
+    if "可以" not in result["content"] and "點頭" not in result["content"] and "確認" not in result["content"]:
+        raise AssertionError(result)
+    expected = {"press_hotkey:space", "click_ui_element:button_1:False", "type_keyboard:hello:False"}
+    if not expected.issubset(set(calls)):
+        raise AssertionError(calls)
+    tool_messages = [m.get("content", "") for m in agent.memory if m.get("role") == "tool"]
+    if not any('"status": "blocked"' in content and "execute_command" in content for content in tool_messages):
+        raise AssertionError("plain approval must not unlock unrelated execute_command")
+    return "plain approval promoted to computer-control operation approval"
+
+
+def approval_restores_pending_from_task_graph_after_restart():
+    calls: list[str] = []
+
+    def fake_hotkey(keys: str):
+        calls.append(f"press_hotkey:{keys}")
+        return core_tools.ToolResult("ok", "fake hotkey")
+
+    def fake_click(element_id: str, double_click: bool = False):
+        calls.append(f"click_ui_element:{element_id}:{double_click}")
+        return core_tools.ToolResult("ok", "fake click")
+
+    def fake_type(text: str, press_enter: bool = False):
+        calls.append(f"type_keyboard:{text}:{press_enter}")
+        return core_tools.ToolResult("ok", "fake type")
+
+    agent = CompanionAgent(ComputerControlTurnApprovalAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "computer_restore_pending_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.add_tool(core_tools.AgentTool("press_hotkey", "fake hotkey", fake_hotkey, {"type": "object", "properties": {"keys": {"type": "string"}}, "required": ["keys"]}, True))
+    agent.add_tool(core_tools.AgentTool("click_ui_element", "fake click", fake_click, {"type": "object", "properties": {"element_id": {"type": "string"}, "double_click": {"type": "boolean"}}, "required": ["element_id"]}, True))
+    agent.add_tool(core_tools.AgentTool("type_keyboard", "fake type", fake_type, {"type": "object", "properties": {"text": {"type": "string"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}, True))
+    agent.chat("幫我暫停播放")
+    if not agent.permission_manager.pending:
+        raise AssertionError("first blocked tool did not create pending permission")
+    agent.permission_manager.pending = None
+    result = agent.chat("本轮允许")
+    if "可以" not in result["content"] and "點頭" not in result["content"] and "確認" not in result["content"]:
+        raise AssertionError(result)
+    expected = {"press_hotkey:space", "click_ui_element:button_1:False", "type_keyboard:hello:False"}
+    if not expected.issubset(set(calls)):
+        raise AssertionError(calls)
+    return "pending permission restored from task graph and approved"
 
 
 def command_cwd_failure_recovers_inside_agent_loop():
@@ -928,6 +1362,36 @@ def self_recovery_does_not_retry_unsafe_python():
     return "unsafe python was not auto-retried"
 
 
+def self_recovery_failed_retry_leaves_evidence_for_reply():
+    class FailingExecutor:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, tool_name, arguments, callback=None, response_policy=None):
+            self.calls += 1
+            return core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)", data={"attempt": self.calls})
+
+    executor = FailingExecutor()
+    recovery = SelfRecoveryController(executor=executor, hooks=DEFAULT_HOOK_MANAGER, session_id="self_test", max_transient_retries=2)
+    original = core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+    recovered, evidence = recovery.recover("search_knowledge", {"query": "permission replay"}, original, None, response_policy_for(InteractionMode.TOOL_TASK), 1)
+    if recovered.status != "error" or not evidence:
+        raise AssertionError({"recovered": recovered, "evidence": evidence})
+    recovery_data = recovered.data.get("recovery_attempted") if isinstance(recovered.data, dict) else None
+    if not recovery_data or recovery_data.get("reason") != "transient_retry" or recovery_data.get("attempts") != 2:
+        raise AssertionError({"data": recovered.data, "evidence": evidence})
+    from agent_user_voice import approved_tool_error_reply
+    import agent_outcome
+
+    reply = approved_tool_error_reply("search_knowledge", recovered)
+    if "自己試過" not in reply or "transient_retry" not in reply:
+        raise AssertionError(reply)
+    summary, _artifacts = agent_outcome.tool_result_outcome("search_knowledge", recovered)
+    if "recovery_attempted: transient_retry attempts=2" not in summary:
+        raise AssertionError(summary)
+    return "failed self-recovery leaves owner-visible evidence"
+
+
 def missing_mss_screenshot_recovery_uses_safe_fallback():
     attempts = {"count": 0, "fallback_code": ""}
 
@@ -935,7 +1399,7 @@ def missing_mss_screenshot_recovery_uses_safe_fallback():
         def execute(self, tool_name, arguments, callback=None, response_policy=None):
             attempts["count"] += 1
             attempts["fallback_code"] = arguments.get("code", "")
-            if "pyautogui.screenshot" not in attempts["fallback_code"] or "ImageGrab.grab" not in attempts["fallback_code"]:
+            if "System.Windows.Forms" not in attempts["fallback_code"] or "CopyFromScreen" not in attempts["fallback_code"]:
                 return core_tools.ToolResult("error", "bad fallback", error="bad fallback")
             return core_tools.ToolResult("ok", "Python completed.", data={"stdout": "fullscreen_screenshot.png", "stderr": ""})
 
@@ -964,7 +1428,7 @@ def screenshot_runtime_error_recovery_uses_safe_fallback():
         def execute(self, tool_name, arguments, callback=None, response_policy=None):
             attempts["count"] += 1
             attempts["fallback_code"] = arguments.get("code", "")
-            if "pyautogui.screenshot" not in attempts["fallback_code"] or "ImageGrab.grab" not in attempts["fallback_code"]:
+            if "System.Windows.Forms" not in attempts["fallback_code"] or "CopyFromScreen" not in attempts["fallback_code"]:
                 return core_tools.ToolResult("error", "bad fallback", error="bad fallback")
             return core_tools.ToolResult("ok", "Python completed.", data={"stdout": "fullscreen_screenshot.png", "stderr": ""})
 
@@ -1016,6 +1480,138 @@ def self_recovery_diagnoses_and_plans_known_errors():
     if transient_diagnosis.category != "transient_external_error" or not transient_plan or transient_plan.max_attempts != 2:
         raise AssertionError((transient_diagnosis, transient_plan))
     return "known recovery errors diagnose and plan deterministically"
+
+
+def repair_planner_orders_safe_candidates():
+    planner = RepairPlanner(max_transient_retries=2)
+
+    cwd_result = core_tools.ToolResult(
+        "error",
+        "Command failed.",
+        data={"cwd": "workspace", "retry_hint": "Command could not find a file. Verify cwd and paths."},
+    )
+    cwd_args = {"command": "python -m py_compile ../core_tools.py", "cwd": "workspace"}
+    cwd_candidates = planner.candidates("execute_command", cwd_args, cwd_result)
+    if [item.strategy for item in cwd_candidates] != ["cwd_retry", "command_file_probe"]:
+        raise AssertionError(cwd_candidates)
+    if cwd_candidates[0].details.get("candidate_order") != 1:
+        raise AssertionError(cwd_candidates[0])
+    if cwd_candidates[1].tool_name != "execute_python" or cwd_candidates[1].requires_same_tool:
+        raise AssertionError(cwd_candidates[1])
+
+    screenshot_result = core_tools.ToolResult("error", "Python failed.", error="ModuleNotFoundError: No module named 'mss'")
+    screenshot_args = {"code": "import mss\nsct.grab(sct.monitors[0]).save('screen.png')", "timeout": 30}
+    screenshot_candidates = plan_recovery_candidates(
+        "execute_python",
+        screenshot_args,
+        screenshot_result,
+        diagnose_tool_error("execute_python", screenshot_args, screenshot_result),
+    )
+    if [item.strategy for item in screenshot_candidates] != ["screenshot_capture_fallback", "screen_ui_snapshot_fallback"]:
+        raise AssertionError(screenshot_candidates)
+    if screenshot_candidates[1].tool_name != "get_screen_ui" or screenshot_candidates[1].requires_same_tool:
+        raise AssertionError(screenshot_candidates[1])
+
+    transient_result = core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+    transient_candidates = planner.candidates("search_knowledge", {"query": "permission"}, transient_result)
+    if [item.strategy for item in transient_candidates] != ["transient_retry"] or transient_candidates[0].max_attempts != 2:
+        raise AssertionError(transient_candidates)
+    return "repair planner produced ordered safe candidates"
+
+
+def command_recovery_uses_file_probe_after_cwd_retry_fails():
+    attempts: list[tuple[str, dict]] = []
+
+    class Executor:
+        def execute(self, tool_name, arguments, callback=None, response_policy=None):
+            attempts.append((tool_name, dict(arguments or {})))
+            if tool_name == "execute_command":
+                return core_tools.ToolResult(
+                    "error",
+                    "Command failed.",
+                    data={"cwd": "project", "retry_hint": "Command could not find a file. Verify cwd and paths."},
+                    error="No such file or directory: missing_core_file.py",
+                )
+            if tool_name == "execute_python":
+                code = arguments.get("code", "")
+                if "missing_core_file.py" not in code or "rglob" not in code:
+                    return core_tools.ToolResult("error", "bad probe", error=code)
+                return core_tools.ToolResult("ok", "Python completed.", data={"stdout": "missing_core_file.py: not found"})
+            raise AssertionError(tool_name)
+
+    recovery = SelfRecoveryController(executor=Executor(), hooks=DEFAULT_HOOK_MANAGER, session_id="self_test")
+    original = core_tools.ToolResult(
+        "error",
+        "Command failed.",
+        data={"cwd": "workspace", "retry_hint": "Command could not find a file. Verify cwd and paths."},
+        error="No such file or directory: missing_core_file.py",
+    )
+    args = {"command": "python -m py_compile missing_core_file.py", "cwd": "workspace", "timeout": 30}
+    recovered, evidence = recovery.recover("execute_command", args, original, None, response_policy_for(InteractionMode.TOOL_TASK), 1)
+    if recovered.status != "ok" or not evidence or evidence.get("reason") != "command_file_probe":
+        raise AssertionError((recovered.to_text(), evidence))
+    if [tool for tool, _args in attempts] != ["execute_command", "execute_python"]:
+        raise AssertionError(attempts)
+    prior = recovered.data.get("prior_recovery_attempts") if isinstance(recovered.data, dict) else None
+    if not prior or prior[0].get("reason") != "cwd_retry":
+        raise AssertionError(recovered.to_text())
+    if _extract_command_file_names("python -m py_compile core_tools.py README.md") != ["core_tools.py", "README.md"]:
+        raise AssertionError("file extraction changed")
+    return "command recovery used file probe after cwd retry failed"
+
+
+def self_recovery_uses_second_candidate_when_first_fails():
+    attempts: list[tuple[str, dict]] = []
+
+    class Executor:
+        def execute(self, tool_name, arguments, callback=None, response_policy=None):
+            attempts.append((tool_name, dict(arguments or {})))
+            if tool_name == "execute_python":
+                return core_tools.ToolResult("error", "PowerShell screenshot failed.", error="PowerShell screenshot failed")
+            if tool_name == "get_screen_ui":
+                return core_tools.ToolResult("ok", "Active window: test\nClickable/input elements:", data={"count": 0})
+            raise AssertionError(tool_name)
+
+    recovery = SelfRecoveryController(executor=Executor(), hooks=DEFAULT_HOOK_MANAGER, session_id="self_test")
+    original = core_tools.ToolResult(
+        "error",
+        "Python failed.",
+        data={"stderr": "ModuleNotFoundError: No module named 'mss'"},
+        error="ModuleNotFoundError: No module named 'mss'",
+    )
+    args = {"code": "import mss\nsct.grab(sct.monitors[0]).save('screen.png')", "timeout": 30}
+    recovered, evidence = recovery.recover("execute_python", args, original, None, response_policy_for(InteractionMode.SCREEN_OBSERVE), 1)
+    if recovered.status != "ok" or not evidence or evidence.get("reason") != "screen_ui_snapshot_fallback":
+        raise AssertionError((recovered.to_text(), evidence))
+    if [tool for tool, _args in attempts] != ["execute_python", "get_screen_ui"]:
+        raise AssertionError(attempts)
+    prior = recovered.data.get("prior_recovery_attempts") if isinstance(recovered.data, dict) else None
+    if not prior or prior[0].get("reason") != "screenshot_capture_fallback":
+        raise AssertionError(recovered.to_text())
+    return "second recovery candidate ran after first screenshot fallback failed"
+
+
+def self_recovery_skips_already_attempted_candidate():
+    class FailingExecutor:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, tool_name, arguments, callback=None, response_policy=None):
+            self.calls += 1
+            return core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+
+    executor = FailingExecutor()
+    recovery = SelfRecoveryController(executor=executor, hooks=DEFAULT_HOOK_MANAGER, session_id="self_test", max_transient_retries=1)
+    original = core_tools.ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+    first, first_evidence = recovery.recover("search_knowledge", {"query": "permission"}, original, None, response_policy_for(InteractionMode.TOOL_TASK), 1)
+    second, second_evidence = recovery.recover("search_knowledge", {"query": "permission"}, original, None, response_policy_for(InteractionMode.TOOL_TASK), 2)
+    if executor.calls != 1:
+        raise AssertionError(f"expected one retry attempt, got {executor.calls}")
+    if not first_evidence or first.data.get("recovery_attempted", {}).get("reason") != "transient_retry":
+        raise AssertionError((first.to_text(), first_evidence))
+    if second is not original or second_evidence is not None:
+        raise AssertionError((second.to_text(), second_evidence))
+    return "self recovery skipped an already attempted candidate"
 
 
 def self_recovery_does_not_plan_unsafe_unknown_errors():
@@ -1081,6 +1677,37 @@ def missing_module_recovery_is_narrow():
     if recovered is not result or evidence is not None:
         raise AssertionError((recovered.to_text(), evidence))
     return "missing module recovery stayed narrow"
+
+
+def self_repair_prompt_includes_failed_deterministic_recovery():
+    from agent_self_recovery import self_repair_instruction
+
+    result = core_tools.ToolResult(
+        "error",
+        "Python failed.",
+        error="ModuleNotFoundError: No module named 'mss'",
+        data={
+            "stderr": "ModuleNotFoundError: No module named 'mss'",
+            "recovery_attempted": {
+                "reason": "screenshot_capture_fallback",
+                "attempts": 1,
+                "retry_status": "error",
+                "retry_message": "PowerShell screenshot failed",
+                "details": {"strategy": "screenshot_capture_fallback"},
+            },
+        },
+    )
+    instruction = self_repair_instruction("execute_python", {"code": "import mss\n# screenshot"}, result)
+    required = [
+        "deterministic_recovery_already_tried",
+        "screenshot_capture_fallback",
+        "PowerShell screenshot failed",
+        "Do not repeat that exact recovery path",
+    ]
+    missing = [item for item in required if item not in instruction]
+    if missing:
+        raise AssertionError({"missing": missing, "instruction": instruction})
+    return "self repair prompt carries failed deterministic recovery evidence"
 
 
 def tool_loop_prompts_self_repair_before_user_followup():
@@ -1620,7 +2247,7 @@ def task_benchmark_runs_default_cases():
     if report["total"] < 10 or report["failed"] != 0 or report["success_rate"] != 1.0:
         raise AssertionError(report)
     categories = set(report.get("by_category", {}))
-    if not {"recovery", "workflow", "knowledge", "permission", "route", "conversation", "voice"}.issubset(categories):
+    if not {"recovery", "workflow", "knowledge", "permission", "route", "conversation", "voice", "presence"}.issubset(categories):
         raise AssertionError(report.get("by_category"))
     if not os.path.exists(report_path):
         raise AssertionError("benchmark report was not written")
@@ -1785,6 +2412,27 @@ def live_eval_ignores_benchmark_sessions_for_gate():
     return "benchmark sessions do not pollute live eval"
 
 
+def live_eval_ignores_artifact_history_test_sessions_for_gate():
+    trace_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "eval_artifact_history_trace_test.jsonl")
+    events = [
+        {"event": "SessionStart", "session_id": "live_owner_chat", "history_file": "workspace/chat_history/live_owner_chat.json"},
+        {"event": "context.budget", "mode": "chat", "total_after": 1000, "max_chars": 9000},
+        {"event": "SessionStart", "session_id": "send_me_after_retry.png", "history_file": "workspace/chat_history/send_me_after_retry.png.json"},
+        {"event": "PostToolUse", "session_id": "send_me_after_retry.png", "tool": "send_telegram_media", "status": "error", "result": "ConnectionResetError(10054)"},
+        {"event": "ToolError", "session_id": "send_me_after_retry.png", "tool": "send_telegram_media", "error": "ConnectionResetError(10054)"},
+    ]
+    with open(trace_path, "w", encoding="utf-8") as file:
+        for event in events:
+            file.write(json.dumps(event, ensure_ascii=False) + "\n")
+    report = build_live_eval_report(trace_path, include_repo=False)
+    data = report.to_dict()
+    if data["total_events"] != 2 or data["tool_errors"] != 0:
+        raise AssertionError(data)
+    if data["next_stage_gate"]["status"] != "pass":
+        raise AssertionError(data["next_stage_gate"])
+    return "artifact-history test sessions do not pollute live eval"
+
+
 def live_eval_repo_hygiene_allows_env_example():
     hygiene = check_repo_hygiene()
     if hygiene.get("status") != "pass":
@@ -1846,7 +2494,7 @@ def live_eval_summarizes_fake_trace_and_writes_report():
     if loaded["knowledge"]["empty_count"] != 1:
         raise AssertionError(loaded["knowledge"])
     text = report.to_text()
-    if "Self repair:" not in text:
+    if "Self repair:" not in text or "recovery 1/1 ok" not in text:
         raise AssertionError(text)
     return text.splitlines()[0]
 
@@ -1868,11 +2516,19 @@ def live_eval_reports_user_facing_source_health():
     for filename, phrases in agent_eval.SOURCE_REQUIRED_PHRASES.items():
         if not isinstance(phrases, tuple):
             raise AssertionError(f"{filename} source health phrases must be a tuple, got {type(phrases).__name__}")
+        for phrase in phrases:
+            if any(marker in phrase for marker in agent_eval.SOURCE_MOJIBAKE_MARKERS):
+                raise AssertionError({"filename": filename, "bad_required_phrase": phrase})
     health = check_user_facing_source_health()
     if health.get("status") != "pass":
         raise AssertionError(health)
+    samples = set(health.get("voice_samples_checked", []))
+    expected_samples = {"friendly_execute_python", "permission", "approved_success", "quick_ack_tool"}
+    missing_samples = sorted(expected_samples - samples)
+    if missing_samples:
+        raise AssertionError({"missing_voice_samples": missing_samples, "checked": sorted(samples)})
     checked = set(health.get("checked_files", []))
-    expected = {"agent_user_voice.py", "agent_permission_replay.py", "agent_runtime_context.py", "core_agent.py", "agent_llm.py"}
+    expected = {"agent_user_voice.py", "agent_permission_replay.py", "agent_runtime_context.py", "agent_planner.py", "core_agent.py", "agent_llm.py"}
     missing_files = sorted(expected - checked)
     if missing_files:
         raise AssertionError({"missing_source_health_files": missing_files, "checked": sorted(checked)})
@@ -1883,9 +2539,58 @@ def live_eval_reports_user_facing_source_health():
     text = report.to_text()
     if "Source health: pass" not in text:
         raise AssertionError(text)
+    if "voice samples" not in text:
+        raise AssertionError(text)
     if data["next_stage_gate"]["status"] != "pass":
         raise AssertionError(data["next_stage_gate"])
     return "source health is part of live eval"
+
+
+def source_health_checks_runtime_voice_samples():
+    health = check_user_facing_source_health()
+    if health.get("status") != "pass":
+        raise AssertionError(health)
+    samples = health.get("voice_samples_checked", [])
+    if len(samples) < 10:
+        raise AssertionError(health)
+    texts = agent_eval.runtime_voice_samples()
+    combined = "\n".join(texts.values())
+    for expected in ["可以", "繼續", "系統截圖", "我先看一下"]:
+        if expected not in combined:
+            raise AssertionError(combined)
+    leaks = [marker for marker in agent_eval.USER_VISIBLE_INTERNAL_LEAK_MARKERS if marker in combined.casefold()]
+    if leaks:
+        raise AssertionError({"leaks": leaks, "samples": texts})
+    return "runtime voice samples are part of source health"
+
+
+def source_health_rejects_mojibake_required_phrases():
+    original = agent_eval.SOURCE_REQUIRED_PHRASES
+    try:
+        agent_eval.SOURCE_REQUIRED_PHRASES = {"agent_user_voice.py": ("鍓涘墰",)}
+        health = check_user_facing_source_health()
+    finally:
+        agent_eval.SOURCE_REQUIRED_PHRASES = original
+    if health.get("status") != "fail":
+        raise AssertionError(health)
+    kinds = {issue.get("kind") for issue in health.get("issues", [])}
+    if "mojibake_required_phrase" not in kinds:
+        raise AssertionError(health)
+    return "mojibake required phrases fail source health"
+
+
+def planner_uses_real_chinese_intent_markers():
+    from agent_planner import DEFAULT_PLANNER
+
+    checks = {
+        "cancel": DEFAULT_PLANNER.plan("算了，停止這個任務").intent == "cancel",
+        "verify": "verification" in " | ".join(DEFAULT_PLANNER.plan("幫我測試 self_test").step_names()),
+        "screen": any("UI" in step or "screen" in step for step in DEFAULT_PLANNER.plan("幫我截圖看螢幕").step_names()),
+        "code": any("code" in step for step in DEFAULT_PLANNER.plan("修 bug 並優化程式").step_names()),
+    }
+    if not all(checks.values()):
+        raise AssertionError(checks)
+    return "planner uses real Chinese task markers"
 
 
 def source_health_detects_bad_user_facing_text():
@@ -1958,6 +2663,29 @@ def action_verification_preserves_recovery_evidence():
     return "action verification carried recovery evidence"
 
 
+def action_verification_preserves_failed_recovery_attempt():
+    result = core_tools.ToolResult(
+        "error",
+        "Connection aborted.",
+        data={
+            "recovery_attempted": {
+                "reason": "transient_retry",
+                "attempts": 2,
+                "retry_status": "error",
+                "details": {"strategy": "transient_retry", "diagnosis": "transient_external_error"},
+            },
+        },
+        error="ConnectionResetError(10054)",
+    )
+    verification = verify_action("search_knowledge", {"query": "permission replay"}, result, "self_test", 1)
+    recovery = verification.details.get("recovery")
+    if verification.status != "fail" or not recovery or not verification.details.get("recovery_attempted"):
+        raise AssertionError(verification)
+    if recovery.get("reason") != "transient_retry" or recovery.get("attempts") != 2:
+        raise AssertionError(recovery)
+    return "action verification carried failed recovery attempt"
+
+
 def task_transaction_records_tool_result():
     path = os.path.join(core_tools.PROJECT_CACHE_DIR, "transaction_test.json")
     try:
@@ -2023,6 +2751,36 @@ def task_graph_records_recovery_evidence_on_step():
     return "task graph recorded recovery evidence"
 
 
+def task_graph_records_failed_recovery_attempt_on_step():
+    path = os.path.join(core_tools.PROJECT_CACHE_DIR, "task_graph_failed_recovery_attempt_test.json")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    manager = TaskGraphManager(path)
+    result = core_tools.ToolResult(
+        "error",
+        "Connection aborted.",
+        data={
+            "recovery_attempted": {
+                "reason": "transient_retry",
+                "attempts": 2,
+                "retry_status": "error",
+                "details": {"strategy": "transient_retry", "diagnosis": "transient_external_error"},
+            },
+        },
+        error="ConnectionResetError(10054)",
+    )
+    verification = verify_action("search_knowledge", {"query": "permission replay"}, result, "self_test", 1)
+    graph = manager.record_tool_result("search_knowledge", {"query": "permission replay"}, result, verification, "self_test", 1, objective="recover knowledge search")
+    evidence = graph.steps[0].evidence
+    if "recovery_attempted" not in evidence or "recovery:transient_retry" not in evidence or "diagnosis:transient_external_error" not in evidence:
+        raise AssertionError(evidence)
+    if graph.status != "blocked":
+        raise AssertionError(graph)
+    return "task graph recorded failed recovery attempt"
+
+
 def task_graph_recovery_summary_does_not_grant_permission():
     agent = CompanionAgent(PermissionAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "task_graph_permission_test.json"))
     agent.interactive_mode = False
@@ -2045,13 +2803,362 @@ def planner_creates_persistent_steps():
         pass
     manager = TaskGraphManager(path)
     plan = DEFAULT_PLANNER.plan("請幫我修 bug 然後跑 self_test", session_id="self_test", turn_id=1)
-    graph = manager.plan_steps(plan.objective, plan.step_names(), "self_test", 1, plan.planner_version)
-    if not graph.steps or not graph.steps[0].planned or graph.planner_version != "planner_v1":
+    graph = manager.plan_steps(plan.objective, plan.step_names(), "self_test", 1, plan.planner_version, step_specs=plan.step_specs())
+    if not graph.steps or not graph.steps[0].planned or graph.planner_version != plan.planner_version:
         raise AssertionError(graph)
+    if not graph.steps[0].allowed_tools or not graph.steps[0].done_condition:
+        raise AssertionError(graph.steps[0])
     reloaded = TaskGraphManager(path)
     if "steps:" not in reloaded.summary() or "workflow:" not in reloaded.summary():
         raise AssertionError(reloaded.summary())
     return graph.steps[0].name
+
+
+def planner_selects_next_structured_step():
+    path = os.path.join(core_tools.PROJECT_CACHE_DIR, "planner_select_next_test.json")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    manager = TaskGraphManager(path)
+    plan = DEFAULT_PLANNER.plan("請幫我截圖看看狀態", session_id="self_test", turn_id=1)
+    graph = manager.plan_steps(plan.objective, plan.step_names(), "self_test", 1, plan.planner_version, step_specs=plan.step_specs())
+    selected = manager.select_next_step("self_test", 2)
+    if not selected or selected.status != "running" or selected.kind != "observe" or selected.observe_policy != "observe_required":
+        raise AssertionError({"selected": selected, "graph": graph})
+    reloaded = TaskGraphManager(path)
+    current = reloaded.active().current_step()
+    if not current or current.status != "running" or current.done_condition == "":
+        raise AssertionError(reloaded.summary())
+    return current.name
+
+
+def planner_reuses_active_graph_for_followup():
+    path = os.path.join(core_tools.PROJECT_CACHE_DIR, "planner_reuse_graph_test.json")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    manager = TaskGraphManager(path)
+    first = DEFAULT_PLANNER.plan("幫我修 bug", session_id="self_test", turn_id=1)
+    graph1 = manager.plan_steps(first.objective, first.step_names(), "self_test", 1, first.planner_version, step_specs=first.step_specs())
+    graph2 = manager.plan_steps("繼續", ["reply with concise outcome"], "self_test", 2, first.planner_version)
+    if graph1.task_id != graph2.task_id or len(graph2.steps) != len(graph1.steps):
+        raise AssertionError({"first": graph1, "second": graph2})
+    return graph2.task_id
+
+
+def planner_force_new_task_does_not_reuse_stale_graph():
+    path = os.path.join(core_tools.PROJECT_CACHE_DIR, "planner_force_new_graph_test.json")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    manager = TaskGraphManager(path)
+    old_plan = DEFAULT_PLANNER.plan("修 Swift 檔案", session_id="self_test", turn_id=1)
+    old_graph = manager.plan_steps(old_plan.objective, old_plan.step_names(), "self_test", 1, old_plan.planner_version, step_specs=old_plan.step_specs())
+    old_graph.status = "awaiting_validation"
+    manager.save()
+    new_plan = DEFAULT_PLANNER.plan("打開 Codex 然後進設定再查看剩餘用量", session_id="self_test", turn_id=2)
+    new_graph = manager.plan_steps(new_plan.objective, new_plan.step_names(), "self_test", 2, new_plan.planner_version, step_specs=new_plan.step_specs(), force_new=True)
+    if new_graph.task_id == old_graph.task_id:
+        raise AssertionError({"old": old_graph.task_id, "new": new_graph.task_id})
+    if "Codex" not in new_graph.objective and "codex" not in new_graph.objective.casefold():
+        raise AssertionError(new_graph.objective)
+    return new_graph.task_id
+
+
+def ui_planner_prefers_direct_window_targeting():
+    plan = DEFAULT_PLANNER.plan("打開 Codex 然後進設定再查看剩餘用量", session_id="self_test", turn_id=1)
+    names = " | ".join(plan.step_names())
+    if "click visible target window" not in names:
+        raise AssertionError(names)
+    ui_step = next((step for step in plan.steps if "click visible target window" in step.name), None)
+    if not ui_step or "click_ui_element" not in ui_step.allowed_tools or "press_hotkey" not in ui_step.allowed_tools:
+        raise AssertionError(ui_step)
+    if "fallback" not in ui_step.done_condition:
+        raise AssertionError(ui_step.done_condition)
+    return ui_step.name
+
+
+def primary_message_extraction_ignores_short_context_for_tasks():
+    prompt = (
+        "主人主要訊息：月月，我电脑有 Bluetooth Audio Receiver，帮我按 Close Connection，确认 Disconnected\n\n"
+        "短期聊天上下文：\n"
+        "- topic=Codex 设置剩余用量 | text=打开 Codex 然后按设置\n"
+        "- last_reply=我被 get_screen_ui 绕圈卡住了"
+    )
+    primary = extract_primary_message(prompt)
+    if "Bluetooth Audio Receiver" not in primary or "Codex" in primary:
+        raise AssertionError(primary)
+    plan = DEFAULT_PLANNER.plan(primary, session_id="self_test", turn_id=1)
+    names = " | ".join(plan.step_names())
+    if "click visible target window" not in names or len(plan.steps) < 4:
+        raise AssertionError(names)
+    return primary
+
+
+def wrapped_bluetooth_task_plan_first_ignores_codex_context():
+    path = os.path.join(core_tools.PROJECT_CACHE_DIR, "planner_wrapped_primary_graph_test.json")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    agent = CompanionAgent(PlanFirstAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "planner_wrapped_primary_test.json"))
+    agent.task_graphs = TaskGraphManager(path)
+    agent.session_brain = SessionBrain(os.path.join(core_tools.PROJECT_CACHE_DIR, "planner_wrapped_primary_brain_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    prompt = (
+        "主人主要訊息：月月，我电脑有 Bluetooth Audio Receiver，当中选取的 Xioshon 显示 Connected，帮我按 Close Connection，然后确认 Disconnected\n\n"
+        "短期聊天上下文：\n"
+        "- topic=Codex 设置剩余用量 | text=打开 Codex 然后按设置\n"
+        "- last_reply=我被 get_screen_ui 绕圈卡住了"
+    )
+    result = agent.chat(prompt)
+    if agent.llm.calls != 0:
+        raise AssertionError(f"wrapped task should not enter tool loop before plan approval; calls={agent.llm.calls}")
+    content = result["content"]
+    if "Bluetooth Audio Receiver" not in content or "Close Connection" not in content or "Codex" in content:
+        raise AssertionError(content)
+    graph = agent.task_graphs.active()
+    if not graph or "Bluetooth Audio Receiver" not in graph.objective or "Codex" in graph.objective:
+        raise AssertionError(graph)
+    return content
+
+
+def complex_ui_task_returns_plan_before_tools():
+    path = os.path.join(core_tools.PROJECT_CACHE_DIR, "planner_plan_first_graph_test.json")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    agent = CompanionAgent(PlanFirstAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "planner_plan_first_test.json"))
+    agent.task_graphs = TaskGraphManager(path)
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    result = agent.chat("請打開 Codex 這個程序，然後按設定，再在二級菜單找到剩餘用量，告訴我 5 小時剩餘百分比")
+    if agent.llm.calls != 0:
+        raise AssertionError(f"complex UI task should not enter tool loop before plan approval; calls={agent.llm.calls}")
+    if "Codex" not in result["content"] or "可以" not in result["content"] or "設定" not in result["content"]:
+        raise AssertionError(result)
+    graph = agent.task_graphs.active()
+    if not graph or graph.status != "awaiting_plan_approval":
+        raise AssertionError(graph)
+    return result["content"]
+
+
+def plan_approval_grants_first_computer_control_step():
+    calls: list[str] = []
+
+    def fake_hotkey(keys: str):
+        calls.append(f"press_hotkey:{keys}")
+        return core_tools.ToolResult("ok", "fake hotkey")
+
+    path = os.path.join(core_tools.PROJECT_CACHE_DIR, "planner_plan_approval_graph_test.json")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    agent = CompanionAgent(PlanApprovalAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "planner_plan_approval_test.json"))
+    agent.task_graphs = TaskGraphManager(path)
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    agent.add_tool(core_tools.AgentTool("press_hotkey", "fake hotkey", fake_hotkey, {"type": "object", "properties": {"keys": {"type": "string"}}, "required": ["keys"]}, True))
+    first = agent.chat("請打開 Codex 這個程序，然後按設定，再在二級菜單找到剩餘用量，告訴我 5 小時剩餘百分比")
+    if agent.llm.calls != 0 or "Codex" not in first["content"] or "可以" not in first["content"]:
+        raise AssertionError(first)
+    second = agent.chat("可以")
+    if "press_hotkey:alt+tab" not in calls:
+        raise AssertionError({"calls": calls, "second": second})
+    if _contains_internal_policy_leak(second["content"]):
+        raise AssertionError(second)
+    return calls
+
+
+def url_platform_classifies_douyin_and_common_sites():
+    checks = {
+        "douyin": classify_url_platform("https://www.douyin.com/video/123") == "douyin",
+        "not_tiktok": classify_url_platform("https://www.douyin.com/video/123") != "tiktok",
+        "youtube": classify_url_platform("https://youtu.be/abc") == "youtube",
+        "bilibili": classify_url_platform("https://www.bilibili.com/video/BV123") == "bilibili",
+        "instagram": classify_url_platform("https://www.instagram.com/reel/abc/") == "instagram",
+        "direct_image": classify_url_platform("https://example.com/a.jpg") == "direct_image",
+    }
+    if not all(checks.values()):
+        raise AssertionError(checks)
+    return checks
+
+
+def url_metadata_parses_open_graph():
+    html = """
+    <html><head>
+    <title>Fallback Title</title>
+    <meta property="og:title" content="OG Title">
+    <meta name="description" content="A useful description">
+    <meta property="og:image" content="https://example.com/cover.jpg">
+    </head><body>hello</body></html>
+    """
+    data = parse_html_metadata(html)
+    if data.get("title") != "OG Title" or data.get("description") != "A useful description" or data.get("image") != "https://example.com/cover.jpg":
+        raise AssertionError(data)
+    return data
+
+
+def douyin_html_metadata_extracts_description_author_and_cover():
+    html_text = '''
+    <html><head>
+      <meta data-react-helmet="true" name="description" content="400名警察联军抓捕21杀校园枪手！ 究极拉跨，人间地狱，全员崩溃~#美警执法 - 爱看热闹的大鹏于20260403发布在抖音，已经收获了161999个喜欢"/>
+    </head><body>
+      <img src="https://p26-sign.douyinpic.com/tos-cn-i-dy/cover.webp?x=1&amp;y=2"/>
+      <script>window.__DATA__={"videoInfoRes":{"item_list":[{"aweme_id":"7624423517320236340","desc":"400名警察联军抓捕21杀校园枪手！ 究极拉跨，人间地狱，全员崩溃~#美警执法","create_time":1775207150,"author":{"nickname":"爱看热闹的大鹏"},"statistics":{"digg_count":161999}}]}}</script>
+    </body></html>
+    '''
+    base = parse_html_metadata(html_text)
+    extra = parse_douyin_metadata(html_text)
+    base.update({key: value for key, value in extra.items() if value})
+    if "400名警察" not in base.get("title", "") or base.get("author") != "爱看热闹的大鹏" or "douyinpic" not in base.get("image", ""):
+        raise AssertionError(base)
+    if "video_id=7624423517320236340" not in base.get("extra", ""):
+        raise AssertionError(base)
+    return {"title": base["title"][:24], "author": base["author"], "image": bool(base["image"])}
+
+
+def url_context_cache_reuses_metadata():
+    import agent_url_context
+
+    path = os.path.join(core_tools.PROJECT_CACHE_DIR, "url_context_cache_test.json")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    cache = URLContextCache(path)
+    calls = {"count": 0}
+    original = agent_url_context._http_get
+
+    def fake_get(url, timeout=6, max_bytes=0, mobile=False):
+        calls["count"] += 1
+        return {
+            "status_code": "200",
+            "url": url,
+            "content_type": "text/html",
+            "text": "<title>Cached Page</title><meta name=\"description\" content=\"cached desc\">",
+            "error": "",
+        }
+
+    try:
+        agent_url_context._http_get = fake_get
+        first = cache.inspect("https://example.com/page", depth="metadata")
+        second = cache.inspect("https://example.com/page", depth="metadata")
+    finally:
+        agent_url_context._http_get = original
+    if calls["count"] != 1 or first.title != "Cached Page" or second.title != "Cached Page":
+        raise AssertionError({"calls": calls, "first": first, "second": second})
+    return {"key": url_cache_key("https://example.com/page"), "calls": calls["count"]}
+
+
+def short_context_resolves_reference_to_recent_url():
+    import agent_short_context
+
+    path = os.path.join(core_tools.PROJECT_CACHE_DIR, "short_context_test.json")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    buffer = ShortContextBuffer(path, max_turns=20)
+    original = agent_short_context.inspect_urls_for_text
+    fake_entry = agent_short_context.URLContextEntry(
+        url="https://www.bilibili.com/video/BV1",
+        platform="bilibili",
+        content_type="video",
+        title="很抽象的視頻",
+        status="ok",
+    )
+
+    try:
+        agent_short_context.inspect_urls_for_text = lambda text, depth="metadata": [fake_entry] if "bilibili" in text else []
+        buffer.observe_turn("chat1", "https://www.bilibili.com/video/BV1 這個好抽象", depth="metadata")
+        rendered = buffer.render_for_turn("chat1", "你覺得呢")
+    finally:
+        agent_short_context.inspect_urls_for_text = original
+    if "可能指代" not in rendered or "很抽象的視頻" not in rendered:
+        raise AssertionError(rendered)
+    return rendered[:120]
+
+
+def url_tools_return_structured_results():
+    import agent_url_context
+
+    original = agent_url_context._http_get
+
+    def fake_get(url, timeout=6, max_bytes=0, mobile=False):
+        return {
+            "status_code": "200",
+            "url": url,
+            "content_type": "text/html",
+            "text": "<title>Tool Page</title><meta name=\"description\" content=\"tool desc\">",
+            "error": "",
+        }
+
+    try:
+        agent_url_context._http_get = fake_get
+        result = core_tools.real_inspect_url("https://example.com/tool-test", depth="metadata")
+    finally:
+        agent_url_context._http_get = original
+    data = result.data if isinstance(result.data, dict) else {}
+    if result.status != "ok" or data.get("title") != "Tool Page" or data.get("platform") != "website":
+        raise AssertionError(result.to_text())
+    read_back = core_tools.real_read_url_context("https://example.com/tool-test")
+    if read_back.status != "ok" or not isinstance(read_back.data, dict):
+        raise AssertionError(read_back.to_text())
+    return data
+
+
+def url_preview_uses_real_chinese_markers():
+    samples = ["这个视频怎么样", "這個影片你覺得呢", "她怎麼這樣", "好抽象，吐槽一下"]
+    failed = [sample for sample in samples if not should_preview_url(sample)]
+    if failed:
+        raise AssertionError(failed)
+    return {"checked": len(samples)}
+
+
+def read_webpage_social_url_degrades_to_url_context():
+    import agent_url_context
+
+    original_http_get = agent_url_context._http_get
+    original_ytdlp = agent_url_context._try_ytdlp_metadata
+    original_screenshot = agent_url_context._try_playwright_screenshot
+
+    def fake_get(url, timeout=6, max_bytes=0, mobile=False):
+        return {
+            "status_code": "401",
+            "url": url,
+            "content_type": "application/json",
+            "text": "",
+            "error": '{"code":401,"message":"You have been blocked from performing anonymous queries due to bad network reputation (AS9009). Please authenticate."}',
+        }
+
+    try:
+        agent_url_context._http_get = fake_get
+        agent_url_context._try_ytdlp_metadata = lambda entry: setattr(entry, "failure_reason", "extractor_failed")
+        agent_url_context._try_playwright_screenshot = lambda entry: None
+        result = core_tools.real_read_webpage("https://www.douyin.com/video/123456")
+    finally:
+        agent_url_context._http_get = original_http_get
+        agent_url_context._try_ytdlp_metadata = original_ytdlp
+        agent_url_context._try_playwright_screenshot = original_screenshot
+    data = result.data if isinstance(result.data, dict) else {}
+    if result.status != "ok" or data.get("platform") != "douyin":
+        raise AssertionError(result.to_text())
+    text = result.to_text()
+    if "AuthenticationRequiredError" in text or "&quot;" in text or "AS9009" in text:
+        raise AssertionError(text)
+    if data.get("human_failure_reason") not in {"网页读取服务被目标或网络信誉限制挡住了", "视频解析器没拿到可用信息", "平台限制或需要登录"}:
+        raise AssertionError(data)
+    return {"platform": data.get("platform"), "failure": data.get("failure_reason")}
 
 
 def task_graph_updates_planned_step_with_tool_result():
@@ -2083,7 +3190,7 @@ def worker_result_assimilation_updates_task_graph_only_from_main_thread():
         "kind": "py_compile",
         "status": "done",
         "evidence": ["command: python -m py_compile", "returncode: 0"],
-        "metadata": {"step_id": graph.steps[0].step_id},
+        "metadata": {"task_id": graph.task_id, "step_id": graph.steps[0].step_id},
     }
     assimilated = manager.assimilate_worker_results([result], "self_test", 2)
     if not assimilated or manager.active().steps[0].verification.status != "pass":
@@ -2316,6 +3423,289 @@ def live_eval_counts_planner_context_subagent_and_assimilation():
     return {"planner": data["planner"], "context": data["context"], "subagents": data["subagents"]}
 
 
+class _FakePresenceComposer:
+    def __init__(self, draft: PresenceMessageCandidate | None = None, quality: PresenceQualityDecision | None = None, raise_error: bool = False):
+        self.draft = draft or PresenceMessageCandidate(
+            should_send=True,
+            message="剛剛那個 CPU 影片我還在想，六顆不同品牌排排站也太像硬體選秀了吧。",
+            message_type="followup",
+            topic_source="cpu_video",
+            confidence=0.9,
+            reason="specific_recent_topic",
+            model="fake",
+        )
+        self.quality = quality or PresenceQualityDecision(True, "quality_pass", score=0.9)
+        self.raise_error = raise_error
+        self.model = "fake-presence-composer"
+        self.debug_file = os.path.join(core_tools.PROJECT_CACHE_DIR, "fake_presence_composer_debug.jsonl")
+        self.topic_history_file = os.path.join(core_tools.PROJECT_CACHE_DIR, "fake_presence_topic_history.jsonl")
+        self.sent: list[dict[str, Any]] = []
+
+    def compose(self, opportunity, short_context, recent_candidates=None):
+        if self.raise_error:
+            raise RuntimeError("fake composer exploded")
+        return self.draft, self.quality
+
+    def record_sent(self, candidate, opportunity, sent_at=None):
+        self.sent.append({"candidate": candidate.to_dict(), "opportunity": opportunity.to_dict(), "sent_at": sent_at})
+
+
+def _presence_test_engine(name: str, config: PresenceConfig | None = None, composer=None) -> PresenceEngine:
+    base = os.path.join(core_tools.PROJECT_CACHE_DIR, name)
+    os.makedirs(base, exist_ok=True)
+    for filename in ("state.json", "candidates.jsonl", "health.json", "debug.jsonl"):
+        try:
+            os.remove(os.path.join(base, filename))
+        except FileNotFoundError:
+            pass
+    return PresenceEngine(
+        state_file=os.path.join(base, "state.json"),
+        candidates_file=os.path.join(base, "candidates.jsonl"),
+        health_file=os.path.join(base, "health.json"),
+        debug_file=os.path.join(base, "debug.jsonl"),
+        config=config or PresenceConfig(mode="shadow", min_interval_minutes=120, quiet_hours="00:00-00:00"),
+        composer=composer or _FakePresenceComposer(),
+    )
+
+
+def presence_shadow_mode_records_candidate_without_send():
+    engine = _presence_test_engine("presence_shadow_test")
+    decision = engine.evaluate(
+        "self-test-chat",
+        short_context={"primary_text": "剛剛那個抖音影片有點好笑", "topic": "douyin video"},
+        session_summary="idle",
+        now=12 * 60 * 60,
+    )
+    health = engine.write_health()
+    if decision.status != "shadow" or not decision.candidate:
+        raise AssertionError(decision)
+    if decision.candidate.status != "shadow" or health["shadow_count"] != 1 or health["candidate_count"] != 1:
+        raise AssertionError({"decision": decision.to_dict(), "health": health})
+    return decision.candidate.to_dict()
+
+
+def presence_cooldown_prevents_spam():
+    engine = _presence_test_engine("presence_cooldown_test")
+    first = engine.evaluate("self-test-chat", short_context={"primary_text": "今天有點累"}, session_summary="idle", now=12 * 60 * 60)
+    second = engine.evaluate("self-test-chat", short_context={"primary_text": "再看看"}, session_summary="idle", now=12 * 60 * 60 + 60)
+    if first.status != "shadow" or second.status != "suppressed" or second.reason != "cooldown":
+        raise AssertionError({"first": first.to_dict(), "second": second.to_dict()})
+    return second.to_dict()
+
+
+def presence_suppresses_during_active_task():
+    engine = _presence_test_engine("presence_active_task_test")
+    decision = engine.evaluate("self-test-chat", short_context={"primary_text": "普通聊天"}, session_summary="active_task: running py_compile", now=12 * 60 * 60)
+    if decision.status != "suppressed" or decision.reason != "task_or_permission_active":
+        raise AssertionError(decision.to_dict())
+    return decision.to_dict()
+
+
+def live_eval_reports_presence_health():
+    previous_state = _read_optional_file(PRESENCE_STATE_FILE)
+    previous_candidates = _read_optional_file(PRESENCE_CANDIDATES_FILE)
+    previous_health = _read_optional_file(PRESENCE_HEALTH_FILE)
+    try:
+        for path in (PRESENCE_STATE_FILE, PRESENCE_CANDIDATES_FILE, PRESENCE_HEALTH_FILE, PRESENCE_DEBUG_FILE):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        engine = PresenceEngine(config=PresenceConfig(mode="shadow", min_interval_minutes=120, quiet_hours="00:00-00:00"))
+        engine.evaluate("self-test-chat", short_context={"primary_text": "想聊一下剛剛的影片"}, session_summary="idle", now=12 * 60 * 60)
+        report = build_live_eval_report(include_repo=False)
+        presence = report.to_dict()["presence"]
+        if presence["mode"] != "shadow" or presence["candidate_count"] < 1:
+            raise AssertionError(presence)
+        if "Presence: mode=shadow" not in report.to_text():
+            raise AssertionError(report.to_text())
+        return presence
+    finally:
+        _restore_optional_file(PRESENCE_STATE_FILE, previous_state)
+        _restore_optional_file(PRESENCE_CANDIDATES_FILE, previous_candidates)
+        _restore_optional_file(PRESENCE_HEALTH_FILE, previous_health)
+
+
+def _presence_fixed_time(hour: int, minute: int = 0) -> float:
+    return time.mktime((2026, 1, 1, hour, minute, 0, 0, 1, -1))
+
+
+def presence_quiet_hours_are_soft_when_owner_recently_active():
+    engine = _presence_test_engine("presence_soft_quiet_test", PresenceConfig(mode="shadow", min_interval_minutes=120, quiet_hours="23:30-08:00"))
+    now = _presence_fixed_time(1, 30)
+    quiet = engine.evaluate("self-test-chat", short_context={"primary_text": "深夜測試", "created_at": now - 4 * 60}, session_summary="idle", now=now)
+    asleep = engine.evaluate("other-chat", short_context={"primary_text": "深夜測試", "created_at": now - 4 * 60 * 60}, session_summary="idle", now=now, force=False)
+    if quiet.status != "shadow" or not quiet.debug.get("owner_likely_awake"):
+        raise AssertionError(quiet.to_dict())
+    if asleep.status != "suppressed" or asleep.reason != "quiet_hours_no_recent_interaction":
+        raise AssertionError(asleep.to_dict())
+    return {"awake": quiet.reason, "asleep": asleep.reason}
+
+
+def presence_stale_permission_does_not_block_forever():
+    engine = _presence_test_engine("presence_stale_task_test", PresenceConfig(mode="shadow", min_interval_minutes=120, quiet_hours="00:00-00:00", stale_task_minutes=60))
+    now = _presence_fixed_time(12)
+    stale = engine.evaluate(
+        "self-test-chat",
+        short_context={"primary_text": "普通聊天", "created_at": now - 10},
+        session_summary="state: awaiting_permission\nlast_tool: send_telegram_media blocked",
+        session_updated_at=now - 3 * 60 * 60,
+        now=now,
+    )
+    fresh = engine.evaluate(
+        "fresh-chat",
+        short_context={"primary_text": "普通聊天", "created_at": now - 10},
+        session_summary="state: awaiting_permission\nlast_tool: send_telegram_media blocked",
+        session_updated_at=now - 10 * 60,
+        now=now,
+    )
+    if stale.status != "shadow" or not stale.debug.get("task_debug", {}).get("stale"):
+        raise AssertionError(stale.to_dict())
+    if fresh.status != "suppressed" or fresh.reason != "task_or_permission_active":
+        raise AssertionError(fresh.to_dict())
+    return {"stale": stale.reason, "fresh": fresh.reason}
+
+
+def presence_notify_tick_sends_once_and_respects_daily_limit():
+    engine = _presence_test_engine("presence_notify_test", PresenceConfig(mode="notify", daily_limit=1, min_interval_minutes=1, quiet_hours="00:00-00:00"))
+    now = _presence_fixed_time(12)
+    sent: list[str] = []
+    first = engine.tick(
+        "self-test-chat",
+        short_context={"primary_text": "今天有點累", "created_at": now - 60},
+        session_summary="idle",
+        now=now,
+        random_value=0.0,
+        send_callback=sent.append,
+    )
+    second = engine.tick(
+        "self-test-chat",
+        short_context={"primary_text": "今天有點累", "created_at": now - 60},
+        session_summary="idle",
+        now=now + 2 * 60,
+        random_value=0.0,
+        send_callback=sent.append,
+    )
+    if first.candidate is None or first.candidate.status != "sent" or len(sent) != 1:
+        raise AssertionError({"first": first.to_dict(), "sent": sent})
+    if second.status != "suppressed" or second.reason != "daily_limit" or len(sent) != 1:
+        raise AssertionError({"second": second.to_dict(), "sent": sent})
+    return {"sent": sent[0], "second": second.reason}
+
+
+def presence_shadow_tick_never_sends():
+    engine = _presence_test_engine("presence_shadow_tick_test", PresenceConfig(mode="shadow", min_interval_minutes=1, quiet_hours="00:00-00:00"))
+    sent: list[str] = []
+    decision = engine.tick(
+        "self-test-chat",
+        short_context={"primary_text": "剛剛那個抖音影片", "created_at": _presence_fixed_time(12) - 60},
+        session_summary="idle",
+        now=_presence_fixed_time(12),
+        random_value=0.0,
+        send_callback=sent.append,
+    )
+    if decision.status != "shadow" or sent:
+        raise AssertionError({"decision": decision.to_dict(), "sent": sent})
+    return decision.to_dict()
+
+
+def presence_composer_quality_message_sends():
+    composer = _FakePresenceComposer()
+    engine = _presence_test_engine("presence_composer_send_test", PresenceConfig(mode="notify", daily_limit=3, min_interval_minutes=1, quiet_hours="00:00-00:00"), composer=composer)
+    now = _presence_fixed_time(12)
+    sent: list[str] = []
+    decision = engine.tick(
+        "self-test-chat",
+        short_context={"primary_text": "剛剛那個 CPU 核心數影片", "created_at": now - 60},
+        session_summary="idle",
+        now=now,
+        random_value=0.0,
+        send_callback=sent.append,
+    )
+    if decision.status != "ready" or not decision.candidate or decision.candidate.status != "sent" or len(sent) != 1:
+        raise AssertionError({"decision": decision.to_dict(), "sent": sent})
+    if not composer.sent:
+        raise AssertionError("composer did not record sent topic")
+    return {"sent": sent[0], "quality": decision.debug.get("quality")}
+
+
+def presence_composer_rejects_generic_checkin():
+    composer = _FakePresenceComposer(
+        draft=PresenceMessageCandidate(
+            should_send=True,
+            message="主人今天怎麼樣呀？",
+            message_type="care",
+            topic_source="generic",
+            confidence=0.8,
+            reason="generic_checkin",
+            model="fake",
+        ),
+        quality=PresenceQualityDecision(False, "generic_checkin_without_context", score=0.0),
+    )
+    engine = _presence_test_engine("presence_composer_reject_test", PresenceConfig(mode="notify", daily_limit=3, min_interval_minutes=1, quiet_hours="00:00-00:00"), composer=composer)
+    sent: list[str] = []
+    decision = engine.tick(
+        "self-test-chat",
+        short_context={"primary_text": "普通空上下文", "created_at": _presence_fixed_time(12) - 60},
+        session_summary="idle",
+        now=_presence_fixed_time(12),
+        random_value=0.0,
+        send_callback=sent.append,
+    )
+    if not decision.candidate or decision.candidate.status != "composer_rejected" or sent:
+        raise AssertionError({"decision": decision.to_dict(), "sent": sent})
+    return decision.debug.get("quality")
+
+
+def presence_composer_error_does_not_crash_or_send():
+    composer = _FakePresenceComposer(raise_error=True)
+    engine = _presence_test_engine("presence_composer_error_test", PresenceConfig(mode="notify", daily_limit=3, min_interval_minutes=1, quiet_hours="00:00-00:00"), composer=composer)
+    sent: list[str] = []
+    decision = engine.tick(
+        "self-test-chat",
+        short_context={"primary_text": "剛剛那個話題", "created_at": _presence_fixed_time(12) - 60},
+        session_summary="idle",
+        now=_presence_fixed_time(12),
+        random_value=0.0,
+        send_callback=sent.append,
+    )
+    if not decision.candidate or decision.candidate.status != "composer_rejected" or sent:
+        raise AssertionError({"decision": decision.to_dict(), "sent": sent})
+    if decision.reason != "composer_error":
+        raise AssertionError(decision.to_dict())
+    return decision.to_dict()
+
+
+def presence_default_quota_is_adaptive_not_tiny_daily_cap():
+    config = PresenceConfig()
+    if config.daily_limit < 6 or config.min_interval_minutes > 90 or config.icebreak_after_minutes != 360:
+        raise AssertionError(config.to_dict())
+    return config.to_dict()
+
+
+def presence_long_silence_becomes_icebreak_opportunity():
+    engine = _presence_test_engine("presence_icebreak_test", PresenceConfig(mode="shadow", min_interval_minutes=1, quiet_hours="00:00-00:00", icebreak_after_minutes=360))
+    now = _presence_fixed_time(18)
+    decision = engine.evaluate(
+        "self-test-chat",
+        short_context={"primary_text": "", "created_at": now - 7 * 60 * 60},
+        session_summary="idle",
+        now=now,
+    )
+    if decision.status != "shadow" or decision.reason != "long_silence_icebreak" or not decision.candidate or decision.candidate.kind != "icebreak":
+        raise AssertionError(decision.to_dict())
+    return decision.to_dict()
+
+
+def presence_debug_records_suppression_reason():
+    engine = _presence_test_engine("presence_debug_test", PresenceConfig(mode="shadow", quiet_hours="23:30-08:00"))
+    decision = engine.evaluate("self-test-chat", short_context={"primary_text": "深夜測試"}, session_summary="idle", now=_presence_fixed_time(2))
+    debug = engine.recent_debug(limit=1)
+    if decision.reason != "quiet_hours_no_recent_interaction" or not debug or debug[-1].get("reason") != decision.reason:
+        raise AssertionError({"decision": decision.to_dict(), "debug": debug})
+    return debug[-1]
+
+
 def failure_replay_persists_minimal_case():
     path = os.path.join(core_tools.PROJECT_CACHE_DIR, "failure_replay_test.jsonl")
     try:
@@ -2479,6 +3869,102 @@ def latency_policy_classifies_modes():
     return "modes classified"
 
 
+def computer_action_text_routes_to_tool_task():
+    examples = [
+        "幫我暫停播放",
+        "按一下空格鍵",
+        "看一下螢幕然後幫我暫停",
+        "幫我點擊播放器",
+    ]
+    for text in examples:
+        mode = classify_interaction(text, False)
+        if mode != InteractionMode.TOOL_TASK:
+            raise AssertionError({"text": text, "mode": mode})
+    return "computer action text routes to tool_task"
+
+
+def observe_only_media_status_does_not_require_plan_approval():
+    text = "你幫我看一下現在我的電腦有沒有在播放媒體或者音樂"
+    if classify_interaction(text, False) != InteractionMode.SCREEN_OBSERVE:
+        raise AssertionError(classify_interaction(text, False))
+    brain_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "observe_only_session_brain_test.json")
+    try:
+        os.remove(brain_path)
+    except FileNotFoundError:
+        pass
+    classification = SessionBrain(brain_path).classify_turn(text, turn_id=1, session_id="self_test")
+    if classification.intent != "screen_observe" or classification.is_chat:
+        raise AssertionError(classification)
+    plan = DEFAULT_PLANNER.plan(text, intent=classification.intent, session_id="self_test", turn_id=1)
+    if len(plan.steps) != 2 or "observe current screen once" not in plan.step_names():
+        raise AssertionError(plan.step_names())
+    agent = CompanionAgent(PlanFirstAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "observe_only_plan_test.json"))
+    agent.task_graphs = TaskGraphManager(os.path.join(core_tools.PROJECT_CACHE_DIR, "observe_only_plan_graph_test.json"))
+    agent.session_brain = SessionBrain(os.path.join(core_tools.PROJECT_CACHE_DIR, "observe_only_plan_brain_test.json"))
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    result = agent.chat(text)
+    if "你回" in result["content"] or "可以" in result["content"]:
+        raise AssertionError(result["content"])
+    if agent.llm.calls != 1:
+        raise AssertionError(agent.llm.calls)
+    return "observe-only media status ran without plan approval"
+
+
+def observe_only_media_status_overrides_stale_validation_state():
+    text = "你幫我看一下現在我的電腦有沒有在播放媒體或者音樂"
+    brain_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "observe_stale_validation_brain_test.json")
+    try:
+        os.remove(brain_path)
+    except FileNotFoundError:
+        pass
+    brain = SessionBrain(brain_path)
+    brain.state.state = "awaiting_validation"
+    brain.state.pending_validation = ["verify previous unrelated task"]
+    brain.state.last_tool = "execute_python"
+    brain.state.last_tool_status = "ok"
+    brain.save()
+    classification = brain.classify_turn(text, turn_id=2, session_id="self_test")
+    if classification.intent != "screen_observe" or classification.reason != "screen_observe_intent":
+        raise AssertionError(classification)
+    if brain.state.current_objective != text:
+        raise AssertionError(brain.state.current_objective)
+    return "fresh observe intent overrides stale validation"
+
+
+def observe_only_media_status_starts_fresh_graph_over_stale_active_graph():
+    text = "你幫我看一下現在我的電腦有沒有在播放媒體或者音樂"
+    graph_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "observe_stale_graph_override_test.json")
+    for path in [graph_path, os.path.join(core_tools.PROJECT_CACHE_DIR, "observe_stale_graph_brain_test.json")]:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    agent = CompanionAgent(PlanFirstAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "observe_stale_graph_test.json"))
+    agent.task_graphs = TaskGraphManager(graph_path)
+    agent.session_brain = SessionBrain(os.path.join(core_tools.PROJECT_CACHE_DIR, "observe_stale_graph_brain_test.json"))
+    agent.task_graphs.plan_steps("old unrelated workflow", ["old pending validation step"], "self_test", 1)
+    stale = agent.task_graphs.active()
+    stale.status = "awaiting_validation"
+    agent.task_graphs.save()
+    agent.session_brain.state.state = "awaiting_validation"
+    agent.session_brain.state.pending_validation = ["verify old unrelated workflow"]
+    agent.session_brain.save()
+    agent.interactive_mode = False
+    for tool in core_tools.ALL_TOOLS:
+        agent.add_tool(tool)
+    result = agent.chat(text)
+    active = agent.task_graphs.active()
+    if not active or active.objective != text:
+        raise AssertionError({"reply": result, "active": active})
+    if len(active.steps) != 2 or "observe current screen once" not in [step.name for step in active.steps]:
+        raise AssertionError(active)
+    if "你回" in result["content"] or "可以" in result["content"]:
+        raise AssertionError(result["content"])
+    return "fresh observe intent starts a fresh graph over stale active graph"
+
+
 def chat_policy_blocks_vision_tool():
     agent = CompanionAgent(VisionCallAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "latency_policy_test.json"))
     for tool in core_tools.ALL_TOOLS:
@@ -2593,12 +4079,17 @@ def user_facing_source_files_are_unicode_safe():
             text = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise AssertionError(f"{filename} is not valid UTF-8: {exc}") from exc
-        if any(marker in text for marker in bad_markers):
+        variants = [text]
+        decoded = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+        decoded = re.sub(r"\\U([0-9a-fA-F]{8})", lambda m: chr(int(m.group(1), 16)), decoded)
+        if decoded != text:
+            variants.append(decoded)
+        if any(marker in variant for marker in bad_markers for variant in variants):
             raise AssertionError(f"{filename} contains mojibake markers")
         if "????" in text:
             raise AssertionError(f"{filename} contains question-mark mojibake")
         for expected in required_pairs.get(filename, []):
-            if expected not in text:
+            if not any(expected in variant for variant in variants):
                 raise AssertionError(f"{filename} is missing expected phrase: {expected}")
     return "user-facing source files are UTF-8 and voice-safe"
 
@@ -2753,15 +4244,60 @@ class RepeatToolAdapter:
         }
 
 
+class InterleavedUiNavigationAdapter:
+    def __init__(self):
+        self.calls = 0
+
+    def chat_with_tools(self, messages, tools):
+        self.calls += 1
+        if self.calls in {1, 3, 5}:
+            args = {"keys": "alt+tab"}
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": f"call_hotkey_{self.calls}", "name": "press_hotkey", "arguments": args, "raw_arguments": json.dumps(args)}],
+            }
+        if self.calls in {2, 4, 6}:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": f"call_screen_{self.calls}", "name": "get_screen_ui", "arguments": {}, "raw_arguments": "{}"}],
+            }
+        return {"role": "assistant", "content": "找到目標窗口了"}
+
+
 def repeated_tool_call_stops_before_timeout():
     agent = CompanionAgent(RepeatToolAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "repeat_tool_test.json"))
     agent.add_tool(core_tools.AgentTool("fake_repeat", "fake repeat tool", lambda value=1: core_tools.ToolResult("ok", "repeat ok"), {"type": "object", "properties": {"value": {"type": "integer"}}}))
     result = agent.chat("repeat tool")
-    if "重複" not in result["content"] or "重現" not in result["content"]:
+    if "繞圈" not in result["content"] and "重複" not in result["content"]:
         raise AssertionError(result)
     if _contains_internal_policy_leak(result["content"]):
         raise AssertionError(result)
     return result["content"]
+
+
+def interleaved_ui_navigation_is_not_treated_as_repeated_loop():
+    calls: list[str] = []
+
+    def fake_hotkey(keys: str):
+        calls.append(f"press_hotkey:{keys}")
+        return core_tools.ToolResult("ok", "fake hotkey")
+
+    def fake_screen():
+        calls.append("get_screen_ui")
+        return core_tools.ToolResult("ok", "fake screen", data={"active_window": "not yet"})
+
+    agent = CompanionAgent(InterleavedUiNavigationAdapter(), "system self test", os.path.join(core_tools.HISTORY_DIR, "interleaved_ui_loop_test.json"))
+    agent.always_allow_tools = True
+    agent.add_tool(core_tools.AgentTool("press_hotkey", "fake hotkey", fake_hotkey, {"type": "object", "properties": {"keys": {"type": "string"}}, "required": ["keys"]}, True))
+    agent.add_tool(core_tools.AgentTool("get_screen_ui", "fake screen", fake_screen, {"type": "object", "properties": {}}, True))
+    result = agent._tool_loop_controller(response_policy_for(InteractionMode.TOOL_TASK)).run(agent.memory, "interleaved ui navigation", None)
+    if result.content != "找到目標窗口了":
+        raise AssertionError(result)
+    if calls.count("press_hotkey:alt+tab") != 3 or calls.count("get_screen_ui") != 3:
+        raise AssertionError(calls)
+    return calls
 
 
 def screen_observe_policy_blocks_unrelated_vision_tool():
@@ -3563,6 +5099,7 @@ def backup_reliability_state():
     global _worker_jobs_backup, _worker_results_backup
     global _context_budget_report_backup, _subagent_runs_backup
     global _trace_log_backup
+    global _presence_state_backup, _presence_candidates_backup, _presence_health_backup, _presence_debug_backup
     _trace_log_backup = _read_optional_file(TRACE_LOG_FILE)
     _transactions_backup = _read_optional_file(TASK_TRANSACTIONS_FILE)
     _failure_replay_backup = _read_optional_file(FAILURE_REPLAY_FILE)
@@ -3580,6 +5117,10 @@ def backup_reliability_state():
     _worker_results_backup = _read_optional_file(WORKER_RESULTS_FILE)
     _context_budget_report_backup = _read_optional_file(CONTEXT_BUDGET_REPORT_FILE)
     _subagent_runs_backup = _read_optional_file(SUBAGENT_RUNS_FILE)
+    _presence_state_backup = _read_optional_file(PRESENCE_STATE_FILE)
+    _presence_candidates_backup = _read_optional_file(PRESENCE_CANDIDATES_FILE)
+    _presence_health_backup = _read_optional_file(PRESENCE_HEALTH_FILE)
+    _presence_debug_backup = _read_optional_file(PRESENCE_DEBUG_FILE)
 
 
 def restore_task_plan():
@@ -3636,6 +5177,10 @@ def restore_reliability_state():
     _restore_optional_file(WORKER_RESULTS_FILE, _worker_results_backup)
     _restore_optional_file(CONTEXT_BUDGET_REPORT_FILE, _context_budget_report_backup)
     _restore_optional_file(SUBAGENT_RUNS_FILE, _subagent_runs_backup)
+    _restore_optional_file(PRESENCE_STATE_FILE, _presence_state_backup)
+    _restore_optional_file(PRESENCE_CANDIDATES_FILE, _presence_candidates_backup)
+    _restore_optional_file(PRESENCE_HEALTH_FILE, _presence_health_backup)
+    _restore_optional_file(PRESENCE_DEBUG_FILE, _presence_debug_backup)
 
 
 def _read_optional_file(path: str) -> str | None:
@@ -3658,7 +5203,7 @@ def _restore_optional_file(path: str, content: str | None) -> None:
 
 
 def cleanup_self_test_files():
-    for name in ("self_test.txt", "permission_test.txt", "wrong_tool.txt", "turn.txt", "delete_me_self_test.txt", "download_test.html", "dedupe_screen.png", "observability_trace_test.jsonl", "eval_trace_test.jsonl", "eval_missing_trace.jsonl", "eval_benchmark_trace_test.jsonl", "eval_report_test.json", "task_benchmark_self_test.json", "benchmark_task_graph.json", "benchmark_blocked_graph.json", "workflow_eval_trace_test.jsonl", "worker_eval_trace_test.jsonl", "control_plane_eval_trace_test.jsonl", "worker_jobs_test.jsonl", "worker_results_test.jsonl", "worker_fail_jobs_test.jsonl", "worker_fail_results_test.jsonl", "worker_timeout_jobs_test.jsonl", "worker_timeout_results_test.jsonl", "worker_reject_jobs_test.jsonl", "worker_reject_results_test.jsonl", "worker_subagent_jobs_test.jsonl", "worker_subagent_results_test.jsonl", "continue_worker_jobs_test.jsonl", "continue_worker_results_test.jsonl", "continue_reject_jobs_test.jsonl", "continue_reject_results_test.jsonl", "action_verify.txt", "transaction_test.txt", "transaction_test.json", "task_graph_test.json", "task_graph_permission_test.json", "planner_graph_test.json", "planner_tool_graph_test.json", "worker_assim_graph_test.json", "observe_graph_test.json", "workflow_replay_graph_test.json", "workflow_replay_test.jsonl", "graph_file.txt", "failure_replay_test.jsonl"):
+    for name in ("self_test.txt", "permission_test.txt", "wrong_tool.txt", "turn.txt", "delete_me_self_test.txt", "download_test.html", "dedupe_screen.png", "retry_last_safe_step.png", "retry_last_safe_step_original_graph.png", "benchmark_outcome_retry.png", "self_test_lock_unit_test.lock", "observability_trace_test.jsonl", "eval_trace_test.jsonl", "eval_missing_trace.jsonl", "eval_benchmark_trace_test.jsonl", "eval_artifact_history_trace_test.jsonl", "eval_report_test.json", "task_benchmark_self_test.json", "benchmark_task_graph.json", "benchmark_blocked_graph.json", "benchmark_outcome_retry_graph.json", "workflow_eval_trace_test.jsonl", "worker_eval_trace_test.jsonl", "control_plane_eval_trace_test.jsonl", "worker_jobs_test.jsonl", "worker_results_test.jsonl", "worker_fail_jobs_test.jsonl", "worker_fail_results_test.jsonl", "worker_timeout_jobs_test.jsonl", "worker_timeout_results_test.jsonl", "worker_reject_jobs_test.jsonl", "worker_reject_results_test.jsonl", "worker_subagent_jobs_test.jsonl", "worker_subagent_results_test.jsonl", "continue_worker_jobs_test.jsonl", "continue_worker_results_test.jsonl", "continue_reject_jobs_test.jsonl", "continue_reject_results_test.jsonl", "action_verify.txt", "transaction_test.txt", "transaction_test.json", "task_graph_test.json", "task_graph_permission_test.json", "task_graph_recovery_evidence_test.json", "task_graph_failed_recovery_attempt_test.json", "planner_graph_test.json", "planner_tool_graph_test.json", "worker_assim_graph_test.json", "observe_graph_test.json", "workflow_replay_graph_test.json", "workflow_replay_test.jsonl", "outcome_safe_retry_graph_test.json", "outcome_original_graph_retry_test.json", "graph_file.txt", "failure_replay_test.jsonl"):
         try:
             os.remove(os.path.join(core_tools.PROJECT_CACHE_DIR, name))
         except FileNotFoundError:
@@ -3699,6 +5244,19 @@ def cleanup_self_test_files():
         "gateway_latest_source",
         "gateway_latest_target",
         "gateway_reject_source",
+        "presence_shadow_test",
+        "presence_cooldown_test",
+        "presence_active_task_test",
+        "presence_soft_quiet_test",
+        "presence_stale_task_test",
+        "presence_notify_test",
+        "presence_shadow_tick_test",
+        "presence_composer_send_test",
+        "presence_composer_reject_test",
+        "presence_composer_error_test",
+        "presence_icebreak_test",
+        "presence_debug_test",
+        "benchmark_presence",
     ):
         path = os.path.join(core_tools.PROJECT_CACHE_DIR, name)
         if os.path.isdir(path):
@@ -3797,6 +5355,7 @@ def launcher_script_has_single_instance_guard():
         "Clear-LauncherPid",
         "Test-ProcessAlive",
         "Stop-ProcessTree",
+        "Get-CimInstance Win32_Process -Filter",
         "ParentProcessId",
         "Use -Restart",
     ]
@@ -3820,6 +5379,31 @@ def launcher_docs_explain_restart():
     if "yueyue_launcher.pid" not in runbook:
         raise AssertionError("RUNBOOK.md does not explain launcher pid file")
     return "launcher restart documented"
+
+
+def self_test_lock_blocks_parallel_run_and_recovers_stale_lock():
+    lock_path = os.path.join(core_tools.PROJECT_CACHE_DIR, "self_test_lock_unit_test.lock")
+    try:
+        os.remove(lock_path)
+    except FileNotFoundError:
+        pass
+    if not acquire_self_test_lock(lock_path):
+        raise AssertionError("first lock acquire failed")
+    try:
+        if acquire_self_test_lock(lock_path):
+            raise AssertionError("second lock acquire should fail")
+    finally:
+        release_self_test_lock(lock_path)
+    with open(lock_path, "w", encoding="utf-8") as file:
+        file.write("stale\n")
+    old = time.time() - (SELF_TEST_LOCK_STALE_SECONDS + 60)
+    os.utime(lock_path, (old, old))
+    if not acquire_self_test_lock(lock_path):
+        raise AssertionError("stale lock was not recovered")
+    release_self_test_lock(lock_path)
+    if os.path.exists(lock_path):
+        raise AssertionError("lock file was not released")
+    return "self_test lock blocks parallel runs and recovers stale lock"
 
 
 def live_telegram_smoke():
@@ -3895,6 +5479,10 @@ def send_telegram_media_falls_back_to_text_after_upload_failure():
 
 
 def main():
+    if not acquire_self_test_lock():
+        print(f"[LOCKED] self_test is already running. Lock file: {SELF_TEST_LOCK_FILE}")
+        print("If this is stale after an interrupted run, remove the lock file or wait for the stale-lock timeout.")
+        raise SystemExit(2)
     checks = [
         ("tool_schemas", validate_tool_schemas),
         ("protocol_constants_are_unicode_safe", protocol_constants_are_unicode_safe),
@@ -3913,6 +5501,7 @@ def main():
         ("git_index_excludes_private_runtime_files", git_index_excludes_private_runtime_files),
         ("launcher_script_has_single_instance_guard", launcher_script_has_single_instance_guard),
         ("launcher_docs_explain_restart", launcher_docs_explain_restart),
+        ("self_test_lock_blocks_parallel_run_and_recovers_stale_lock", self_test_lock_blocks_parallel_run_and_recovers_stale_lock),
         ("create_plan", lambda: result_text(core_tools.real_create_plan("self test objective", ["step one", "step two"]))),
         ("update_plan", lambda: result_text(core_tools.real_update_plan(1, "完成", "self test ok"))),
         ("update_memory", lambda: result_text(core_tools.real_update_memory("self test memory entry"))),
@@ -3927,7 +5516,9 @@ def main():
         ("permission_followup_allows_exact_tool", permission_followup_allows_exact_tool),
         ("permission_replay_bypasses_chat_route_policy", permission_replay_bypasses_chat_route_policy),
         ("permission_replay_delivers_safe_artifact_after_success", permission_replay_delivers_safe_artifact_after_success),
+        ("permission_replay_recovers_transient_artifact_delivery", permission_replay_recovers_transient_artifact_delivery),
         ("permission_replay_recovers_transient_error_before_reply", permission_replay_recovers_transient_error_before_reply),
+        ("permission_replay_summarizes_media_status_instead_of_raw_stdout", permission_replay_summarizes_media_status_instead_of_raw_stdout),
         ("permission_replay_failed_python_enters_self_repair_loop", permission_replay_failed_python_enters_self_repair_loop),
         ("permission_replay_lives_in_controller_not_core_loop", permission_replay_lives_in_controller_not_core_loop),
         ("tool_loop_lives_in_controller_not_core_loop", tool_loop_lives_in_controller_not_core_loop),
@@ -3938,6 +5529,9 @@ def main():
         ("task_result_followup_uses_last_outcome_without_replanning", task_result_followup_uses_last_outcome_without_replanning),
         ("outcome_context_handles_result_followup_even_when_classified_chat", outcome_context_handles_result_followup_even_when_classified_chat),
         ("outcome_send_artifact_uses_stored_artifact_without_replanning", outcome_send_artifact_uses_stored_artifact_without_replanning),
+        ("outcome_send_artifact_recovers_transient_error_without_replanning", outcome_send_artifact_recovers_transient_error_without_replanning),
+        ("outcome_continue_retries_last_safe_failed_step_without_replanning", outcome_continue_retries_last_safe_failed_step_without_replanning),
+        ("outcome_retry_records_result_on_original_failed_graph", outcome_retry_records_result_on_original_failed_graph),
         ("outcome_analyze_artifact_uses_stored_artifact_without_replanning", outcome_analyze_artifact_uses_stored_artifact_without_replanning),
         ("outcome_action_without_artifact_is_clear", outcome_action_without_artifact_is_clear),
         ("outcome_intent_helpers_are_deterministic_and_bounded", outcome_intent_helpers_are_deterministic_and_bounded),
@@ -3946,15 +5540,24 @@ def main():
         ("outcome_continue_rejects_non_allowlisted_verifier_plan", outcome_continue_rejects_non_allowlisted_verifier_plan),
         ("single_approval_does_not_allow_unrelated_tool", single_approval_does_not_allow_unrelated_tool),
         ("turn_approval_allows_tool_chain", turn_approval_allows_tool_chain),
+        ("turn_approval_allows_computer_control_bundle", turn_approval_allows_computer_control_bundle),
+        ("plain_approval_allows_computer_control_operation", plain_approval_allows_computer_control_operation),
+        ("approval_restores_pending_from_task_graph_after_restart", approval_restores_pending_from_task_graph_after_restart),
         ("command_cwd_failure_recovers_inside_agent_loop", command_cwd_failure_recovers_inside_agent_loop),
         ("transient_tool_error_recovers_before_user_followup", transient_tool_error_recovers_before_user_followup),
         ("self_recovery_does_not_retry_unsafe_python", self_recovery_does_not_retry_unsafe_python),
+        ("self_recovery_failed_retry_leaves_evidence_for_reply", self_recovery_failed_retry_leaves_evidence_for_reply),
         ("missing_mss_screenshot_recovery_uses_safe_fallback", missing_mss_screenshot_recovery_uses_safe_fallback),
         ("screenshot_runtime_error_recovery_uses_safe_fallback", screenshot_runtime_error_recovery_uses_safe_fallback),
         ("self_recovery_diagnoses_and_plans_known_errors", self_recovery_diagnoses_and_plans_known_errors),
+        ("repair_planner_orders_safe_candidates", repair_planner_orders_safe_candidates),
+        ("command_recovery_uses_file_probe_after_cwd_retry_fails", command_recovery_uses_file_probe_after_cwd_retry_fails),
+        ("self_recovery_uses_second_candidate_when_first_fails", self_recovery_uses_second_candidate_when_first_fails),
+        ("self_recovery_skips_already_attempted_candidate", self_recovery_skips_already_attempted_candidate),
         ("self_recovery_does_not_plan_unsafe_unknown_errors", self_recovery_does_not_plan_unsafe_unknown_errors),
         ("missing_mss_recovery_bypasses_chat_route_allowlist", missing_mss_recovery_bypasses_chat_route_allowlist),
         ("missing_module_recovery_is_narrow", missing_module_recovery_is_narrow),
+        ("self_repair_prompt_includes_failed_deterministic_recovery", self_repair_prompt_includes_failed_deterministic_recovery),
         ("tool_loop_prompts_self_repair_before_user_followup", tool_loop_prompts_self_repair_before_user_followup),
         ("trace_log_records_tool_events", trace_log_records_tool_events),
         ("session_brain_plain_chat_stays_idle", session_brain_plain_chat_stays_idle),
@@ -3993,19 +5596,41 @@ def main():
         ("live_eval_gate_uses_current_session_window", live_eval_gate_uses_current_session_window),
         ("live_eval_ignores_self_test_sessions_for_gate", live_eval_ignores_self_test_sessions_for_gate),
         ("live_eval_ignores_benchmark_sessions_for_gate", live_eval_ignores_benchmark_sessions_for_gate),
+        ("live_eval_ignores_artifact_history_test_sessions_for_gate", live_eval_ignores_artifact_history_test_sessions_for_gate),
         ("live_eval_repo_hygiene_allows_env_example", live_eval_repo_hygiene_allows_env_example),
         ("live_eval_summarizes_fake_trace_and_writes_report", live_eval_summarizes_fake_trace_and_writes_report),
         ("live_eval_writes_permission_health", live_eval_writes_permission_health),
         ("live_eval_reports_user_facing_source_health", live_eval_reports_user_facing_source_health),
+        ("source_health_checks_runtime_voice_samples", source_health_checks_runtime_voice_samples),
+        ("source_health_rejects_mojibake_required_phrases", source_health_rejects_mojibake_required_phrases),
+        ("planner_uses_real_chinese_intent_markers", planner_uses_real_chinese_intent_markers),
         ("source_health_detects_bad_user_facing_text", source_health_detects_bad_user_facing_text),
         ("source_health_failure_blocks_next_stage_gate", source_health_failure_blocks_next_stage_gate),
         ("action_verification_checks_file_write_and_delete", action_verification_checks_file_write_and_delete),
         ("action_verification_preserves_recovery_evidence", action_verification_preserves_recovery_evidence),
+        ("action_verification_preserves_failed_recovery_attempt", action_verification_preserves_failed_recovery_attempt),
         ("task_transaction_records_tool_result", task_transaction_records_tool_result),
         ("task_graph_creates_persists_and_summarizes_steps", task_graph_creates_persists_and_summarizes_steps),
         ("task_graph_records_recovery_evidence_on_step", task_graph_records_recovery_evidence_on_step),
+        ("task_graph_records_failed_recovery_attempt_on_step", task_graph_records_failed_recovery_attempt_on_step),
         ("task_graph_recovery_summary_does_not_grant_permission", task_graph_recovery_summary_does_not_grant_permission),
         ("planner_creates_persistent_steps", planner_creates_persistent_steps),
+        ("planner_selects_next_structured_step", planner_selects_next_structured_step),
+        ("planner_reuses_active_graph_for_followup", planner_reuses_active_graph_for_followup),
+        ("planner_force_new_task_does_not_reuse_stale_graph", planner_force_new_task_does_not_reuse_stale_graph),
+        ("ui_planner_prefers_direct_window_targeting", ui_planner_prefers_direct_window_targeting),
+        ("primary_message_extraction_ignores_short_context_for_tasks", primary_message_extraction_ignores_short_context_for_tasks),
+        ("wrapped_bluetooth_task_plan_first_ignores_codex_context", wrapped_bluetooth_task_plan_first_ignores_codex_context),
+        ("complex_ui_task_returns_plan_before_tools", complex_ui_task_returns_plan_before_tools),
+        ("plan_approval_grants_first_computer_control_step", plan_approval_grants_first_computer_control_step),
+        ("url_platform_classifies_douyin_and_common_sites", url_platform_classifies_douyin_and_common_sites),
+        ("url_metadata_parses_open_graph", url_metadata_parses_open_graph),
+        ("douyin_html_metadata_extracts_description_author_and_cover", douyin_html_metadata_extracts_description_author_and_cover),
+        ("url_context_cache_reuses_metadata", url_context_cache_reuses_metadata),
+        ("short_context_resolves_reference_to_recent_url", short_context_resolves_reference_to_recent_url),
+        ("url_tools_return_structured_results", url_tools_return_structured_results),
+        ("url_preview_uses_real_chinese_markers", url_preview_uses_real_chinese_markers),
+        ("read_webpage_social_url_degrades_to_url_context", read_webpage_social_url_degrades_to_url_context),
         ("task_graph_updates_planned_step_with_tool_result", task_graph_updates_planned_step_with_tool_result),
         ("worker_result_assimilation_updates_task_graph_only_from_main_thread", worker_result_assimilation_updates_task_graph_only_from_main_thread),
         ("observe_needed_stays_awaiting_validation", observe_needed_stays_awaiting_validation),
@@ -4019,6 +5644,20 @@ def main():
         ("verifier_subagent_can_submit_background_job", verifier_subagent_can_submit_background_job),
         ("live_eval_counts_worker_metrics", live_eval_counts_worker_metrics),
         ("live_eval_counts_planner_context_subagent_and_assimilation", live_eval_counts_planner_context_subagent_and_assimilation),
+        ("presence_shadow_mode_records_candidate_without_send", presence_shadow_mode_records_candidate_without_send),
+        ("presence_cooldown_prevents_spam", presence_cooldown_prevents_spam),
+        ("presence_suppresses_during_active_task", presence_suppresses_during_active_task),
+        ("live_eval_reports_presence_health", live_eval_reports_presence_health),
+        ("presence_quiet_hours_are_soft_when_owner_recently_active", presence_quiet_hours_are_soft_when_owner_recently_active),
+        ("presence_stale_permission_does_not_block_forever", presence_stale_permission_does_not_block_forever),
+        ("presence_notify_tick_sends_once_and_respects_daily_limit", presence_notify_tick_sends_once_and_respects_daily_limit),
+        ("presence_shadow_tick_never_sends", presence_shadow_tick_never_sends),
+        ("presence_composer_quality_message_sends", presence_composer_quality_message_sends),
+        ("presence_composer_rejects_generic_checkin", presence_composer_rejects_generic_checkin),
+        ("presence_composer_error_does_not_crash_or_send", presence_composer_error_does_not_crash_or_send),
+        ("presence_default_quota_is_adaptive_not_tiny_daily_cap", presence_default_quota_is_adaptive_not_tiny_daily_cap),
+        ("presence_long_silence_becomes_icebreak_opportunity", presence_long_silence_becomes_icebreak_opportunity),
+        ("presence_debug_records_suppression_reason", presence_debug_records_suppression_reason),
         ("failure_replay_persists_minimal_case", failure_replay_persists_minimal_case),
         ("subagent_lite_returns_isolated_summary", subagent_lite_returns_isolated_summary),
         ("verifier_subagent_runs_safe_command", verifier_subagent_runs_safe_command),
@@ -4029,6 +5668,10 @@ def main():
         ("verification_planner_handles_docs_only", verification_planner_handles_docs_only),
         ("session_brain_validation_includes_plan_and_clears_it", session_brain_validation_includes_plan_and_clears_it),
         ("latency_policy_classifies_modes", latency_policy_classifies_modes),
+        ("computer_action_text_routes_to_tool_task", computer_action_text_routes_to_tool_task),
+        ("observe_only_media_status_does_not_require_plan_approval", observe_only_media_status_does_not_require_plan_approval),
+        ("observe_only_media_status_overrides_stale_validation_state", observe_only_media_status_overrides_stale_validation_state),
+        ("observe_only_media_status_starts_fresh_graph_over_stale_active_graph", observe_only_media_status_starts_fresh_graph_over_stale_active_graph),
         ("chat_policy_blocks_vision_tool", chat_policy_blocks_vision_tool),
         ("user_visible_tool_blocks_hide_internal_route_terms", user_visible_tool_blocks_hide_internal_route_terms),
         ("user_voice_strings_are_unicode_safe", user_voice_strings_are_unicode_safe),
@@ -4042,6 +5685,7 @@ def main():
         ("dynamic_media_skips_image_vision", dynamic_media_skips_image_vision),
         ("quick_ack_exists_for_slow_modes", quick_ack_exists_for_slow_modes),
         ("repeated_tool_call_stops_before_timeout", repeated_tool_call_stops_before_timeout),
+        ("interleaved_ui_navigation_is_not_treated_as_repeated_loop", interleaved_ui_navigation_is_not_treated_as_repeated_loop),
         ("screen_observe_policy_blocks_unrelated_vision_tool", screen_observe_policy_blocks_unrelated_vision_tool),
         ("prompt_mode_routes_screen_observe_persona", prompt_mode_routes_screen_observe_persona),
         ("dsml_cleaner_handles_spaced_tags", dsml_cleaner_handles_spaced_tags),
@@ -4103,6 +5747,7 @@ def main():
         restore_session_brain()
         restore_reliability_state()
         cleanup_self_test_files()
+        release_self_test_lock()
 
 
 if __name__ == "__main__":

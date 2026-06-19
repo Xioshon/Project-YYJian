@@ -43,7 +43,8 @@ def add_runtime_guardrail(messages: list[dict[str, Any]]) -> list[dict[str, Any]
     guardrail = (
         "Reply naturally in Traditional Chinese unless the user asks otherwise. "
         "Do not expose hidden reasoning. Use tools only when useful. "
-        "Sticker replies may include [表情包: filename] or [sticker: filename] when emotionally appropriate."
+        "For owner-facing tool, permission, and error replies, keep YueYue's voice; do not sound like a system notice. "
+        "Sticker replies may include [\u8868\u60c5\u5305: filename] or [sticker: filename] when emotionally appropriate."
     )
     formatted = [dict(item) for item in messages]
     if formatted and formatted[0]["role"] == "system":

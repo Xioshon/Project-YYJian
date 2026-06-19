@@ -122,6 +122,12 @@ This project should be treated as a small agent runtime, not as a pile of prompt
   TelegramGateway may attach one suggested local sticker for clear sticker-battle turns when the model did not already emit a sticker marker.
 - `SocialReplyPolicy`
   Converts short-lived social rhythm into concise reply guidance: sticker battle stays playful and quick, affection stays soft, teasing stays warm, and social turns avoid tool use.
+- `ShortContextBuffer`
+  Keeps the last 20 logical chat turns per chat for lightweight social grounding: recent text, URL summaries, media metadata, mood/topic hints, and the last assistant reply summary. This is short-term context only and does not update long-term memory.
+- `URLContextCache`
+  Classifies and caches URL metadata/preview context for YouTube, Bilibili, Douyin, TikTok, Instagram, X/Twitter, direct images, and ordinary websites. Extraction is layered and bounded: metadata first, optional preview only on demand, hard timeouts, no login cookies, no platform bypassing, and clear failure reasons.
+- `PresenceEngine`
+  Evaluates whether YueYue would naturally want to check in after recent chat context. Phase B2 uses adaptive presence: quiet hours are a soft rule, recent owner activity can mark the owner as likely awake, stale task states stop blocking forever, and decisions are written to `presence_debug.jsonl`. In `notify` mode it can send one low-frequency Telegram text check-in through the gateway scheduler; it never runs tools, mutates memory, or changes task state.
 
 ## Latency Policy
 
@@ -134,6 +140,8 @@ This project should be treated as a small agent runtime, not as a pile of prompt
 - Sticker battles and mood stickers use local sticker search/indexing first; incoming stickers are cataloged as social metadata and are not analyzed unless requested.
 - Sticker auto-selection uses quiet eligibility checks and keeps incoming stickers as unapproved candidates until curated. Affection/teasing is allowed, and intense wording should be handled by warm pivoting rather than abrupt interruption.
 - SocialSession prompt notes may provide candidate sticker filenames and recent rhythm, but must remain separate from durable memory and SessionBrain task state.
+- URL handling follows the same latency principle: cheap metadata/cache is allowed in chat, heavier preview is only triggered when the owner asks to look at or comment on the link. Douyin is treated as Chinese Douyin, not TikTok; app-only, login-gated, or region-restricted pages must degrade honestly instead of inventing content.
+- Presence handling is low-cost. Post-turn evaluation records candidates and debug evidence; a background scheduler performs bounded ticks every configured interval. Quiet hours suppress checks unless recent Telegram context indicates the owner is likely awake. Fresh active tasks, permission waits, validation waits, cooldown, and daily limits still suppress proactive messages.
 
 ## Memory Policy
 

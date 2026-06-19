@@ -1,9 +1,10 @@
-import os
+﻿import os
 import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from agent_outcome import tool_result_outcome
+from agent_reply_composer import ReplyComposer, ReplyEvent
 from agent_self_recovery import self_repair_instruction, should_prompt_self_repair
 from agent_user_voice import approved_tool_blocked_reply, approved_tool_error_reply, approved_tool_success_reply, failure_replay_reply
 from agent_tool_runtime import is_safe_workspace_media
@@ -37,6 +38,7 @@ class PermissionReplayController:
         recover_tool_result: Callable[[str, dict, ToolResult, Callable | None, Any], tuple[ToolResult, dict[str, Any] | None]] | None = None,
         response_policy: Any = None,
         reset_turn_state: Callable[[], None],
+        reply_composer: ReplyComposer | None = None,
         session_id: str,
         turn_id_getter: Callable[[], int],
     ):
@@ -52,6 +54,7 @@ class PermissionReplayController:
         self.continue_after_error = continue_after_error
         self.response_policy = response_policy
         self.reset_turn_state = reset_turn_state
+        self.reply_composer = reply_composer or ReplyComposer()
         self.session_id = session_id
         self.turn_id_getter = turn_id_getter
 
@@ -149,14 +152,43 @@ class PermissionReplayController:
                 evidence=[tool_name],
             )
             outcome_summary, artifacts = tool_result_outcome(tool_name, result)
-            return approved_tool_success_reply(tool_name, result.message, outcome_summary, bool(artifacts))
+            owner_summary = _owner_summary_for_replay_result(tool_name, approved_action.arguments, result, outcome_summary)
+            fallback = owner_summary or approved_tool_success_reply(tool_name, result.message, outcome_summary, bool(artifacts))
+            return self.reply_composer.compose(
+                ReplyEvent(
+                    "tool_success",
+                    user_input="permission replay approved by owner",
+                    tool_name=tool_name,
+                    result=result,
+                    summary=owner_summary or outcome_summary,
+                    artifacts=artifacts,
+                    next_action="answer the owner's actual task result",
+                ),
+                fallback,
+            )
         if replay_case:
-            return failure_replay_reply(tool_name, replay_case.get("name", ""))
+            return self.reply_composer.compose(
+                ReplyEvent(
+                    "tool_error",
+                    user_input="permission replay failed repeatedly",
+                    tool_name=tool_name,
+                    result=result,
+                    reason="failure replay generated",
+                    extra={"replay_name": replay_case.get("name", "")},
+                ),
+                failure_replay_reply(tool_name, replay_case.get("name", "")),
+            )
         if result.status == "blocked":
             if result.requires_permission:
                 self.session_brain.mark_permission_needed(tool_name, self.turn_id_getter(), self.session_id)
-            return approved_tool_blocked_reply(tool_name, result)
-        return approved_tool_error_reply(tool_name, result)
+            return self.reply_composer.compose(
+                ReplyEvent("permission_request" if result.requires_permission else "tool_error", tool_name=tool_name, result=result),
+                approved_tool_blocked_reply(tool_name, result),
+            )
+        return self.reply_composer.compose(
+            ReplyEvent("tool_error", tool_name=tool_name, result=result, reason="approved tool returned error"),
+            approved_tool_error_reply(tool_name, result),
+        )
 
     def _deliver_safe_artifact_after_success(self, tool_name: str, result: ToolResult, tool_callback: Callable | None) -> tuple[str, ToolResult | None]:
         _outcome_summary, artifacts = tool_result_outcome(tool_name, result)
@@ -165,12 +197,14 @@ class PermissionReplayController:
             return "", None
         args = {"file_path": artifact, "caption": "剛剛的結果喔"}
         delivered = self.executor.execute("send_telegram_media", args, tool_callback, None)
+        if self.recover_tool_result is not None:
+            delivered, _recovery = self.recover_tool_result("send_telegram_media", args, delivered, tool_callback, self.response_policy)
         self.after_tool_result("send_telegram_media", args, delivered)
         if delivered.status == "ok":
             return f"\n我也順手把 `{os.path.basename(artifact)}` 發給你了。", delivered
         if delivered.requires_permission:
             self.session_brain.mark_permission_needed("send_telegram_media", self.turn_id_getter(), self.session_id)
-            return f"\n結果檔案已經生成了，不過發送 `{os.path.basename(artifact)}` 還需要你點頭一下。", delivered
+            return f"\n結果檔案已經生成了，不過發送 `{os.path.basename(artifact)}` 還需要你確認一下。", delivered
         return f"\n結果檔案已經生成了，但我發送時卡住了：{delivered.message}", delivered
 
 
@@ -180,4 +214,59 @@ def _first_safe_media_artifact(artifacts: list[str]) -> str:
         ext = os.path.splitext(artifact)[1].casefold()
         if ext in media_exts and is_safe_workspace_media(artifact):
             return artifact
+    return ""
+
+
+def _owner_summary_for_replay_result(tool_name: str, arguments: dict[str, Any], result: ToolResult, outcome_summary: str) -> str:
+    if tool_name != "execute_python" or not isinstance(result.data, dict):
+        return ""
+    code = str((arguments or {}).get("code") or "").casefold()
+    stdout = str(result.data.get("stdout") or "")
+    combined = (code + "\n" + stdout).casefold()
+    if not any(marker in combined for marker in ["cloudmusic", "spotify", "vlc", "potplayer", "media", "music", "網易", "网易", "音樂", "音乐"]):
+        return ""
+    if not any(marker in combined for marker in ["mainwindowtitle", "processname", "pid", "tasklist", "get-process", "workingsetmb"]):
+        return ""
+
+    title = _extract_media_window_title(stdout)
+    process = _extract_media_process_name(stdout, combined)
+    lines = ["我查到比較像答案的部分了："]
+    if process:
+        lines.append(f"- 目前有 `{process}` 相關進程在跑。")
+    if title:
+        lines.append(f"- 可見播放器窗口標題像是：`{title}`。")
+    else:
+        lines.append("- 有媒體相關進程，但沒有抓到清楚的播放窗口標題。")
+    lines.append("- 所以我的判斷是：你的電腦上確實有媒體/音樂播放器在活動或待命。")
+    lines.append("- 但只靠進程和窗口標題，還不能 100% 判斷它此刻是在播放還是暫停；要精準確認，需要再看播放器畫面或音量混音器。")
+    lines.append("")
+    lines.append("我猜你真正想知道的是：聲音是不是從某個播放器來、要不要幫你切過去或暫停。")
+    lines.append("下一步你可以直接說「切到播放器看看」或「幫我暫停音樂」，我就接著做。")
+    return "\n".join(lines)
+
+
+def _extract_media_window_title(stdout: str) -> str:
+    candidates: list[str] = []
+    for raw_line in (stdout or "").splitlines():
+        line = " ".join(raw_line.strip().split())
+        if not line or line.startswith("---") or line.startswith("===") or "mainwindowtitle" in line.casefold():
+            continue
+        if any(marker in line.casefold() for marker in ["mygo", "spotify", "vlc", "potplayer", "music", "cloudmusic"]):
+            candidates.append(line)
+    if not candidates:
+        return ""
+    best = candidates[0]
+    best = best.replace("True ", "").strip()
+    parts = best.split()
+    if len(parts) >= 2 and parts[0].isdigit():
+        best = " ".join(parts[1:])
+    if len(parts) >= 6 and parts[0].isdigit():
+        best = " ".join(parts[5:])
+    return best[:120]
+
+
+def _extract_media_process_name(stdout: str, combined: str) -> str:
+    for name in ["cloudmusic", "spotify", "vlc", "potplayer", "foobar", "wmplayer"]:
+        if name in combined:
+            return name
     return ""

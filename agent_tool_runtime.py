@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import re
 import time
@@ -39,6 +39,7 @@ PERMISSION_BUNDLES: dict[str, set[str]] = {
     "telegram_media_bundle": {"send_telegram_media"},
     "screenshot_bundle": {"get_screen_ui", "send_telegram_media", "delete_file"},
 }
+AUTO_TURN_APPROVAL_BUNDLES = {"computer_control_bundle"}
 HIGH_RISK_TOOLS = {"execute_command", "execute_python", "execute_async_command"}
 
 LOW_RISK_TOOLS = {
@@ -50,6 +51,9 @@ LOW_RISK_TOOLS = {
     "read_knowledge",
     "search_sticker",
     "analyze_media",
+    "inspect_url",
+    "read_url_context",
+    "reindex_url_cache",
     "react_to_message",
     "update_memory",
     "update_profile",
@@ -140,6 +144,14 @@ class PermissionManager:
             self.hooks.emit("PermissionBundleGranted", session_id=self.session_id, turn_id=turn_id, bundle=bundle_name, allowed_tools=sorted(allowed_tools))
             return "turn"
         if decision == "single" and self.pending:
+            bundle_name, allowed_tools = bundle_for_tool(self.pending.tool_name)
+            if bundle_name in AUTO_TURN_APPROVAL_BUNDLES:
+                self.grant = PermissionGrant(scope="turn", remaining_uses=50, bundle_name=bundle_name, allowed_tools=allowed_tools)
+                self.pending = None
+                self.approved_action = None
+                self.hooks.emit("PermissionGranted", session_id=self.session_id, turn_id=turn_id, scope="turn", bundle=bundle_name, allowed_tools=sorted(allowed_tools), promoted_from="single")
+                self.hooks.emit("PermissionBundleGranted", session_id=self.session_id, turn_id=turn_id, bundle=bundle_name, allowed_tools=sorted(allowed_tools), promoted_from="single")
+                return "turn"
             self.approved_action = self.pending
             self.grant = PermissionGrant(scope="single", tool_name=self.pending.tool_name, arguments_key=stable_args(self.pending.arguments), remaining_uses=1)
             self.hooks.emit("PermissionGranted", session_id=self.session_id, turn_id=turn_id, scope="single", tool=self.pending.tool_name)

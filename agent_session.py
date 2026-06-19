@@ -74,6 +74,7 @@ class SessionBrain:
     def classify_turn(self, text: str, grant: str = "none", pending_permission: bool = False, turn_id: int = 0, session_id: str = "") -> TurnClassification:
         normalized = (text or "").strip().casefold()
         old_state = self.state.state
+        interaction = classify_interaction(text, has_media=False)
         if _contains_any(normalized, STOP_MARKERS) or grant == "deny":
             self._set_state("idle", turn_id, session_id, "owner_cancelled")
             self.state.current_objective = ""
@@ -95,13 +96,19 @@ class SessionBrain:
             self.save()
             return self._emit_classified("active_task", "permission_granted", f"permission_{grant}", False, turn_id, session_id, old_state)
 
+        if interaction == InteractionMode.SCREEN_OBSERVE:
+            self._set_state("active_task", turn_id, session_id, "screen_observe_intent")
+            self.state.current_objective = _shorten(text)
+            self.state.last_turn_was_chat = False
+            self.save()
+            return self._emit_classified("active_task", "screen_observe", "screen_observe_intent", False, turn_id, session_id, old_state)
+
         if self.state.state in {"active_task", "awaiting_validation", "awaiting_permission"} and _looks_like_task_followup(normalized):
             self._set_state("active_task", turn_id, session_id, "task_continuation")
             self.state.last_turn_was_chat = False
             self.save()
             return self._emit_classified("active_task", "task_continuation", "task_continuation", False, turn_id, session_id, old_state)
 
-        interaction = classify_interaction(text, has_media=False)
         if interaction == InteractionMode.TOOL_TASK or _looks_like_task(normalized):
             self._set_state("active_task", turn_id, session_id, "task_intent")
             self.state.current_objective = _shorten(text)
@@ -236,6 +243,25 @@ def _looks_like_task(text: str) -> bool:
         "\u627e bug",
         "\u5be6\u73fe",
         "\u512a\u5316",
+        "打開",
+        "打开",
+        "點擊",
+        "点击",
+        "按一下",
+        "按下",
+        "關閉",
+        "关闭",
+        "切換",
+        "切换",
+        "設定",
+        "设置",
+        "菜單",
+        "菜单",
+        "窗口",
+        "視窗",
+        "快捷鍵",
+        "快捷键",
+        "空格",
         "please implement",
         "implement",
         "debug",

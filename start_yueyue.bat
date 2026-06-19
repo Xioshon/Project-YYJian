@@ -3,6 +3,9 @@ setlocal
 title YueYue Agent Launcher
 cd /d "%~dp0"
 
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_yueyue.ps1" %*
 set EXITCODE=%ERRORLEVEL%
 

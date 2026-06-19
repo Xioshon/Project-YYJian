@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 
@@ -14,6 +15,8 @@ import telebot
 from agent_context import DEFAULT_CONTEXT_BUILDER
 from agent_latency import DEFAULT_MEDIA_CACHE, InteractionMode, classify_interaction, media_type_for, quick_ack_for, response_policy_for
 from agent_protocol import STICKER_MARKER_LABEL, SCREENSHOT_MARKER_LABEL, TELEGRAM_STATUS_LABELS, screenshot_pattern, sticker_pattern
+from agent_presence import DEFAULT_PRESENCE_ENGINE
+from agent_short_context import DEFAULT_SHORT_CONTEXT_BUFFER, build_context_for_turn
 from agent_skills import DEFAULT_SKILL_REGISTRY
 from agent_social import DEFAULT_SOCIAL_CURATION_REMINDER, DEFAULT_SOCIAL_SESSION_MANAGER, DEFAULT_SOCIAL_STICKER_INDEX, social_reply_policy_for
 from agent_turns import InboundMessagePart, MessageCoalescer, build_turn_prompt
@@ -218,6 +221,8 @@ class TelegramGateway:
         self.agent = agent
         self.agent.interactive_mode = False
         self.turn_coalescer = MessageCoalescer()
+        self._presence_stop = threading.Event()
+        self._presence_thread: threading.Thread | None = None
         self.register_handlers()
 
     def _telegram_call(self, fn, *args, attempts: int = 3, **kwargs):
@@ -341,13 +346,14 @@ class TelegramGateway:
         mode: InteractionMode = InteractionMode.CHAT,
         suggested_stickers: list[str] | None = None,
         allow_auto_sticker: bool = False,
-    ) -> None:
+    ) -> dict:
         set_telegram_context(message.chat.id, message.message_id)
         policy = response_policy_for(mode)
         reply_data = self.agent.chat(prompt, tool_callback=self._tool_notifier_for(message), response_policy=policy)
         if allow_auto_sticker:
             reply_data = self._attach_social_sticker_if_needed(reply_data, suggested_stickers or [])
         self.send_reply_with_stickers(message.chat.id, reply_data, message.message_id)
+        return reply_data
 
     def _attach_social_sticker_if_needed(self, reply_data: dict, suggested_stickers: list[str]) -> dict:
         if not suggested_stickers:
@@ -365,6 +371,8 @@ class TelegramGateway:
     def _handle_sticker_curation_command(self, message) -> bool:
         text = (getattr(message, "text", "") or "").strip()
         lowered = text.casefold()
+        if self._handle_presence_command(message, text, lowered):
+            return True
         if lowered in {"list sticker candidates", "list stickers"} or any(marker in text for marker in ["列出貼圖候選", "列出表情包候選", "候選貼圖", "候選表情包"]):
             candidates = DEFAULT_SOCIAL_STICKER_INDEX.list_candidates(limit=10)
             if not candidates:
@@ -466,6 +474,54 @@ class TelegramGateway:
             return True
         return False
 
+    def _handle_presence_command(self, message, text: str, lowered: str) -> bool:
+        markers = [
+            "presence status",
+            "presence candidates",
+            "presence debug",
+            "月月剛剛有沒有想找我",
+            "月月刚刚有没有想找我",
+            "月月剛才有沒有想找我",
+            "月月刚才有没有想找我",
+            "月月想找我嗎",
+            "月月想找我吗",
+            "月月為什麼沒找我",
+            "月月为什么没找我",
+            "月月剛剛想說什麼",
+            "月月刚刚想说什么",
+        ]
+        if lowered not in markers and not any(marker in text for marker in markers if not marker.isascii()):
+            return False
+        health = DEFAULT_PRESENCE_ENGINE.write_health()
+        candidates = DEFAULT_PRESENCE_ENGINE.recent_candidates(limit=3)
+        debug_rows = DEFAULT_PRESENCE_ENGINE.recent_debug(limit=5)
+        lines = [
+            f"月月的待命狀態：{health.get('mode', 'unknown')}",
+            f"候選 {health.get('candidate_count', 0)} 次，已主動發 {health.get('sent_count', 0)} 次，被壓住 {health.get('suppressed_count', 0)} 次。",
+            f"今天 {health.get('daily_count', 0)}/{health.get('daily_limit', 1)}，冷卻 {health.get('min_interval_minutes', 0)} 分鐘，破冰 {health.get('icebreak_after_minutes', 0)} 分鐘，安靜時間 {health.get('quiet_hours', '')}。",
+            f"Composer：{'啟用' if health.get('composer_enabled') else '未啟用'}，模型 {health.get('composer_model', 'unknown')}。",
+        ]
+        if debug_rows:
+            lines.append("最近判斷：")
+            for row in debug_rows[-3:]:
+                decision = row.get("decision", "unknown")
+                reason = row.get("reason", "")
+                awake = "醒著" if row.get("owner_likely_awake") else "未確認醒著"
+                quiet = "安靜時間" if row.get("quiet_now") else "非安靜時間"
+                quality = row.get("quality") if isinstance(row.get("quality"), dict) else {}
+                quality_reason = quality.get("reason") if quality else ""
+                suffix = f"，內容 gate：{quality_reason}" if quality_reason else ""
+                lines.append(f"- {decision}: {reason}（{awake} / {quiet}{suffix}）")
+        if not candidates:
+            lines.append("剛剛沒有特別想打擾你的候選，月月很乖地待著～")
+        else:
+            lines.append("最近幾個候選：")
+            for item in candidates:
+                message_text = item.message or "等 composer 判斷有沒有值得說的內容"
+                lines.append(f"- {item.kind}: {message_text} ({item.reason})")
+        self.bot.reply_to(message, "\n".join(lines))
+        return True
+
     def _enqueue_turn_part(self, part: InboundMessagePart) -> None:
         self.turn_coalescer.add(part, self._flush_aggregated_turn)
 
@@ -477,6 +533,24 @@ class TelegramGateway:
             if turn.mode in {InteractionMode.VISION_TASK, InteractionMode.TOOL_TASK}:
                 self._maybe_quick_ack(message, turn.mode)
             prompt = build_turn_prompt(self.quote_context(message), turn)
+            context_text = "\n".join(
+                item
+                for item in [turn.primary_text, *[part.caption for part in turn.parts if part.caption]]
+                if item
+            )
+            media_context = [
+                {
+                    "kind": part.kind,
+                    "path": part.path,
+                    "media_type": part.media_type,
+                    "caption": part.caption,
+                }
+                for part in turn.parts
+                if part.kind in {"photo", "sticker"}
+            ]
+            context_note, _context_turn = build_context_for_turn(turn.chat_id, context_text, media_context)
+            if context_note:
+                prompt = f"{prompt}\n\n{context_note}" if prompt else context_note
             social_state = DEFAULT_SOCIAL_SESSION_MANAGER.observe_turn(
                 turn.chat_id,
                 text=turn.primary_text,
@@ -492,12 +566,107 @@ class TelegramGateway:
                     prompt = f"{prompt}\n\n{social_note}" if prompt else social_note
             social_policy = social_reply_policy_for(social_state.mode, social_state.intent_tags, has_sticker=bool(turn.stickers))
             allow_auto_sticker = social_policy.should_attach_sticker and social_state.mode != "idle"
-            self._chat_and_reply(message, prompt, turn.mode, suggested_stickers=suggestions, allow_auto_sticker=allow_auto_sticker)
+            reply_data = self._chat_and_reply(message, prompt, turn.mode, suggested_stickers=suggestions, allow_auto_sticker=allow_auto_sticker)
+            DEFAULT_SHORT_CONTEXT_BUFFER.update_last_assistant(turn.chat_id, reply_data.get("content", "") if isinstance(reply_data, dict) else "")
+            self._record_presence_candidate(turn, reply_data)
         except Exception as exc:
             try:
                 self.bot.reply_to(message, f"處理合併訊息時出錯了：{exc}")
             except Exception:
                 print(f"[TG warning] aggregated turn failed: {exc}")
+
+    def _record_presence_candidate(self, turn, reply_data) -> None:
+        try:
+            turns = DEFAULT_SHORT_CONTEXT_BUFFER.turns.get(str(turn.chat_id)) or []
+            latest = turns[-1] if turns else None
+            short_context = {
+                "primary_text": turn.primary_text,
+                "summary": reply_data.get("content", "") if isinstance(reply_data, dict) else "",
+                "topic": getattr(latest, "topic", "") if latest else "",
+                "mood": getattr(latest, "mood", "") if latest else "",
+                "turns": [
+                    {
+                        "text": item.text,
+                        "topic": item.topic,
+                        "emotion": item.mood,
+                        "assistant_summary": item.assistant_summary,
+                    }
+                    for item in turns[-5:]
+                ],
+            }
+            if latest and getattr(latest, "created_at", None):
+                short_context["created_at"] = latest.created_at
+            session_summary, session_updated_at = self._presence_session_state()
+            DEFAULT_PRESENCE_ENGINE.evaluate(
+                turn.chat_id,
+                short_context=short_context,
+                session_summary=session_summary,
+                session_updated_at=session_updated_at,
+                source="post_turn",
+            )
+        except Exception as exc:
+            print(f"[presence warning] {exc}")
+
+    def _presence_session_state(self) -> tuple[str, float | None]:
+        brain = getattr(self.agent, "session_brain", None)
+        if not brain:
+            return "", None
+        updated_at = getattr(getattr(brain, "state", None), "updated_at", None)
+        return brain.summary(), updated_at if isinstance(updated_at, (int, float)) else None
+
+    def _presence_context_for_chat(self, chat_id: int | str) -> dict:
+        turns = DEFAULT_SHORT_CONTEXT_BUFFER.turns.get(str(chat_id)) or []
+        latest = turns[-1] if turns else None
+        return {
+            "primary_text": getattr(latest, "text", "") if latest else "",
+            "topic": getattr(latest, "topic", "") if latest else "",
+            "mood": getattr(latest, "mood", "") if latest else "",
+            "assistant_summary": getattr(latest, "assistant_summary", "") if latest else "",
+            "created_at": getattr(latest, "created_at", 0.0) if latest else 0.0,
+            "turns": [
+                {
+                    "text": item.text,
+                    "topic": item.topic,
+                    "emotion": item.mood,
+                    "assistant_summary": item.assistant_summary,
+                    "created_at": item.created_at,
+                }
+                for item in turns[-5:]
+            ],
+        }
+
+    def _read_presence_chat_id(self) -> str:
+        try:
+            with open(CHAT_ID_FILE, "r", encoding="utf-8") as file:
+                return file.read().strip()
+        except Exception:
+            return ""
+
+    def _presence_scheduler_loop(self) -> None:
+        interval = max(60, int(DEFAULT_PRESENCE_ENGINE.config.tick_minutes * 60))
+        while not self._presence_stop.wait(interval):
+            chat_id = self._read_presence_chat_id()
+            if not chat_id:
+                continue
+            try:
+                session_summary, session_updated_at = self._presence_session_state()
+                context = self._presence_context_for_chat(chat_id)
+                DEFAULT_PRESENCE_ENGINE.tick(
+                    chat_id,
+                    short_context=context,
+                    session_summary=session_summary,
+                    session_updated_at=session_updated_at,
+                    send_callback=lambda text, cid=chat_id: self._telegram_call(self.bot.send_message, cid, text),
+                )
+            except Exception as exc:
+                print(f"[presence scheduler warning] {exc}")
+
+    def _start_presence_scheduler(self) -> None:
+        if self._presence_thread and self._presence_thread.is_alive():
+            return
+        self._presence_stop.clear()
+        self._presence_thread = threading.Thread(target=self._presence_scheduler_loop, name="YueYuePresenceScheduler", daemon=True)
+        self._presence_thread.start()
 
     def register_handlers(self) -> None:
         @self.bot.message_handler(commands=["start", "help"])
@@ -605,6 +774,7 @@ class TelegramGateway:
 
     def start(self) -> None:
         print("\n>>> Telegram bot mode started.")
+        self._start_presence_scheduler()
         self.bot.infinity_polling(allowed_updates=["message"], timeout=90, long_polling_timeout=90)
 
 

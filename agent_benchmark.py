@@ -5,13 +5,16 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
-from agent_outcome import detect_outcome_action, is_result_followup
+from agent_outcome import _is_safe_retry_step, _latest_retryable_graph_and_step, detect_outcome_action, is_result_followup
 from agent_action_verification import verify_action
-from agent_hooks import emit_trace
+from agent_hooks import DEFAULT_HOOK_MANAGER, emit_trace
 from agent_knowledge import search_knowledge
 from agent_latency import InteractionMode, response_policy_for
 from agent_permission_replay import PermissionReplayController
-from agent_self_recovery import diagnose_tool_error, plan_recovery
+from agent_planner import DEFAULT_PLANNER
+from agent_presence import PresenceConfig, PresenceEngine
+from agent_self_recovery import SelfRecoveryController, diagnose_tool_error, plan_recovery
+from agent_url_context import URLContextCache, classify_url_platform, parse_html_metadata
 from agent_session import SessionBrain
 from agent_task_graph import TaskGraphManager
 from agent_tool_runtime import PermissionManager, ToolExecutor, ToolRegistry
@@ -150,6 +153,14 @@ def build_default_benchmark() -> TaskBenchmarkHarness:
     )
     harness.register(
         BenchmarkCase(
+            name="recovery_command_file_probe_after_cwd_retry",
+            description="execute_command path mismatch falls through to a safe file probe when cwd retry fails",
+            category="recovery",
+            runner=_case_recovery_command_file_probe_after_cwd_retry,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
             name="recovery_plan_screenshot_fallback",
             description="screenshot capture failures produce a deterministic screenshot fallback",
             category="recovery",
@@ -174,6 +185,22 @@ def build_default_benchmark() -> TaskBenchmarkHarness:
     )
     harness.register(
         BenchmarkCase(
+            name="planner_code_task_structured_steps",
+            description="code tasks produce inspect/change/verify/report structured steps",
+            category="planner",
+            runner=_case_planner_code_task_structured_steps,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
+            name="planner_screen_task_short_observe_flow",
+            description="screen observation tasks produce a bounded observe/summarize flow",
+            category="planner",
+            runner=_case_planner_screen_task_short_observe_flow,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
             name="workflow_failure_generates_blocked_state",
             description="failed verification blocks the active workflow instead of pretending success",
             category="workflow",
@@ -186,6 +213,14 @@ def build_default_benchmark() -> TaskBenchmarkHarness:
             description="engineering knowledge index can answer permission replay questions",
             category="knowledge",
             runner=_case_knowledge_search_permission_replay,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
+            name="url_context_metadata_and_douyin_classification",
+            description="URL context classifies Douyin separately from TikTok and parses stable metadata",
+            category="url_context",
+            runner=_case_url_context_metadata_and_douyin_classification,
         )
     )
     harness.register(
@@ -230,10 +265,26 @@ def build_default_benchmark() -> TaskBenchmarkHarness:
     )
     harness.register(
         BenchmarkCase(
+            name="outcome_retry_finds_recent_failed_step",
+            description="outcome retry finds the latest safe failed step even if a new active graph exists",
+            category="workflow",
+            runner=_case_outcome_retry_finds_recent_failed_step,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
             name="user_voice_hides_internal_control_plane",
             description="owner-facing block/retry text stays warm and does not expose route/policy internals",
             category="voice",
             runner=_case_user_voice_hides_internal_control_plane,
+        )
+    )
+    harness.register(
+        BenchmarkCase(
+            name="presence_shadow_candidate_and_cooldown",
+            description="presence v1 records a shadow candidate and suppresses immediate repeats",
+            category="presence",
+            runner=_case_presence_shadow_candidate_and_cooldown,
         )
     )
     return harness
@@ -272,6 +323,58 @@ def _case_recovery_plan_cwd_retry() -> dict[str, Any]:
     return {"ok": ok, "message": diagnosis.category, "recovery_used": bool(plan), "strategy": getattr(plan, "strategy", "")}
 
 
+def _case_recovery_command_file_probe_after_cwd_retry() -> dict[str, Any]:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeExecutor:
+        def execute(self, tool_name: str, arguments: dict[str, Any], tool_callback=None, response_policy=None):
+            calls.append((tool_name, dict(arguments or {})))
+            if tool_name == "execute_command":
+                return ToolResult(
+                    "error",
+                    "Command failed.",
+                    data={"cwd": "project", "retry_hint": "File was still not found from project root."},
+                    error="[Errno 2] No such file or directory: 'missing_core_file.py'",
+                )
+            if tool_name == "execute_python":
+                code = str((arguments or {}).get("code") or "")
+                ok = "missing_core_file.py" in code and "rglob" in code
+                return ToolResult(
+                    "ok" if ok else "error",
+                    "Python completed." if ok else "Python failed.",
+                    data={"stdout": "candidate: C:\\Agent\\core_tools.py", "returncode": 0},
+                    error="" if ok else "probe did not include target filename",
+                )
+            return ToolResult("error", "unexpected tool", error=tool_name)
+
+    original = ToolResult(
+        "error",
+        "Command failed.",
+        data={"cwd": "workspace", "retry_hint": "Command could not find a file. Verify cwd and paths."},
+        error="[Errno 2] No such file or directory: 'missing_core_file.py'",
+    )
+    args = {"command": "python -m py_compile missing_core_file.py", "cwd": "workspace", "timeout": 30}
+    controller = SelfRecoveryController(executor=FakeExecutor(), hooks=DEFAULT_HOOK_MANAGER, session_id="benchmark")
+    recovered, evidence = controller.recover("execute_command", args, original, None, response_policy_for(InteractionMode.TOOL_TASK), turn_id=3)
+    prior = recovered.data.get("prior_recovery_attempts", []) if isinstance(recovered.data, dict) else []
+    ok = (
+        recovered.status == "ok"
+        and bool(evidence)
+        and evidence.get("reason") == "command_file_probe"
+        and [name for name, _ in calls] == ["execute_command", "execute_python"]
+        and bool(prior)
+        and prior[0].get("reason") == "cwd_retry"
+    )
+    return {
+        "ok": ok,
+        "message": evidence.get("reason") if evidence else recovered.message,
+        "recovery_used": True,
+        "strategy": evidence.get("details", {}).get("strategy") if evidence else "",
+        "candidate_count": len(calls),
+        "fallback_tool": calls[-1][0] if calls else "",
+    }
+
+
 def _case_recovery_plan_mss_fallback() -> dict[str, Any]:
     code = "import mss\nwith mss.mss() as sct:\n    sct.shot(output='screenshot.png')"
     result = ToolResult("error", "Python failed.", error="ModuleNotFoundError: No module named 'mss'")
@@ -279,7 +382,7 @@ def _case_recovery_plan_mss_fallback() -> dict[str, Any]:
     diagnosis = diagnose_tool_error("execute_python", args, result)
     plan = plan_recovery("execute_python", args, result, diagnosis)
     retry_code = str((plan.retry_args or {}).get("code") if plan else "")
-    ok = bool(plan and plan.strategy == "screenshot_capture_fallback" and "ImageGrab.grab" in retry_code)
+    ok = bool(plan and plan.strategy == "screenshot_capture_fallback" and "System.Windows.Forms" in retry_code and "CopyFromScreen" in retry_code)
     return {"ok": ok, "message": diagnosis.category, "recovery_used": bool(plan), "strategy": getattr(plan, "strategy", "")}
 
 
@@ -290,7 +393,7 @@ def _case_recovery_plan_screenshot_runtime_error() -> dict[str, Any]:
     diagnosis = diagnose_tool_error("execute_python", args, result)
     plan = plan_recovery("execute_python", args, result, diagnosis)
     retry_code = str((plan.retry_args or {}).get("code") if plan else "")
-    ok = bool(plan and plan.strategy == "screenshot_capture_fallback" and "ImageGrab.grab" in retry_code)
+    ok = bool(plan and plan.strategy == "screenshot_capture_fallback" and "System.Windows.Forms" in retry_code and "CopyFromScreen" in retry_code)
     return {"ok": ok, "message": diagnosis.category, "recovery_used": bool(plan), "strategy": getattr(plan, "strategy", "")}
 
 
@@ -316,6 +419,50 @@ def _case_task_graph_records_recovery_evidence() -> dict[str, Any]:
     return {"ok": ok, "message": step.status if step else "missing step", "workflow_verified": ok, "recovery_used": True, "evidence": evidence}
 
 
+def _case_planner_code_task_structured_steps() -> dict[str, Any]:
+    path = os.path.join(PROJECT_CACHE_DIR, "benchmark_planner_code_graph.json")
+    _remove_file(path)
+    plan = DEFAULT_PLANNER.plan("請幫我修 bug，然後跑 self_test", session_id="benchmark", turn_id=11)
+    manager = TaskGraphManager(path)
+    graph = manager.plan_steps(plan.objective, plan.step_names(), "benchmark", 11, plan.planner_version, step_specs=plan.step_specs())
+    selected = manager.select_next_step("benchmark", 12)
+    kinds = [step.kind for step in graph.steps]
+    verification_steps = [step for step in graph.steps if step.verification_policy == "deterministic"]
+    ok = bool(
+        selected
+        and selected.status == "running"
+        and {"plan", "act", "verify", "reply"}.issubset(set(kinds))
+        and verification_steps
+        and graph.steps[0].allowed_tools
+        and graph.steps[-1].done_condition
+    )
+    return {
+        "ok": ok,
+        "message": f"{len(graph.steps)} steps",
+        "workflow_verified": ok,
+        "step_count": len(graph.steps),
+        "first_step": selected.name if selected else "",
+        "planner_version": graph.planner_version,
+    }
+
+
+def _case_planner_screen_task_short_observe_flow() -> dict[str, Any]:
+    path = os.path.join(PROJECT_CACHE_DIR, "benchmark_planner_screen_graph.json")
+    _remove_file(path)
+    plan = DEFAULT_PLANNER.plan("可以幫我截圖看一下現在畫面嗎", session_id="benchmark", turn_id=13)
+    manager = TaskGraphManager(path)
+    graph = manager.plan_steps(plan.objective, plan.step_names(), "benchmark", 13, plan.planner_version, step_specs=plan.step_specs())
+    selected = manager.select_next_step("benchmark", 14)
+    ok = bool(
+        len(graph.steps) == 2
+        and selected
+        and selected.kind == "observe"
+        and selected.observe_policy == "observe_required"
+        and all(step.kind in {"observe", "reply"} for step in graph.steps)
+    )
+    return {"ok": ok, "message": selected.name if selected else "missing", "workflow_verified": ok, "step_count": len(graph.steps)}
+
+
 def _case_workflow_failure_generates_blocked_state() -> dict[str, Any]:
     path = os.path.join(PROJECT_CACHE_DIR, "benchmark_blocked_graph.json")
     _remove_file(path)
@@ -331,6 +478,17 @@ def _case_knowledge_search_permission_replay() -> dict[str, Any]:
     hits = search_knowledge("permission replay execute_command cwd recovery", limit=3)
     ok = bool(hits)
     return {"ok": ok, "message": f"{len(hits)} hits", "hit_count": len(hits), "top_hit": hits[0]["title"] if hits else ""}
+
+
+def _case_url_context_metadata_and_douyin_classification() -> dict[str, Any]:
+    metadata = parse_html_metadata(
+        "<html><head><title>Fallback</title><meta property='og:title' content='URL Benchmark'>"
+        "<meta name='description' content='metadata ok'><meta property='og:image' content='https://example.com/a.jpg'></head></html>"
+    )
+    cache = URLContextCache(os.path.join(PROJECT_CACHE_DIR, "benchmark_url_context_cache.json"))
+    classification_ok = classify_url_platform("https://www.douyin.com/video/123") == "douyin" and classify_url_platform("https://www.douyin.com/video/123") != "tiktok"
+    ok = classification_ok and metadata.get("title") == "URL Benchmark" and metadata.get("description") == "metadata ok" and cache.reindex().get("status") == "ok"
+    return {"ok": ok, "message": "ok" if ok else "url context failed", "platform": classify_url_platform("https://www.douyin.com/video/123"), "title": metadata.get("title", "")}
 
 
 def _case_permission_single_replay_exact_action() -> dict[str, Any]:
@@ -427,6 +585,28 @@ def _case_outcome_followup_intent_stays_available() -> dict[str, Any]:
     return {"ok": ok, "message": "ok" if ok else str({key: value for key, value in checks.items() if not value}), **checks}
 
 
+def _case_outcome_retry_finds_recent_failed_step() -> dict[str, Any]:
+    path = os.path.join(PROJECT_CACHE_DIR, "benchmark_outcome_retry_graph.json")
+    _remove_file(path)
+    manager = TaskGraphManager(path)
+    artifact = os.path.join(PROJECT_CACHE_DIR, "benchmark_outcome_retry.png")
+    with open(artifact, "wb") as file:
+        file.write(b"\x89PNG\r\n\x1a\n")
+    failed = ToolResult("error", "Connection aborted.", error="ConnectionResetError(10054)")
+    verification = verify_action("send_telegram_media", {"file_path": artifact}, failed, session_id="benchmark", turn_id=1)
+    failed_graph = manager.record_tool_result("send_telegram_media", {"file_path": artifact}, failed, verification, session_id="benchmark", turn_id=1, objective="send artifact")
+    manager.start_or_resume("new owner follow-up", session_id="benchmark", turn_id=2)
+    graph, step = _latest_retryable_graph_and_step(manager)
+    ok = bool(graph and step and graph.task_id == failed_graph.task_id and step.tool_name == "send_telegram_media" and _is_safe_retry_step(step.tool_name, step.arguments))
+    return {
+        "ok": ok,
+        "message": step.tool_name if step else "no retryable step",
+        "workflow_verified": ok,
+        "failed_graph": failed_graph.task_id,
+        "selected_graph": getattr(graph, "task_id", ""),
+    }
+
+
 def _case_user_voice_hides_internal_control_plane() -> dict[str, Any]:
     samples = [
         friendly_tool_block("execute_python"),
@@ -454,6 +634,53 @@ def _case_user_voice_hides_internal_control_plane() -> dict[str, Any]:
     missing = sorted(item for item in expected if item not in combined)
     ok = not leaked and not mojibake and not missing
     return {"ok": ok, "message": "ok" if ok else "voice leak", "leaked": leaked, "mojibake": mojibake, "missing": missing}
+
+
+def _case_presence_shadow_candidate_and_cooldown() -> dict[str, Any]:
+    base = os.path.join(PROJECT_CACHE_DIR, "benchmark_presence")
+    os.makedirs(base, exist_ok=True)
+    state = os.path.join(base, "state.json")
+    candidates = os.path.join(base, "candidates.jsonl")
+    health = os.path.join(base, "health.json")
+    for path in (state, candidates, health):
+        _remove_file(path)
+    engine = PresenceEngine(
+        state_file=state,
+        candidates_file=candidates,
+        health_file=health,
+        config=PresenceConfig(mode="shadow", min_interval_minutes=120, quiet_hours="00:00-00:00"),
+    )
+    now = 12 * 60 * 60
+    first = engine.evaluate(
+        "benchmark-chat",
+        short_context={"primary_text": "剛剛分享了一個抖音影片，想知道你覺得呢", "topic": "douyin video"},
+        session_summary="idle",
+        now=now,
+    )
+    second = engine.evaluate(
+        "benchmark-chat",
+        short_context={"primary_text": "再聊一下"},
+        session_summary="idle",
+        now=now + 60,
+    )
+    recent = engine.recent_candidates()
+    health_payload = engine.write_health()
+    ok = bool(
+        first.status == "shadow"
+        and first.candidate
+        and first.candidate.kind in {"followup", "soft_ping", "social", "care"}
+        and second.status == "suppressed"
+        and second.reason == "cooldown"
+        and len(recent) == 1
+        and health_payload.get("shadow_count") == 1
+    )
+    return {
+        "ok": ok,
+        "message": f"{first.status}/{second.reason}",
+        "workflow_verified": ok,
+        "candidate_kind": first.candidate.kind if first.candidate else "",
+        "suppressed_reason": second.reason,
+    }
 
 
 def _group_by_category(results: list[BenchmarkResult]) -> dict[str, list[BenchmarkResult]]:

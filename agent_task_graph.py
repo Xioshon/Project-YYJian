@@ -24,6 +24,7 @@ class StepVerification:
 class TaskStep:
     step_id: str
     name: str
+    kind: str = "act"
     tool_name: str = ""
     arguments: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"
@@ -34,6 +35,10 @@ class TaskStep:
     evidence: list[str] = field(default_factory=list)
     worker_jobs: list[str] = field(default_factory=list)
     observe_policy: str = ""
+    allowed_tools: list[str] = field(default_factory=list)
+    verification_policy: str = "optional"
+    risk_level: str = "low"
+    done_condition: str = ""
     planned: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -62,7 +67,7 @@ class TaskGraph:
 
     def next_pending_step(self) -> TaskStep | None:
         for step in self.steps:
-            if step.status in {"pending", "planned", "observe_needed", "awaiting_verification"}:
+            if step.status in {"pending", "planned", "running", "awaiting_permission", "awaiting_observation", "observe_needed", "awaiting_verification"}:
                 return step
         return None
 
@@ -95,12 +100,12 @@ class TaskGraphManager:
 
     def active(self) -> TaskGraph | None:
         for item in reversed(self.graphs):
-            if item.status in {"active", "awaiting_permission", "awaiting_validation", "blocked"}:
+            if item.status in {"active", "awaiting_permission", "awaiting_validation", "awaiting_plan_approval", "blocked"}:
                 return item
         return None
 
-    def start_or_resume(self, objective: str = "", session_id: str = "", turn_id: int = 0) -> TaskGraph:
-        current = self.active()
+    def start_or_resume(self, objective: str = "", session_id: str = "", turn_id: int = 0, force_new: bool = False) -> TaskGraph:
+        current = None if force_new else self.active()
         if current and current.status != "blocked":
             if objective and not current.objective:
                 current.objective = objective[:500]
@@ -124,8 +129,11 @@ class TaskGraphManager:
         session_id: str = "",
         turn_id: int = 0,
         objective: str = "",
+        task_id: str = "",
     ) -> TaskGraph:
-        graph = self.start_or_resume(objective, session_id=session_id, turn_id=turn_id)
+        graph = self._graph_by_id(task_id) if task_id else None
+        if graph is None:
+            graph = self.start_or_resume(objective, session_id=session_id, turn_id=turn_id)
         verification_status = getattr(verification, "status", "") if verification else ""
         step_status = _step_status(result.status, verification_status)
         step = self._step_for_tool_result(graph, tool_name)
@@ -166,20 +174,34 @@ class TaskGraphManager:
         )
         return graph
 
-    def plan_steps(self, objective: str, step_names: list[str], session_id: str = "", turn_id: int = 0, planner_version: str = "planner_v1") -> TaskGraph:
-        graph = self.start_or_resume(objective, session_id=session_id, turn_id=turn_id)
+    def _graph_by_id(self, task_id: str) -> TaskGraph | None:
+        if not task_id:
+            return None
+        for graph in reversed(self.graphs):
+            if graph.task_id == task_id:
+                return graph
+        return None
+
+    def plan_steps(self, objective: str, step_names: list[str], session_id: str = "", turn_id: int = 0, planner_version: str = "planner_v1", step_specs: list[dict[str, Any]] | None = None, force_new: bool = False) -> TaskGraph:
+        graph = self.start_or_resume(objective, session_id=session_id, turn_id=turn_id, force_new=force_new)
         if graph.steps:
             emit_trace("planner.plan_reused", session_id=session_id, turn_id=turn_id, task_id=graph.task_id, step_count=len(graph.steps))
             return graph
-        for index, name in enumerate(step_names[:12], start=1):
+        specs = _normalize_step_specs(step_names, step_specs)
+        for index, spec in enumerate(specs[:12], start=1):
             graph.steps.append(
                 TaskStep(
                     step_id=f"step_{index}",
-                    name=name[:160],
+                    name=str(spec.get("name") or f"step {index}")[:160],
+                    kind=str(spec.get("kind") or "act")[:40],
                     status="planned",
                     planned=True,
-                    observe_policy=_observe_policy_for_name(name),
-                    evidence=["planned"],
+                    observe_policy=str(spec.get("observe_policy") or _observe_policy_for_name(str(spec.get("name") or "")))[:80],
+                    allowed_tools=[str(item)[:80] for item in (spec.get("allowed_tools") or [])[:12]],
+                    verification_policy=str(spec.get("verification_policy") or "optional")[:80],
+                    risk_level=str(spec.get("risk_level") or "low")[:40],
+                    done_condition=str(spec.get("done_condition") or "")[:240],
+                    evidence=["planned", f"kind:{str(spec.get('kind') or 'act')[:40]}"],
                 )
             )
         graph.planner_version = planner_version
@@ -189,14 +211,68 @@ class TaskGraphManager:
         emit_trace("planner.plan_created", session_id=session_id, turn_id=turn_id, task_id=graph.task_id, objective=graph.objective[:160], step_count=len(graph.steps), planner_version=planner_version)
         return graph
 
+    def mark_awaiting_plan_approval(self, session_id: str = "", turn_id: int = 0, reason: str = "complex_task_plan") -> TaskGraph | None:
+        graph = self.active()
+        if not graph:
+            return None
+        graph.status = "awaiting_plan_approval"
+        graph.updated_at = time.time()
+        self.save()
+        emit_trace("planner.awaiting_plan_approval", session_id=session_id, turn_id=turn_id, task_id=graph.task_id, reason=reason)
+        return graph
+
+    def approve_plan(self, session_id: str = "", turn_id: int = 0) -> TaskGraph | None:
+        graph = self.active()
+        if not graph or graph.status != "awaiting_plan_approval":
+            return None
+        graph.status = "active"
+        graph.updated_at = time.time()
+        self.save()
+        emit_trace("planner.plan_approved", session_id=session_id, turn_id=turn_id, task_id=graph.task_id)
+        return graph
+
+    def select_next_step(self, session_id: str = "", turn_id: int = 0) -> TaskStep | None:
+        graph = self.active()
+        if not graph:
+            return None
+        step = graph.next_pending_step()
+        if not step:
+            if graph.status in {"active", "awaiting_validation"}:
+                graph.status = "completed"
+                graph.updated_at = time.time()
+                self.save()
+                emit_trace("workflow.completed", session_id=session_id, turn_id=turn_id, task_id=graph.task_id, step_count=len(graph.steps))
+            return None
+        graph.current_step_index = max(0, graph.steps.index(step))
+        if step.status == "planned":
+            step.status = "running"
+            step.updated_at = time.time()
+            graph.updated_at = time.time()
+            self.save()
+        emit_trace(
+            "planner.next_step_selected",
+            session_id=session_id,
+            turn_id=turn_id,
+            task_id=graph.task_id,
+            step_id=step.step_id,
+            kind=step.kind,
+            status=step.status,
+            risk_level=step.risk_level,
+            observe_policy=step.observe_policy,
+        )
+        return step
+
     def append_plan_step(self, name: str, session_id: str = "", turn_id: int = 0) -> TaskGraph:
         graph = self.start_or_resume(name, session_id=session_id, turn_id=turn_id)
         step = TaskStep(
             step_id=f"step_{len(graph.steps) + 1}",
             name=name[:160],
+            kind="act",
             status="planned",
             planned=True,
             observe_policy=_observe_policy_for_name(name),
+            verification_policy="optional",
+            risk_level="low",
             evidence=["planned_append"],
         )
         graph.steps.append(step)
@@ -218,11 +294,17 @@ class TaskGraphManager:
 
     def assimilate_worker_results(self, results: list[dict[str, Any]], session_id: str = "", turn_id: int = 0) -> list[dict[str, Any]]:
         graph = self.active()
-        if not graph:
+        if not graph or graph.status == "awaiting_plan_approval":
             return []
         assimilated: list[dict[str, Any]] = []
         for result in results:
             job_id = str(result.get("job_id") or "")
+            metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+            target_task_id = str(metadata.get("task_id") or "")
+            if target_task_id and target_task_id != graph.task_id:
+                continue
+            if not target_task_id and not any(job_id in (step.worker_jobs or []) for step in graph.steps):
+                continue
             if not job_id or job_id in graph.assimilated_worker_jobs:
                 continue
             step = self._step_for_worker_result(graph, result)
@@ -278,7 +360,11 @@ class TaskGraphManager:
             f"steps: {len(graph.steps)}",
         ]
         if current:
-            lines.append(f"current_step: {current.step_id} {current.tool_name} {current.status}")
+            lines.append(f"current_step: {current.step_id} {current.kind} {current.tool_name or current.name} {current.status}")
+            if current.done_condition:
+                lines.append("done_condition: " + current.done_condition[:160])
+            if current.allowed_tools:
+                lines.append("allowed_tools: " + ", ".join(current.allowed_tools[:6]))
         if graph.created_files:
             lines.append("created_files: " + ", ".join(graph.created_files[-3:]))
         return "\n".join(lines)
@@ -350,6 +436,16 @@ def _graph_from_dict(item: dict[str, Any]) -> TaskGraph:
         steps.append(TaskStep(**{key: value for key, value in raw_step.items() if key in TaskStep.__dataclass_fields__}))
     fields = {key: value for key, value in item.items() if key in TaskGraph.__dataclass_fields__ and key != "steps"}
     return TaskGraph(**fields, steps=steps)
+
+
+def _normalize_step_specs(step_names: list[str], step_specs: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for raw in step_specs or []:
+        if isinstance(raw, dict) and raw.get("name"):
+            specs.append(dict(raw))
+    if specs:
+        return specs
+    return [{"name": name, "kind": "act", "observe_policy": _observe_policy_for_name(name)} for name in step_names]
 
 
 def _observe_policy_for_name(name: str) -> str:
@@ -426,9 +522,13 @@ def _created_file_candidates(tool_name: str, arguments: dict[str, Any], result: 
 def _recovery_evidence(result: ToolResult) -> list[str]:
     data = result.data if isinstance(result.data, dict) else {}
     recovery = data.get("recovered_from")
+    recovered = True
+    if not isinstance(recovery, dict):
+        recovery = data.get("recovery_attempted")
+        recovered = False
     if not isinstance(recovery, dict):
         return []
-    items = ["recovered"]
+    items = ["recovered" if recovered else "recovery_attempted"]
     reason = str(recovery.get("reason") or "")
     if reason:
         items.append(f"recovery:{reason}")

@@ -21,8 +21,11 @@ workspace/telegram_images/
 workspace/memory/chat_summary/rolling_summary.md
 workspace/assets/tg_images/
 workspace/assets/screenshots/
+workspace/assets/stickers/tg_sticker_*
 workspace/assets/social_sticker_index.json
 workspace/screenshot_*.png
+workspace/fullscreen_screenshot.png
+workspace/tasks/task_plan.md
 
 # Local generated app/project artifacts
 workspace/project/**/__pycache__/

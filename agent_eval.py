@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import time
 from collections import Counter
@@ -9,6 +10,7 @@ from typing import Any
 from agent_benchmark import load_latest_benchmark_report
 from agent_hooks import TRACE_LOG_FILE
 from agent_observability import load_trace_events
+from agent_presence import load_presence_health
 from core_tools import PROJECT_CACHE_DIR, ROOT_DIR
 
 
@@ -48,6 +50,7 @@ class LiveEvalReport:
     permission_policy: dict[str, Any] = field(default_factory=dict)
     render: dict[str, Any] = field(default_factory=dict)
     telegram: dict[str, Any] = field(default_factory=dict)
+    presence: dict[str, Any] = field(default_factory=dict)
     recent_errors: list[dict[str, Any]] = field(default_factory=list)
     repo_hygiene: dict[str, Any] = field(default_factory=dict)
     next_stage_gate: dict[str, Any] = field(default_factory=dict)
@@ -63,7 +66,11 @@ class LiveEvalReport:
             f"Permission replay: {self.permission_replay.get('success_rate', 1.0):.1%} success",
             f"Knowledge hit rate: {self.knowledge.get('hit_rate', 1.0):.1%} ({self.knowledge.get('hit_count', 0)}/{self.knowledge.get('search_count', 0)})",
             f"Workflow success rate: {self.workflow.get('success_rate', 1.0):.1%} ({self.workflow.get('completed_count', 0)}/{self.workflow.get('started_count', 0)})",
-            f"Self repair: {self.self_repair.get('trigger_count', 0)} triggers, deterministic {self.self_repair.get('deterministic_success_rate', 1.0):.1%} success",
+            (
+                f"Self repair: {self.self_repair.get('trigger_count', 0)} triggers, "
+                f"recovery {self.self_repair.get('success_count', 0)}/{self.self_repair.get('result_count', 0)} ok, "
+                f"deterministic {self.self_repair.get('deterministic_success_rate', 1.0):.1%} success"
+            ),
             f"Worker success rate: {self.worker.get('success_rate', 1.0):.1%} ({self.worker.get('done_count', 0)}/{self.worker.get('total_results', 0)})",
             f"Planner coverage: {self.planner.get('plan_count', 0)} plans, {self.planner.get('planned_step_count', 0)} planned steps",
             f"Verified waiting workflows: {self.workflow.get('verified_waiting_count', 0)}",
@@ -72,9 +79,21 @@ class LiveEvalReport:
             f"Task benchmark: {self.benchmark.get('passed', 0)}/{self.benchmark.get('total', 0)} passed ({self.benchmark.get('success_rate', 1.0):.1%})",
             f"Context budget: {self.context.get('last_total_after', 0)}/{self.context.get('last_max_chars', 0)} chars",
             f"Persona health: {self.persona.get('status', 'unknown')}",
-            f"Source health: {self.source_health.get('status', 'unknown')}",
+            (
+                f"Source health: {self.source_health.get('status', 'unknown')} "
+                f"({len(self.source_health.get('checked_files') or [])} files, "
+                f"{len(self.source_health.get('voice_samples_checked') or [])} voice samples)"
+            ),
             f"Permission policy: {self.permission_policy.get('status', 'unknown')}",
             f"Render dedupe: {self.render.get('deduped_count', 0)} artifacts deduped",
+            (
+                f"Presence: mode={self.presence.get('mode', 'unknown')}, "
+                f"candidates={self.presence.get('candidate_count', 0)}, "
+                f"shadow={self.presence.get('shadow_count', 0)}, "
+                f"sent={self.presence.get('sent_count', 0)}, "
+                f"suppressed={self.presence.get('suppressed_count', 0)}, "
+                f"composer={'on' if self.presence.get('composer_enabled') else 'off'}"
+            ),
             f"Repeated failure cases: {self.repeated_failure_count}",
             f"Repo hygiene: {self.repo_hygiene.get('status', 'unknown')}",
             f"Next-stage gate: {self.next_stage_gate.get('status', 'unknown')}",
@@ -282,6 +301,7 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
     source_health = check_user_facing_source_health()
     permission_policy = _permission_policy_health()
     render = _load_render_dedupe()
+    presence = load_presence_health()
     benchmark = load_latest_benchmark_report()
     started_count = len(workflow_started)
     completed_count = len(workflow_completed)
@@ -358,6 +378,7 @@ def build_live_eval_report(trace_path: str = TRACE_LOG_FILE, limit: int | None =
         permission_policy=permission_policy,
         render=render,
         telegram={"events": dict(sorted(telegram_events.items()))},
+        presence=presence,
         recent_errors=recent_errors[-10:],
         repo_hygiene=repo_hygiene,
         next_stage_gate=gate,
@@ -396,11 +417,13 @@ def _is_test_session(event: dict[str, Any]) -> bool:
     session_id = str(event.get("session_id") or "").casefold()
     history_file = str(event.get("history_file") or "").replace("\\", "/").casefold()
     markers = ("test", "self_test", "debug", "benchmark", "probe", "runtime_context", "route_voice")
+    artifact_history = any(history_file.endswith(suffix) for suffix in (".png.json", ".jpg.json", ".jpeg.json", ".webp.json", ".gif.json"))
     return (
         event_name.startswith("benchmark.")
         or
         any(marker in session_id for marker in markers)
         or any(marker in history_file for marker in markers)
+        or artifact_history
         or "workspace/history/" in history_file
     )
 
@@ -428,29 +451,111 @@ USER_FACING_SOURCE_FILES = (
     "agent_runtime_context.py",
     "agent_tool_runtime.py",
     "agent_tool_loop.py",
+    "agent_planner.py",
     "core_agent.py",
     "agent_llm.py",
     "main.py",
 )
 
-SOURCE_MOJIBAKE_MARKERS = ("鍓", "鐪", "绲", "鎴", "锛", "灞", "闆", "铻", "妯", "楹", "�")
+SOURCE_MOJIBAKE_MARKERS = ("\u9353", "\u942a", "\u7ef2", "\u93b4", "\u951b", "\u707a", "\u95c6", "\u94fb", "\u59af", "\u6965", "\ufffd")
 
 SOURCE_REQUIRED_PHRASES = {
-    "agent_user_voice.py": ("我先等你點頭", "可以", "繼續"),
+    "agent_user_voice.py": ("\u6211\u5148\u7b49\u4f60\u9ede\u982d", "\u53ef\u4ee5", "\u7e7c\u7e8c"),
     "agent_permission_replay.py": ("approved_tool_success_reply", "approved_tool_blocked_reply", "approved_tool_error_reply"),
-    "agent_outcome.py": ("有結果", "發給我", "分析一下", "繼續"),
-    "agent_latency.py": ("我先看一下", "我先處理一下", "收到"),
-    "agent_runtime_context.py": ("目前任務筆記", "目前步驟", "驗證結果"),
-    "agent_tool_runtime.py": ("你可以說「繼續」接回原任務",),
-    "agent_tool_loop.py": ("系統截圖",),
-    "core_agent.py": ("任務提醒",),
-    "agent_llm.py": ("目前任務筆記",),
+    "agent_outcome.py": ("\u6709\u7d50\u679c", "\u767c\u7d66\u6211", "\u5206\u6790\u4e00\u4e0b", "\u7e7c\u7e8c"),
+    "agent_latency.py": ("\u6211\u5148\u770b\u4e00\u4e0b", "\u6211\u5148\u8655\u7406\u4e00\u4e0b", "\u6536\u5230"),
+    "agent_runtime_context.py": ("\u76ee\u524d\u4efb\u52d9\u7b46\u8a18", "\u76ee\u524d\u6b65\u9a5f", "\u9a57\u8b49\u7d50\u679c"),
+    "agent_tool_runtime.py": ("\u4f60\u53ef\u4ee5\u8aaa\u300c\u7e7c\u7e8c\u300d\u63a5\u56de\u539f\u4efb\u52d9",),
+    "agent_tool_loop.py": ("\u7cfb\u7d71\u622a\u5716",),
+    "agent_planner.py": ("\u4fee", "\u6e2c\u8a66", "\u622a\u5716", "\u7e7c\u7e8c"),
+    "core_agent.py": ("\u4efb\u52d9\u63d0\u9192",),
+    "agent_llm.py": ("YueYue",),
 }
 
+
+USER_VISIBLE_INTERNAL_LEAK_MARKERS = (
+    "route policy",
+    "chat route",
+    "screen_observe",
+    "tool_task",
+    "social_sticker",
+    "skipped by",
+    "response policy",
+    "loop controller",
+    "tool_not_allowed_for_route",
+)
+
+
+def runtime_voice_samples() -> dict[str, str]:
+    from agent_latency import InteractionMode, quick_ack_for
+    from agent_user_voice import (
+        approved_tool_blocked_reply,
+        approved_tool_error_reply,
+        approved_tool_success_reply,
+        empty_reply_fallback,
+        failsafe_reply,
+        failure_replay_reply,
+        friendly_tool_block,
+        permission_request_reply,
+        repeated_tool_stop_reply,
+        tool_loop_timeout_reply,
+    )
+    from core_tools import ToolResult
+
+    return {
+        "friendly_execute_python": friendly_tool_block("execute_python"),
+        "friendly_media": friendly_tool_block("analyze_media"),
+        "friendly_retry_hint": friendly_tool_block("read_file", ToolResult("blocked", "Need a cleaner path.", data={"retry_hint": "\u8acb\u63db\u4e00\u500b\u6a94\u6848\u8def\u5f91\u3002"})),
+        "repeated_tool": repeated_tool_stop_reply("execute_python", "case_1"),
+        "failsafe": failsafe_reply(" [\u7cfb\u7d71\u622a\u5716: screen.png]"),
+        "failure_replay": failure_replay_reply("execute_command", "case_2", "trace.jsonl"),
+        "timeout": tool_loop_timeout_reply(),
+        "empty": empty_reply_fallback(),
+        "permission": permission_request_reply("execute_command"),
+        "approved_success": approved_tool_success_reply("execute_python", "Python completed.", "stdout: ok", True),
+        "approved_blocked": approved_tool_blocked_reply("execute_python", ToolResult("blocked", "needs permission", requires_permission=True)),
+        "approved_error": approved_tool_error_reply("execute_python", ToolResult("error", "Python failed.", error="RuntimeError: boom")),
+        "quick_ack_vision": quick_ack_for(InteractionMode.VISION_TASK),
+        "quick_ack_tool": quick_ack_for(InteractionMode.TOOL_TASK),
+        "quick_ack_screen": quick_ack_for(InteractionMode.SCREEN_OBSERVE),
+    }
+
+
+
+
+def _source_text_variants(text: str) -> list[str]:
+    variants = [text]
+    decoded = _decode_unicode_escape_markers(text)
+    if decoded != text:
+        variants.append(decoded)
+    return variants
+
+
+def _phrase_in_source(phrase: str, text: str) -> bool:
+    return any(phrase in variant for variant in _source_text_variants(text))
+
+
+def _decode_unicode_escape_markers(text: str) -> str:
+    def repl_short(match: Any) -> str:
+        return chr(int(match.group(1), 16))
+
+    def repl_long(match: Any) -> str:
+        return chr(int(match.group(1), 16))
+
+    text = re.sub(r"\\u([0-9a-fA-F]{4})", repl_short, text)
+    return re.sub(r"\\U([0-9a-fA-F]{8})", repl_long, text)
 
 def check_user_facing_source_health(root_dir: str = ROOT_DIR) -> dict[str, Any]:
     checked: list[str] = []
     issues: list[dict[str, Any]] = []
+    for filename, phrases in SOURCE_REQUIRED_PHRASES.items():
+        if not isinstance(phrases, tuple):
+            issues.append({"file": filename, "kind": "invalid_required_phrase_config"})
+            continue
+        for phrase in phrases:
+            markers = [marker for marker in SOURCE_MOJIBAKE_MARKERS if marker in phrase]
+            if markers:
+                issues.append({"file": filename, "kind": "mojibake_required_phrase", "phrase": phrase, "markers": markers[:8]})
     for filename in USER_FACING_SOURCE_FILES:
         path = os.path.join(root_dir, filename)
         checked.append(filename)
@@ -466,13 +571,31 @@ def check_user_facing_source_health(root_dir: str = ROOT_DIR) -> dict[str, Any]:
             continue
         if "????" in text:
             issues.append({"file": filename, "kind": "question_mark_mojibake"})
-        markers = [marker for marker in SOURCE_MOJIBAKE_MARKERS if marker in text]
+        variants = _source_text_variants(text)
+        markers = [marker for marker in SOURCE_MOJIBAKE_MARKERS if any(marker in variant for variant in variants)]
         if markers:
             issues.append({"file": filename, "kind": "mojibake_markers", "markers": markers[:8]})
         for phrase in SOURCE_REQUIRED_PHRASES.get(filename, ()):
-            if phrase not in text:
+            if not _phrase_in_source(phrase, text):
                 issues.append({"file": filename, "kind": "missing_phrase", "phrase": phrase})
-    return {"status": "pass" if not issues else "fail", "checked_files": checked, "issues": issues[:20]}
+    samples_checked: list[str] = []
+    try:
+        samples = runtime_voice_samples()
+    except Exception as exc:
+        issues.append({"file": "runtime_voice", "kind": "sample_generation_failed", "message": str(exc)})
+        samples = {}
+    for sample_name, sample_text in samples.items():
+        samples_checked.append(sample_name)
+        text = str(sample_text or "")
+        if "????" in text:
+            issues.append({"file": "runtime_voice", "sample": sample_name, "kind": "question_mark_mojibake"})
+        markers = [marker for marker in SOURCE_MOJIBAKE_MARKERS if marker in text]
+        if markers:
+            issues.append({"file": "runtime_voice", "sample": sample_name, "kind": "mojibake_markers", "markers": markers[:8]})
+        leaks = [marker for marker in USER_VISIBLE_INTERNAL_LEAK_MARKERS if marker in text.casefold()]
+        if leaks:
+            issues.append({"file": "runtime_voice", "sample": sample_name, "kind": "internal_policy_leak", "markers": leaks[:8]})
+    return {"status": "pass" if not issues else "fail", "checked_files": checked, "voice_samples_checked": samples_checked, "issues": issues[:20]}
 
 
 def _load_persona_health() -> dict[str, Any]:

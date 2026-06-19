@@ -1,8 +1,9 @@
-import json
+﻿import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from agent_hooks import TRACE_LOG_FILE
+from agent_reply_composer import ReplyComposer, ReplyEvent
 from agent_replay import record_failure_replay
 from agent_self_recovery import self_repair_instruction, should_prompt_self_repair
 from agent_user_voice import empty_reply_fallback, failsafe_reply, failure_replay_reply, friendly_tool_block, repeated_tool_stop_reply, tool_loop_timeout_reply
@@ -47,6 +48,7 @@ class ToolLoopController:
         remember_turn_summary: Callable[[str, str], None],
         save_history: Callable[[], None],
         reset_turn_state: Callable[[], None],
+        reply_composer: ReplyComposer | None = None,
         session_id: str,
         turn_id: int,
     ):
@@ -65,13 +67,14 @@ class ToolLoopController:
         self.remember_turn_summary = remember_turn_summary
         self.save_history = save_history
         self.reset_turn_state = reset_turn_state
+        self.reply_composer = reply_composer or ReplyComposer()
         self.session_id = session_id
         self.turn_id = turn_id
 
     def run(self, memory: list[dict[str, Any]], user_input_for_summary: str, tool_callback: Callable | None) -> ToolLoopResult:
         total_reasoning = ""
         successful_tools: list[str] = []
-        tool_call_counts: dict[str, int] = {}
+        repeat_state: dict[str, Any] = {"last_signature": "", "consecutive_count": 0}
         repair_prompted_signatures: set[str] = set()
 
         for _ in range(self.response_policy.max_tool_iterations):
@@ -83,7 +86,7 @@ class ToolLoopController:
             tool_calls = response.get("tool_calls") or []
             if tool_calls:
                 memory.append(self._assistant_tool_call_message(response, tool_calls))
-                stopped = self._run_tool_calls(memory, tool_calls, tool_callback, user_input_for_summary, total_reasoning, successful_tools, tool_call_counts, repair_prompted_signatures)
+                stopped = self._run_tool_calls(memory, tool_calls, tool_callback, user_input_for_summary, total_reasoning, successful_tools, repeat_state, repair_prompted_signatures)
                 if stopped is not None:
                     return stopped
                 continue
@@ -117,15 +120,19 @@ class ToolLoopController:
         user_input_for_summary: str,
         total_reasoning: str,
         successful_tools: list[str],
-        tool_call_counts: dict[str, int],
+        repeat_state: dict[str, Any],
         repair_prompted_signatures: set[str],
     ) -> ToolLoopResult | None:
         for call in tool_calls:
             arguments = call.get("arguments", {})
             signature = tool_signature(call["name"], arguments)
-            tool_call_counts[signature] = tool_call_counts.get(signature, 0) + 1
-            if tool_call_counts[signature] > max(1, self.response_policy.max_repeated_tool_calls):
-                return self._stop_repeated_tool(memory, call, arguments, tool_call_counts[signature], user_input_for_summary, total_reasoning)
+            if repeat_state.get("last_signature") == signature:
+                repeat_state["consecutive_count"] = int(repeat_state.get("consecutive_count") or 0) + 1
+            else:
+                repeat_state["last_signature"] = signature
+                repeat_state["consecutive_count"] = 1
+            if repeat_state["consecutive_count"] > max(1, self.response_policy.max_repeated_tool_calls):
+                return self._stop_repeated_tool(memory, call, arguments, repeat_state["consecutive_count"], user_input_for_summary, total_reasoning)
 
             result = self.executor.execute(call["name"], arguments, tool_callback, self.response_policy)
             result, _recovery = self.recover_tool_result(call["name"], arguments, result, tool_callback, self.response_policy)
@@ -142,7 +149,7 @@ class ToolLoopController:
             if result.status == "blocked":
                 if result.requires_permission:
                     self.session_brain.mark_permission_needed(call["name"], self.turn_id, self.session_id)
-                    return None
+                    return self._stop_permission_request(memory, call, result, user_input_for_summary, total_reasoning)
                 return self._stop_route_block(memory, call, result, user_input_for_summary, total_reasoning)
             if result.status == "error" and self._maybe_prompt_self_repair(memory, call, arguments, result, signature, repair_prompted_signatures):
                 continue
@@ -176,7 +183,17 @@ class ToolLoopController:
         repeated_result = ToolResult("error", "Repeated tool call stopped.", error="repeated_tool_call")
         replay_case = record_failure_replay(call["name"], arguments, repeated_result, session_id=self.session_id, turn_id=self.turn_id, count=count)
         self.task_graphs.mark_blocked("repeated tool call stopped", self.session_id, self.turn_id, tool_name=call["name"], arguments=arguments, result=repeated_result)
-        final_reply = repeated_tool_stop_reply(call["name"], replay_case.get("name", ""))
+        fallback = repeated_tool_stop_reply(call["name"], replay_case.get("name", ""))
+        final_reply = self.reply_composer.compose(
+            ReplyEvent(
+                "repeated_tool_stop",
+                user_input=user_input,
+                tool_name=call["name"],
+                reason="same tool and arguments repeated in one step",
+                extra={"replay_name": replay_case.get("name", ""), "count": count},
+            ),
+            fallback,
+        )
         self._clear_transient_self_repair(memory)
         memory.append({"role": "assistant", "content": final_reply})
         self.reset_turn_state()
@@ -190,7 +207,10 @@ class ToolLoopController:
         tag = f" [系統截圖: {screen}]" if screen else ""
         result_text = ToolResult("error", f"Fail-safe triggered. Stop all actions immediately.{tag}").to_text()
         memory.append({"role": "tool", "tool_call_id": call["id"], "name": call["name"], "content": result_text})
-        final_reply = failsafe_reply(tag)
+        final_reply = self.reply_composer.compose(
+            ReplyEvent("failsafe", user_input=user_input, tool_name=call["name"], reason="fail-safe triggered", extra={"tag": tag}),
+            failsafe_reply(tag),
+        )
         self._clear_transient_self_repair(memory)
         memory.append({"role": "assistant", "content": final_reply})
         self.reset_turn_state()
@@ -199,7 +219,18 @@ class ToolLoopController:
         return ToolLoopResult(final_reply, total_reasoning.strip())
 
     def _stop_failure_replay(self, memory: list[dict[str, Any]], call: dict[str, Any], replay_case: dict[str, Any], user_input: str, total_reasoning: str) -> ToolLoopResult:
-        final_reply = failure_replay_reply(call["name"], replay_case.get("name", ""), TRACE_LOG_FILE)
+        fallback = failure_replay_reply(call["name"], replay_case.get("name", ""), TRACE_LOG_FILE)
+        final_reply = self.reply_composer.compose(
+            ReplyEvent(
+                "tool_error",
+                user_input=user_input,
+                tool_name=call["name"],
+                result=ToolResult("error", "Tool failed repeatedly.", error="failure_replay"),
+                reason="failure replay generated",
+                extra={"replay_name": replay_case.get("name", "")},
+            ),
+            fallback,
+        )
         self._clear_transient_self_repair(memory)
         memory.append({"role": "assistant", "content": final_reply})
         self.reset_turn_state()
@@ -209,11 +240,48 @@ class ToolLoopController:
         return ToolLoopResult(final_reply, total_reasoning.strip())
 
     def _stop_route_block(self, memory: list[dict[str, Any]], call: dict[str, Any], result: ToolResult, user_input: str, total_reasoning: str) -> ToolLoopResult:
-        final_reply = friendly_tool_block(call["name"], result, getattr(self.response_policy, "route", ""))
+        fallback = friendly_tool_block(call["name"], result, getattr(self.response_policy, "route", ""))
+        final_reply = self.reply_composer.compose(
+            ReplyEvent(
+                "tool_error",
+                user_input=user_input,
+                tool_name=call["name"],
+                result=result,
+                reason="tool blocked by route or policy",
+                next_action="ask owner for a clearer task or continue the active task if appropriate",
+            ),
+            fallback,
+        )
+        reply_decision = self.hooks.emit("BeforeReply", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
+        if reply_decision.annotate:
+            final_reply += reply_decision.annotate
         self._clear_transient_self_repair(memory)
         memory.append({"role": "assistant", "content": final_reply})
         self.reset_turn_state()
         self.hooks.emit("StopFailure", session_id=self.session_id, turn_id=self.turn_id, tool=call["name"], reason="route_policy_block")
+        self.remember_turn_summary(user_input, final_reply)
+        self.save_history()
+        return ToolLoopResult(final_reply, total_reasoning.strip())
+
+    def _stop_permission_request(self, memory: list[dict[str, Any]], call: dict[str, Any], result: ToolResult, user_input: str, total_reasoning: str) -> ToolLoopResult:
+        fallback = result.message or f"`{call['name']}` 這一步需要你確認一下喔。你回「可以」我就繼續剛剛那一步。"
+        final_reply = self.reply_composer.compose(
+            ReplyEvent(
+                "permission_request",
+                user_input=user_input,
+                tool_name=call["name"],
+                result=result,
+                risk="guarded",
+                next_action="owner can approve with 可以",
+            ),
+            fallback,
+        )
+        reply_decision = self.hooks.emit("BeforeReply", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160])
+        if reply_decision.annotate:
+            final_reply += reply_decision.annotate
+        self._clear_transient_self_repair(memory)
+        memory.append({"role": "assistant", "content": final_reply})
+        self.hooks.emit("Stop", session_id=self.session_id, turn_id=self.turn_id, content_preview=final_reply[:160], reason="permission_request")
         self.remember_turn_summary(user_input, final_reply)
         self.save_history()
         return ToolLoopResult(final_reply, total_reasoning.strip())
@@ -236,7 +304,10 @@ class ToolLoopController:
         return ToolLoopResult(final_reply, total_reasoning.strip())
 
     def _timeout(self, memory: list[dict[str, Any]], user_input: str, total_reasoning: str) -> ToolLoopResult:
-        timeout_msg = tool_loop_timeout_reply()
+        timeout_msg = self.reply_composer.compose(
+            ReplyEvent("timeout", user_input=user_input, reason="tool loop reached iteration budget"),
+            tool_loop_timeout_reply(),
+        )
         self._clear_transient_self_repair(memory)
         memory.append({"role": "assistant", "content": timeout_msg})
         self.reset_turn_state()

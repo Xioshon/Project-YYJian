@@ -1,5 +1,6 @@
 import base64
 import fnmatch
+import html
 import json
 import mimetypes
 import os
@@ -530,10 +531,31 @@ def real_read_webpage(url: str) -> ToolResult:
     if not re.match(r"^https?://", url or "", flags=re.IGNORECASE):
         return _error("URL must start with http:// or https://.")
     try:
+        from agent_url_context import VIDEO_SOCIAL_PLATFORMS, classify_url_platform, human_failure_reason, inspect_url
+
+        platform = classify_url_platform(url)
+        if platform in VIDEO_SOCIAL_PLATFORMS:
+            entry = inspect_url(url, depth="preview")
+            message = "URL inspected." if entry.status == "ok" else "URL preview is limited."
+            data = entry.to_dict()
+            if entry.failure_reason:
+                data["human_failure_reason"] = human_failure_reason(entry.failure_reason)
+            return _ok(message, data)
+    except Exception:
+        pass
+    try:
         response = requests.get("https://r.jina.ai/" + url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
         if response.ok and response.text.strip():
             return _ok("Webpage read.", truncate_text(response.text, 8000))
-        return _error(f"Reader returned HTTP {response.status_code}.", response.text[:500])
+        clean_error = html.unescape(response.text or "")
+        try:
+            payload = json.loads(clean_error)
+            clean_error = payload.get("readableMessage") or payload.get("message") or clean_error
+        except Exception:
+            pass
+        if re.search(r"bad network reputation|anonymous queries|authenticate|40103", clean_error, flags=re.IGNORECASE):
+            return _error("Reader service requires authentication or was blocked by network reputation.", "reader_service_blocked")
+        return _error(f"Reader returned HTTP {response.status_code}.", truncate_text(clean_error, 500))
     except Exception as exc:
         return _error("Failed to read webpage.", str(exc))
 
@@ -934,6 +956,38 @@ def real_reindex_workspace() -> ToolResult:
         return _error("Knowledge reindex failed.", str(exc))
 
 
+def real_inspect_url(url: str, depth: str = "auto") -> ToolResult:
+    try:
+        from agent_url_context import inspect_url
+
+        depth = depth if depth in {"metadata", "auto", "preview", "full"} else "auto"
+        entry = inspect_url(url, depth=depth)
+        return _ok("URL inspected.", entry.to_dict())
+    except Exception as exc:
+        return _error("URL inspection failed.", str(exc))
+
+
+def real_read_url_context(url_or_id: str) -> ToolResult:
+    try:
+        from agent_url_context import read_url_context
+
+        entry = read_url_context(url_or_id)
+        if not entry:
+            return _ok("URL context not found.", {"url_or_id": url_or_id})
+        return _ok("URL context loaded.", entry.to_dict())
+    except Exception as exc:
+        return _error("URL context read failed.", str(exc))
+
+
+def real_reindex_url_cache() -> ToolResult:
+    try:
+        from agent_url_context import reindex_url_cache
+
+        return _ok("URL cache indexed.", reindex_url_cache())
+    except Exception as exc:
+        return _error("URL cache index failed.", str(exc))
+
+
 get_screen_ui_tool = AgentTool("get_screen_ui", "Inspect visible UI controls on the active window.", real_get_screen_ui, {"type": "object", "properties": {}}, False)
 click_ui_element_tool = AgentTool("click_ui_element", "Click an element id returned by get_screen_ui.", real_click_ui_element, {"type": "object", "properties": {"element_id": {"type": "string"}, "double_click": {"type": "boolean"}}, "required": ["element_id"]}, True)
 type_keyboard_tool = AgentTool("type_keyboard", "Type text into the active UI using clipboard paste.", real_type_keyboard, {"type": "object", "properties": {"text": {"type": "string"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}, True)
@@ -944,7 +998,13 @@ list_files_tool = AgentTool("list_files", "List files under the workspace.", rea
 search_in_files_tool = AgentTool("search_in_files", "Search text files under the workspace.", real_search_in_files, {"type": "object", "properties": {"keyword": {"type": "string"}, "directory": {"type": "string"}}, "required": ["keyword"]}, False)
 execute_async_command_tool = AgentTool("execute_async_command", "Run a shell command in the background and save its output.", real_execute_async_command, {"type": "object", "properties": {"command": {"type": "string"}, "task_name": {"type": "string"}}, "required": ["command", "task_name"]}, True)
 search_tool = AgentTool("web_search", "Search the web.", real_web_search, {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}, False)
-read_webpage_tool = AgentTool("read_webpage", "Read a webpage as text.", real_read_webpage, {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}, False)
+read_webpage_tool = AgentTool(
+    "read_webpage",
+    "Read a generic webpage as text. For video/social URLs such as Douyin, Bilibili, YouTube, Instagram, X/Twitter, prefer inspect_url.",
+    real_read_webpage,
+    {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+    False,
+)
 download_file_tool = AgentTool("download_file", "Download a URL into the workspace.", real_download_file, {"type": "object", "properties": {"url": {"type": "string"}, "filename": {"type": "string"}}, "required": ["url", "filename"]}, True)
 analyze_media_tool = AgentTool("analyze_media", "Analyze a local image file.", real_analyze_media, {"type": "object", "properties": {"file_path": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["file_path"]}, False)
 read_file_tool = AgentTool("read_file", "Read a text file.", real_read_file, {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]}, False)
@@ -960,6 +1020,9 @@ search_sticker_tool = AgentTool("search_sticker", "Search local sticker filename
 search_knowledge_tool = AgentTool("search_knowledge", "Search the local engineering knowledge index.", real_search_knowledge, {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}, False)
 read_knowledge_tool = AgentTool("read_knowledge", "Read one local engineering knowledge chunk by id.", real_read_knowledge, {"type": "object", "properties": {"chunk_id": {"type": "string"}}, "required": ["chunk_id"]}, False)
 reindex_workspace_tool = AgentTool("reindex_workspace", "Rebuild the local engineering knowledge index.", real_reindex_workspace, {"type": "object", "properties": {}}, False)
+inspect_url_tool = AgentTool("inspect_url", "Inspect a URL with cached metadata and optional preview.", real_inspect_url, {"type": "object", "properties": {"url": {"type": "string"}, "depth": {"type": "string", "enum": ["metadata", "auto", "preview", "full"]}}, "required": ["url"]}, False)
+read_url_context_tool = AgentTool("read_url_context", "Read cached URL context by URL or cache id.", real_read_url_context, {"type": "object", "properties": {"url_or_id": {"type": "string"}}, "required": ["url_or_id"]}, False)
+reindex_url_cache_tool = AgentTool("reindex_url_cache", "Reload the local URL context cache.", real_reindex_url_cache, {"type": "object", "properties": {}}, False)
 
 ALL_TOOLS = [
     get_screen_ui_tool,
@@ -988,4 +1051,7 @@ ALL_TOOLS = [
     search_knowledge_tool,
     read_knowledge_tool,
     reindex_workspace_tool,
+    inspect_url_tool,
+    read_url_context_tool,
+    reindex_url_cache_tool,
 ]

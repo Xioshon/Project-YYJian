@@ -9,6 +9,12 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+
 $LogDir = Join-Path $Root "workspace\logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $LogFile = Join-Path $LogDir ("startup_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
@@ -56,8 +62,8 @@ function Test-ProcessAlive {
         return $false
     }
     try {
-        $process = Get-Process -Id $ProcessId -ErrorAction Stop
-        return -not $process.HasExited
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+        return $null -ne $process
     } catch {
         return $false
     }

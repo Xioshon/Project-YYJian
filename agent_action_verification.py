@@ -24,6 +24,7 @@ def verify_action(tool_name: str, arguments: dict[str, Any], result: ToolResult,
         details = {"tool_message": result.message}
         if recovery:
             details["recovery"] = recovery
+            details["recovery_attempted"] = True
         verification = ActionVerificationResult(tool_name, "fail", f"tool status is {result.status}", details)
         _emit(verification, session_id, turn_id)
         return verification
@@ -72,4 +73,7 @@ def _emit(verification: ActionVerificationResult, session_id: str, turn_id: int)
 def _recovery_from_result(result: ToolResult) -> dict[str, Any]:
     data = result.data if isinstance(result.data, dict) else {}
     recovery = data.get("recovered_from")
+    if isinstance(recovery, dict):
+        return recovery
+    recovery = data.get("recovery_attempted")
     return recovery if isinstance(recovery, dict) else {}

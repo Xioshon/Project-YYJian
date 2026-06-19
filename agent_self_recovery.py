@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
@@ -66,6 +67,7 @@ class RecoveryPlan:
     retry_args: dict[str, Any] | None = None
     max_attempts: int = 1
     requires_same_tool: bool = True
+    tool_name: str = ""
     details: dict[str, Any] = field(default_factory=dict)
 
 
@@ -93,6 +95,17 @@ class RecoveryEvidence:
         }
 
 
+class RepairPlanner:
+    """Produces ordered, safe recovery candidates for a failed tool result."""
+
+    def __init__(self, max_transient_retries: int = 2):
+        self.max_transient_retries = max(0, min(int(max_transient_retries), 3))
+
+    def candidates(self, tool_name: str, arguments: dict[str, Any], result: ToolResult, diagnosis: ErrorDiagnosis | None = None) -> list[RecoveryPlan]:
+        diagnosis = diagnosis or diagnose_tool_error(tool_name, arguments or {}, result)
+        return plan_recovery_candidates(tool_name, arguments or {}, result, diagnosis, self.max_transient_retries)
+
+
 class SelfRecoveryController:
     """Deterministic, bounded tool recovery before asking the owner for help."""
 
@@ -101,6 +114,7 @@ class SelfRecoveryController:
         self.hooks = hooks
         self.session_id = session_id
         self.max_transient_retries = max(0, min(int(max_transient_retries), 3))
+        self.planner = RepairPlanner(self.max_transient_retries)
         self._attempted: set[str] = set()
 
     def recover(
@@ -124,18 +138,51 @@ class SelfRecoveryController:
                 safe_to_auto_repair=safe_retry,
                 evidence={**diagnosis.evidence, "safe_exact_retry": safe_retry},
             )
-        plan = plan_recovery(tool_name, arguments, result, diagnosis, self.max_transient_retries)
-        if plan is None:
+        plans = self.planner.candidates(tool_name, arguments, result, diagnosis)
+        if not plans:
             return result, None
 
-        if plan.strategy == "cwd_retry":
-            return self._recover_command_cwd(tool_name, arguments, result, tool_callback, response_policy, turn_id, diagnosis, plan)
+        last_skipped = False
+        failed_attempts: list[dict[str, Any]] = []
+        for plan in plans:
+            target_tool = plan.tool_name or tool_name
+            if self._has_attempted(target_tool, plan.retry_args or arguments, plan.strategy):
+                last_skipped = True
+                continue
 
-        if plan.strategy == "screenshot_capture_fallback":
-            return self._recover_missing_python_dependency(tool_name, arguments, result, tool_callback, response_policy, turn_id, diagnosis, plan)
+            if plan.strategy in {"cwd_retry", "command_file_probe"}:
+                recovered, evidence = self._recover_command_cwd(tool_name, arguments, result, tool_callback, response_policy, turn_id, diagnosis, plan)
+            elif plan.strategy in {"screenshot_capture_fallback", "screen_ui_snapshot_fallback"}:
+                recovered, evidence = self._recover_missing_python_dependency(tool_name, arguments, result, tool_callback, response_policy, turn_id, diagnosis, plan)
+            elif plan.strategy == "transient_retry":
+                recovered, evidence = self._recover_transient(tool_name, arguments, result, tool_callback, response_policy, turn_id, diagnosis, plan)
+            else:
+                continue
 
-        if plan.strategy == "transient_retry":
-            return self._recover_transient(tool_name, arguments, result, tool_callback, response_policy, turn_id, diagnosis, plan)
+            if recovered.status == "ok":
+                if failed_attempts and isinstance(recovered.data, dict):
+                    recovered.data.setdefault("prior_recovery_attempts", failed_attempts)
+                return recovered, evidence
+            if evidence:
+                failed_attempts.append(evidence)
+            if len(plans) == 1:
+                return recovered, evidence
+
+        if last_skipped:
+            self.hooks.emit("SelfRecoverySkipped", session_id=self.session_id, turn_id=turn_id, tool=tool_name, reason="all_candidates_already_attempted")
+
+        if failed_attempts:
+            exhausted = RecoveryEvidence(
+                reason="repair_planner_exhausted",
+                original_status=result.status,
+                original_message=result.message,
+                original_error=result.error,
+                attempts=sum(int(item.get("attempts") or 0) for item in failed_attempts),
+                retry_status=str(failed_attempts[-1].get("retry_status") or "error"),
+                retry_message=str(failed_attempts[-1].get("retry_message") or ""),
+                details={"candidate_attempts": failed_attempts},
+            )
+            return _with_recovery_attempt(result, exhausted), exhausted.to_dict()
 
         return result, None
 
@@ -156,7 +203,8 @@ class SelfRecoveryController:
         retry_hint = str(data.get("retry_hint") or "")
         original_cwd = str(arguments.get("cwd") or data.get("cwd") or "project")
         retry_args = dict(plan.retry_args)
-        key = self._key(tool_name, retry_args, plan.strategy)
+        target_tool = plan.tool_name or tool_name
+        key = self._key(target_tool, retry_args, plan.strategy)
         if key in self._attempted:
             return result, None
         self._attempted.add(key)
@@ -176,7 +224,7 @@ class SelfRecoveryController:
             },
         )
         self._emit_attempt(tool_name, turn_id, evidence)
-        recovered = self.executor.execute(tool_name, retry_args, tool_callback, _recovery_policy(response_policy))
+        recovered = self.executor.execute(target_tool, retry_args, tool_callback, _recovery_policy(response_policy))
         evidence.retry_status = recovered.status
         evidence.retry_message = recovered.message
         if isinstance(recovered.data, dict):
@@ -184,7 +232,7 @@ class SelfRecoveryController:
         self._emit_result(tool_name, turn_id, evidence)
         if recovered.status == "ok":
             return recovered, evidence.to_dict()
-        return result, evidence.to_dict()
+        return _with_recovery_attempt(result, evidence), evidence.to_dict()
 
     def _recover_missing_python_dependency(
         self,
@@ -197,11 +245,12 @@ class SelfRecoveryController:
         diagnosis: ErrorDiagnosis | None = None,
         plan: RecoveryPlan | None = None,
     ) -> tuple[ToolResult, dict[str, Any] | None]:
-        if tool_name != "execute_python" or plan is None or not plan.retry_args:
+        if tool_name != "execute_python" or plan is None:
             return result, None
+        target_tool = plan.tool_name or tool_name
         diagnosis = diagnosis or diagnose_tool_error(tool_name, arguments, result)
-        retry_args = dict(plan.retry_args)
-        key = self._key(tool_name, retry_args, plan.strategy)
+        retry_args = dict(plan.retry_args or {})
+        key = self._key(target_tool, retry_args, plan.strategy)
         if key in self._attempted:
             return result, None
         self._attempted.add(key)
@@ -214,7 +263,7 @@ class SelfRecoveryController:
             details={"strategy": plan.strategy, "diagnosis": diagnosis.category, **diagnosis.evidence, **plan.details},
         )
         self._emit_attempt(tool_name, turn_id, evidence)
-        recovered = self.executor.execute(tool_name, retry_args, tool_callback, _recovery_policy(response_policy))
+        recovered = self.executor.execute(target_tool, retry_args, tool_callback, _recovery_policy(response_policy))
         evidence.retry_status = recovered.status
         evidence.retry_message = recovered.message
         if isinstance(recovered.data, dict):
@@ -222,7 +271,7 @@ class SelfRecoveryController:
         self._emit_result(tool_name, turn_id, evidence)
         if recovered.status == "ok":
             return recovered, evidence.to_dict()
-        return result, evidence.to_dict()
+        return _with_recovery_attempt(result, evidence), evidence.to_dict()
 
     def _recover_transient(
         self,
@@ -265,7 +314,7 @@ class SelfRecoveryController:
             if not self._is_transient(recovered):
                 break
         self._emit_result(tool_name, turn_id, evidence)
-        return result, evidence.to_dict()
+        return _with_recovery_attempt(result, evidence), evidence.to_dict()
 
     def _can_retry_exactly(self, tool_name: str, arguments: dict[str, Any]) -> bool:
         if tool_name in IDEMPOTENT_RETRY_TOOLS:
@@ -286,6 +335,9 @@ class SelfRecoveryController:
 
     def _key(self, tool_name: str, arguments: dict[str, Any], reason: str) -> str:
         return f"{reason}:{tool_name}:{repr(sorted((arguments or {}).items()))[:1000]}"
+
+    def _has_attempted(self, tool_name: str, arguments: dict[str, Any], reason: str) -> bool:
+        return self._key(tool_name, arguments, reason) in self._attempted
 
 
 def diagnose_tool_error(tool_name: str, arguments: dict[str, Any], result: ToolResult) -> ErrorDiagnosis:
@@ -350,18 +402,44 @@ def plan_recovery(
     diagnosis: ErrorDiagnosis,
     max_transient_retries: int = 2,
 ) -> RecoveryPlan | None:
+    candidates = plan_recovery_candidates(tool_name, arguments, result, diagnosis, max_transient_retries)
+    return candidates[0] if candidates else None
+
+
+def plan_recovery_candidates(
+    tool_name: str,
+    arguments: dict[str, Any],
+    result: ToolResult,
+    diagnosis: ErrorDiagnosis,
+    max_transient_retries: int = 2,
+) -> list[RecoveryPlan]:
     if not diagnosis.safe_to_auto_repair:
-        return None
+        return []
 
     if diagnosis.category == "cwd_or_path_mismatch" and tool_name == "execute_command":
         retry_args = dict(arguments or {})
         retry_args["cwd"] = "project"
-        return RecoveryPlan(
-            strategy="cwd_retry",
-            reason="cwd_retry",
-            retry_args=retry_args,
-            details={"retry_cwd": "project"},
-        )
+        candidates = [
+            RecoveryPlan(
+                strategy="cwd_retry",
+                reason="cwd_retry",
+                retry_args=retry_args,
+                details={"retry_cwd": "project", "candidate_order": 1},
+            )
+        ]
+        probe_args = _command_file_probe_args(str((arguments or {}).get("command") or ""))
+        if probe_args:
+            candidates.append(
+                RecoveryPlan(
+                    strategy="command_file_probe",
+                    reason="command_file_probe",
+                    retry_args=probe_args,
+                    requires_same_tool=False,
+                    tool_name="execute_python",
+                    details={"candidate_order": 2, "probe": "referenced_files"},
+                )
+            )
+        return candidates
 
     if diagnosis.category in {"missing_python_module", "screenshot_python_failure"} and tool_name == "execute_python":
         module_name = str(diagnosis.evidence.get("missing_module") or diagnosis.detail)
@@ -371,23 +449,35 @@ def plan_recovery(
                 timeout = min(max(1, int((arguments or {}).get("timeout") or 30)), 30)
             except Exception:
                 timeout = 30
-            return RecoveryPlan(
-                strategy="screenshot_capture_fallback",
-                reason="screenshot_capture_fallback",
-                retry_args={"code": _mss_screenshot_fallback_code(fallback_path), "timeout": timeout},
-                details={"fallback_path": fallback_path, "missing_module": module_name},
-            )
+            return [
+                RecoveryPlan(
+                    strategy="screenshot_capture_fallback",
+                    reason="screenshot_capture_fallback",
+                    retry_args={"code": _mss_screenshot_fallback_code(fallback_path), "timeout": timeout},
+                    details={"fallback_path": fallback_path, "missing_module": module_name, "candidate_order": 1},
+                ),
+                RecoveryPlan(
+                    strategy="screen_ui_snapshot_fallback",
+                    reason="screen_ui_snapshot_fallback",
+                    retry_args={},
+                    requires_same_tool=False,
+                    tool_name="get_screen_ui",
+                    details={"fallback_kind": "ui_snapshot", "candidate_order": 2},
+                ),
+            ]
 
     if diagnosis.category == "transient_external_error":
-        return RecoveryPlan(
-            strategy="transient_retry",
-            reason="transient_retry",
-            retry_args=dict(arguments or {}),
-            max_attempts=max(0, min(int(max_transient_retries), 3)),
-            details={"safe_exact_retry": True},
-        )
+        return [
+            RecoveryPlan(
+                strategy="transient_retry",
+                reason="transient_retry",
+                retry_args=dict(arguments or {}),
+                max_attempts=max(0, min(int(max_transient_retries), 3)),
+                details={"safe_exact_retry": True, "candidate_order": 1},
+            )
+        ]
 
-    return None
+    return []
 
 
 def _can_retry_tool_exactly(tool_name: str, arguments: dict[str, Any]) -> bool:
@@ -396,6 +486,36 @@ def _can_retry_tool_exactly(tool_name: str, arguments: dict[str, Any]) -> bool:
     if tool_name == "execute_command":
         return is_safe_verifier_command(str((arguments or {}).get("command") or ""))
     return False
+
+
+def _command_file_probe_args(command: str) -> dict[str, Any] | None:
+    names = _extract_command_file_names(command)
+    if not names:
+        return None
+    payload = repr(names[:8])
+    code = (
+        "from pathlib import Path\n"
+        f"names = {payload}\n"
+        "roots = [Path.cwd(), Path.cwd() / 'workspace']\n"
+        "for name in names:\n"
+        "    matches = []\n"
+        "    for root in roots:\n"
+        "        try:\n"
+        "            matches.extend(str(path) for path in root.rglob(name) if path.is_file())\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "    print(f'{name}: ' + (' | '.join(matches[:8]) if matches else 'not found'))\n"
+    )
+    return {"code": code, "timeout": 20}
+
+
+def _extract_command_file_names(command: str) -> list[str]:
+    found: list[str] = []
+    for match in re.findall(r"(?<![\w.-])([\w.-]+\.(?:py|md|json|txt|yaml|yml|toml|ini|log))(?![\w.-])", command or "", flags=re.IGNORECASE):
+        name = os.path.basename(match.strip("\"'` "))
+        if name and name not in found:
+            found.append(name)
+    return found
 
 
 def _is_transient_result(result: ToolResult) -> bool:
@@ -465,17 +585,27 @@ def _looks_like_screenshot_runtime_error(result: ToolResult) -> bool:
 def _mss_screenshot_fallback_code(output_path: str) -> str:
     escaped = output_path.replace("\\", "\\\\")
     return (
+        "import subprocess\n"
         "from pathlib import Path\n"
         f"output = Path(r'{escaped}')\n"
         "output.parent.mkdir(parents=True, exist_ok=True)\n"
-        "try:\n"
-        "    import pyautogui\n"
-        "    image = pyautogui.screenshot()\n"
-        "    image.save(output)\n"
-        "except Exception:\n"
-        "    from PIL import ImageGrab\n"
-        "    image = ImageGrab.grab()\n"
-        "    image.save(output)\n"
+        "ps_path = str(output).replace(\"'\", \"''\")\n"
+        "script = f'''\n"
+        "Add-Type -AssemblyName System.Windows.Forms\n"
+        "Add-Type -AssemblyName System.Drawing\n"
+        "$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen\n"
+        "$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height\n"
+        "$graphics = [System.Drawing.Graphics]::FromImage($bmp)\n"
+        "$graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bounds.Size)\n"
+        "$bmp.Save('{ps_path}', [System.Drawing.Imaging.ImageFormat]::Png)\n"
+        "$graphics.Dispose()\n"
+        "$bmp.Dispose()\n"
+        "'''\n"
+        "completed = subprocess.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], capture_output=True, text=True, timeout=25)\n"
+        "if completed.returncode != 0:\n"
+        "    raise RuntimeError((completed.stderr or completed.stdout or 'PowerShell screenshot failed')[:1000])\n"
+        "if not output.exists() or output.stat().st_size <= 0:\n"
+        "    raise RuntimeError('PowerShell screenshot did not create an image')\n"
         "print(str(output))\n"
     )
 
@@ -494,11 +624,18 @@ def _recovery_policy(response_policy: Any) -> Any:
         return response_policy
 
 
+def _with_recovery_attempt(result: ToolResult, evidence: RecoveryEvidence) -> ToolResult:
+    data = dict(result.data) if isinstance(result.data, dict) else {}
+    data["recovery_attempted"] = evidence.to_dict()
+    return replace(result, data=data)
+
+
 def self_repair_instruction(tool_name: str, arguments: dict[str, Any], result: ToolResult) -> str:
     data = result.data if isinstance(result.data, dict) else {}
     retry_hint = str(data.get("retry_hint") or "").strip()
     stderr = str(data.get("stderr") or result.error or "").strip()
     stdout = str(data.get("stdout") or "").strip()
+    recovery_attempted = data.get("recovery_attempted") if isinstance(data, dict) else None
     parts = [
         "[SelfRepair]",
         f"The previous `{tool_name}` call failed. Do not stop at the raw error if a safe recovery is possible.",
@@ -516,6 +653,16 @@ def self_repair_instruction(tool_name: str, arguments: dict[str, Any], result: T
         parts.append(
             f"diagnosis: Python dependency `{missing_module}` is missing. Prefer a safe fallback using already available libraries; do not install packages unless the owner explicitly approves."
         )
+    if isinstance(recovery_attempted, dict):
+        reason = str(recovery_attempted.get("reason") or recovery_attempted.get("details", {}).get("strategy") or "auto_recovery").strip()
+        retry_status = str(recovery_attempted.get("retry_status") or "not_ok").strip()
+        retry_message = str(recovery_attempted.get("retry_message") or "").strip()
+        attempts = recovery_attempted.get("attempts") or 0
+        parts.append(
+            "deterministic_recovery_already_tried: "
+            f"strategy={reason}; attempts={attempts}; status={retry_status}; message={retry_message[:500]}"
+        )
+        parts.append("Do not repeat that exact recovery path unless you change one concrete cause.")
     if arguments:
         parts.append(f"failed_arguments: {repr(arguments)[:900]}")
     return "\n".join(parts)

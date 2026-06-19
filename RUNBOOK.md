@@ -202,6 +202,68 @@ Common values:
 
 Invalid or non-positive values fall back to `5.5` and write a `turn.config_warning` trace event.
 
+## Short Context and URL Vision
+
+- Short context is stored at `C:\Agent\workspace\project_cache\short_context.json` and keeps only recent Telegram logical turns. It helps YueYue resolve phrases like `這個`, `剛剛那個`, and `你覺得呢`; it is not long-term memory.
+- URL context is stored at `C:\Agent\workspace\project_cache\url_context_cache.json`; downloaded previews are stored under `C:\Agent\workspace\project_cache\url_previews`.
+- `inspect_url(url, depth)` supports `metadata`, `auto`, `preview`, and `full`. It is low-risk but bounded by timeouts and cache.
+- The URL pipeline tries cheap metadata first, then optional preview. It does not use login cookies, private account data, anti-bypass tricks, or full video downloads.
+- Douyin links are classified as Chinese Douyin. Expect graceful degradation for app-only, login-gated, region-restricted, or anti-bot pages.
+- If YueYue only sees a title, cover, or page screenshot, she should say so naturally instead of pretending to have watched the full video.
+- Manual smoke tests:
+  - Send a normal webpage URL and ask `你覺得呢`; expected: YueYue references title/description or says what she can see.
+  - Send a Bilibili or YouTube URL; expected: metadata/preview when available, cache hit on second try.
+  - Send a Douyin URL; expected: classified as Douyin, with clear fallback if restricted.
+- Send `這個好抽象` after a URL; expected: YueYue binds `這個` to the recent URL.
+
+## Presence Engine
+
+- Phase B3 is the Presence Engine v1 close-out: `PresenceEngine` decides whether it is okay to reach out, then `PresenceComposer` uses the model to decide whether there is actually something worth saying.
+- Default mode is `notify`: YueYue has a higher safety cap of eight short Telegram presence messages per day, with at least 75 minutes between candidates. This is not a quota; if the composer has no specific topic, YueYue stays quiet. Set `YUEYUE_PRESENCE_MODE=shadow` to record only.
+- Runtime files:
+  - `C:\Agent\workspace\project_cache\presence_state.json`
+  - `C:\Agent\workspace\project_cache\presence_candidates.jsonl`
+  - `C:\Agent\workspace\project_cache\presence_health.json`
+  - `C:\Agent\workspace\project_cache\presence_debug.jsonl`
+  - `C:\Agent\workspace\project_cache\presence_composer_debug.jsonl`
+  - `C:\Agent\workspace\project_cache\presence_topic_history.jsonl`
+- Telegram status prompts:
+  - `月月剛剛有沒有想找我`
+  - `月月刚刚有没有想找我`
+  - `月月為什麼沒找我`
+  - `月月为什么没找我`
+  - `月月刚刚想说什么`
+  - `presence status`
+- Environment configuration:
+
+```powershell
+YUEYUE_PRESENCE_MODE=notify
+YUEYUE_PRESENCE_DAILY_LIMIT=8
+YUEYUE_PRESENCE_MIN_INTERVAL_MINUTES=75
+YUEYUE_PRESENCE_QUIET_HOURS=23:30-08:00
+YUEYUE_PRESENCE_OWNER_AWAKE_MINUTES=30
+YUEYUE_PRESENCE_STALE_TASK_MINUTES=120
+YUEYUE_PRESENCE_TICK_MINUTES=45
+YUEYUE_PRESENCE_ICEBREAK_AFTER_MINUTES=360
+YUEYUE_PRESENCE_COMPOSER_MODEL=deepseek-ai/DeepSeek-V4-Pro
+```
+
+Modes:
+
+- `off`: no candidates.
+- `shadow`: record candidates and suppression reasons only.
+- `notify`: send model-composed Telegram presence messages through the gateway scheduler only after the quality gate passes.
+
+Quality policy:
+
+- Avoid generic check-ins such as `你還好嗎` or `今天怎麼樣` unless recent context clearly justifies care.
+- Prefer recent jokes, links, stickers, light teasing, small shares, or a concrete follow-up that gives the owner something easy to reply to.
+- If there is a recent URL, sticker exchange, mood signal, or joke, Presence treats it as a follow-up opportunity.
+- If there has been no interaction for about six hours during non-quiet time, Presence may create an `icebreak` opportunity. The composer should open a small new topic, not ask why the owner disappeared.
+- If the model output is repetitive, formal, task-like, too long, malformed, or not worth sending, YueYue records the reason and sends nothing.
+
+Quiet hours are a soft rule. If the owner interacted recently, YueYue treats the owner as likely awake and may generate a candidate, but daily limit, cooldown, task state, and composer quality still apply. Fresh active tasks, permission waits, and validation waits suppress Presence. Stale task states older than the configured threshold stop blocking forever. `agent_eval.py` reports candidate count, shadow count, sent count, suppressed count, and composer status.
+
 ## Social Stickers
 
 - Local sticker selection first checks `C:\Agent\workspace\assets\social_sticker_index.json`.
@@ -245,6 +307,7 @@ Single-action approval replay:
 - The model is not asked to regenerate the tool call, which prevents approval from drifting into a different tool or different arguments.
 - If the replayed action generates a safe workspace media artifact such as a screenshot, the runtime delivers it through `send_telegram_media` automatically instead of stopping at `Python completed`.
 - Screenshot-oriented Python failures, including missing capture dependencies or common `mss` API/runtime errors, may be repaired with a bounded safe screenshot fallback before asking the owner what to do next.
+- Sending stored/generated artifacts uses the same bounded transient-error recovery path, so temporary Telegram connection resets are retried before YueYue reports a failure.
 
 State separation:
 
@@ -300,6 +363,8 @@ powershell -ExecutionPolicy Bypass -File .\start_yueyue.ps1 -CheckOnly
 python agent_benchmark.py
 python agent_eval.py
 ```
+
+- `self_test.py` is single-instance by design. It writes shared trace/cache/state files, so a second run exits with a lock message instead of corrupting the first run's evidence.
 
 ## Knowledge Index
 
