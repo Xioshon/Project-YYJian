@@ -463,9 +463,7 @@ def _is_valid_micro_plain_greeting(text: str, recent: list[str]) -> bool:
         return False
     family = _social_family_key(value)
     recent_families = {item for item in (_social_family_key(x) for x in recent[-8:]) if item}
-    if family and family in recent_families:
-        return False
-    return True
+    return not (family and family in recent_families)
 
 
 def _compose_micro_plain_greeting(owner_prompt: str, recent: list[str]) -> str:
@@ -563,20 +561,50 @@ def _is_valid_generated_greeting(text: str, recent: list[str]) -> bool:
         return False
     family = _social_family_key(value)
     recent_families = {item for item in (_social_family_key(x) for x in recent[-8:]) if item}
-    if family and family in recent_families:
-        return False
-    return True
+    return not (family and family in recent_families)
+
+
+def _greeting_rejection_reason(text: str, recent: list[str]) -> str:
+    """Name the first check a candidate fails, so the retry can tell the model WHAT to fix.
+    ROADMAP P1: a named critique turns blocklist hits from silent discard (-> canned pool) into
+    a self-correction signal - the model usually fixes a named problem on the second try."""
+    value = str(text or "").strip()
+    if not value or "\n" in value or "\r" in value or len(value) > 28:
+        return "太長或換行了，一句28字以內"
+    lowered = value.casefold()
+    hits = [phrase for phrase in GENERATED_GREETING_BAD_PHRASES if phrase.casefold() in lowered]
+    if hits:
+        return "用了太熟口熟面的罐頭字眼（" + "、".join(hits[:2]) + "），換個自然說法"
+    violation = voice_register_violation(value)
+    if violation:
+        return "字感不對（" + violation + "），用香港書面繁體，別用台味語尾或粵語口語字"
+    if _social_similarity_key(value) and _social_similarity_key(value) in {
+        _social_similarity_key(item) for item in recent[-6:]
+    }:
+        return "跟最近說過的太像，換個角度"
+    return "語氣不自然，重寫一句更像月月本人的"
 
 
 def _compose_generated_plain_greeting(agent: Any, owner_prompt: str, recent: list[str]) -> str:
-    raw = _model_chat_without_tools(agent, _generated_greeting_prompt(owner_prompt, recent))
-    if not raw:
-        return ""
-    text = str(raw or "").strip()
-    text = re.sub(r"^['\"「『]+|['\"」』]+$", "", text).strip()
-    if not _is_valid_generated_greeting(text, recent):
-        return ""
-    return text
+    messages = _generated_greeting_prompt(owner_prompt, recent)
+    for _ in range(2):
+        raw = _model_chat_without_tools(agent, messages)
+        if not raw:
+            return ""
+        text = str(raw or "").strip()
+        text = re.sub(r"^['\"「『]+|['\"」』]+$", "", text).strip()
+        if _is_valid_generated_greeting(text, recent):
+            return text
+        # Retry once with a named critique before surrendering to the pooled fallback.
+        messages = [
+            *messages[:-1],
+            {
+                "role": "user",
+                "content": messages[-1]["content"]
+                + f"\n你剛寫的「{text[:40]}」被拒：{_greeting_rejection_reason(text, recent)}。",
+            },
+        ]
+    return ""
 
 
 def _compose_generated_short_line(agent: Any, system: str, user: str, recent: list[str]) -> str:
@@ -586,14 +614,17 @@ def _compose_generated_short_line(agent: Any, system: str, user: str, recent: li
     recent_lines = [str(item or "").strip() for item in recent[-4:] if str(item or "").strip()]
     if recent_lines:
         system = system + "\n最近用過的語氣不要照抄：" + " / ".join(recent_lines)
-    raw = _model_chat_without_tools(agent, [{"role": "system", "content": system}, {"role": "user", "content": user}])
-    if not raw:
-        return ""
-    text = str(raw or "").strip()
-    text = re.sub(r"^['\"「『]+|['\"」』]+$", "", text).strip()
-    if not _is_valid_micro_plain_greeting(text, recent):
-        return ""
-    return text
+    prompt = user
+    for _ in range(2):
+        raw = _model_chat_without_tools(agent, [{"role": "system", "content": system}, {"role": "user", "content": prompt}])
+        if not raw:
+            return ""
+        text = str(raw or "").strip()
+        text = re.sub(r"^['\"「『]+|['\"」』]+$", "", text).strip()
+        if _is_valid_micro_plain_greeting(text, recent):
+            return text
+        prompt = user + f"\n你剛寫的「{text[:40]}」被拒：{_greeting_rejection_reason(text, recent)}。"
+    return ""
 
 
 def _social_similarity_key(text: str) -> str:
