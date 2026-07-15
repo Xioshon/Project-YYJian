@@ -77,7 +77,8 @@ _TAIWAN_FINAL_PARTICLE_RE = re.compile(r"[喔喲耶](?=[\s。！？!?~～…，,
 # 实/么/边/远 added 2026-07-16: a live P2 test reply contained 「什么的」「实在不行」 and none of
 # those chars were gated.
 # 听/条/难 added same day: 「听到了哦」 passed the Tier-2 register check unflagged.
-_SIMPLIFIED_ONLY_CHARS = "这来对时说话现发见还没头买东习级练热压历数记个为过让点写实么边远听条难"
+# 处/办/务/开/关 added from live Telegram task-voice leak 2026-07-16 (「我先处理一下」).
+_SIMPLIFIED_ONLY_CHARS = "这来对时说话现发见还没头买东习级练热压历数记个为过让点写实么边远听条难处办务开关"
 
 # DeepSeek/MiniMax occasionally emit stray Cyrillic mid-sentence when writing Chinese (live
 # gap-battery leak 2026-07-15: 「我想跑一段 Python код 來數一下…」 in a permission request).
