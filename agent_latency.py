@@ -364,6 +364,34 @@ def classify_interaction(text: str = "", has_media: bool = False, media_kind: st
     return InteractionMode.CHAT
 
 
+def classification_is_grey(text: str, mode: InteractionMode, has_media: bool = False, media_kind: str = "") -> bool:
+    """True when the keyword decision above rested on WEAK signals - the historical misroute zone.
+
+    Two grey shapes, one per direction:
+    - decided CHAT while weak intent verbs / task-target nouns were present (the 「用指令查版本」
+      class: fell to chat, then the chat model hallucinated an answer);
+    - decided TOOL_TASK purely via the weak co-occurrence gate (the 「設定精簡」 class: a casual
+      mention self-satisfied verb+target and hijacked a chat into a workflow).
+    Certain signals (media/sticker attachments, strong action/tool markers) are never grey.
+    An LLM router may then re-judge grey cases; the keyword result stays the fallback."""
+    if has_media or media_kind:
+        return False
+    normalized = (text or "").casefold()
+    if any(marker.casefold() in normalized for marker in COMPUTER_ACTION_MARKERS):
+        return False
+    if any(marker.casefold() in normalized for marker in TOOL_INTENT_MARKERS):
+        return False
+    weak_signals = any(
+        marker.casefold() in normalized
+        for marker in (*COMPUTER_ACTION_WEAK_MARKERS, *TOOL_INTENT_WEAK_MARKERS, *TASK_TARGET_CONTEXT_MARKERS)
+    )
+    if mode == InteractionMode.CHAT:
+        return weak_signals
+    # TOOL_TASK here was reached only via the weak co-occurrence gate (strong paths returned
+    # False above); other modes (observe/vision/sticker) are considered certain.
+    return mode == InteractionMode.TOOL_TASK
+
+
 def _looks_like_observe_only_query(text: str) -> bool:
     # These verbs already imply an active "go check something" request, so they are
     # safe to trigger observe-mode on their own.

@@ -26,9 +26,9 @@
 
 **目的**:成果落盤,之後每個 Phase 都有回滾點和對照基線。
 
-- [ ] 本地 git commit(分批、乾淨訊息;**不 push**,公開前絕不上遠端)。
-- [ ] 跑一次 `eval_suite.py --live --judge`,存 scorecard JSON 作為質量基線。
-- [ ] 差距電池結果(4-5/6)寫入基線記錄。
+- [x] 本地 git commit(分批、乾淨訊息;**不 push**,公開前絕不上遠端)。
+- [x] 跑一次 `eval_suite.py --live --judge`,存 scorecard JSON 作為質量基線。
+- [x] 差距電池結果(4-5/6)寫入基線記錄。
 
 **驗收**:git log 乾淨、基線檔案在 `workspace/project_cache/baselines/`。
 

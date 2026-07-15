@@ -5,7 +5,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from agent_hooks import emit_trace
-from agent_latency import InteractionMode, classify_interaction
+from agent_latency import InteractionMode, classification_is_grey, classify_interaction
+from route_llm import llm_route
 
 ROOT_DIR = os.path.abspath(os.getenv("YUEYUE_ROOT_DIR") or os.path.dirname(__file__))
 TURN_DEBOUNCE_ENV = "YUEYUE_TURN_DEBOUNCE_SECONDS"
@@ -142,6 +143,11 @@ def build_aggregated_turn(parts: list[InboundMessagePart]) -> AggregatedTurn:
     media_parts = [part for part in ordered if part.kind in {"photo", "sticker"}]
     media_kind = _dominant_media_kind(media_parts)
     mode = classify_interaction(primary_text, has_media=bool(media_parts), media_kind=media_kind)
+    # ROADMAP P1: keyword routing is the fast path; when its decision rested on weak signals
+    # (the historical misroute zone), the cheap chat model re-judges. Opt-in via
+    # YUEYUE_LLM_ROUTING=1; any LLM failure keeps the keyword result.
+    if classification_is_grey(primary_text, mode, has_media=bool(media_parts), media_kind=media_kind):
+        mode = llm_route(primary_text, mode)
     if primary_text and mode == InteractionMode.SOCIAL_STICKER:
         mode = InteractionMode.CHAT
     return AggregatedTurn(

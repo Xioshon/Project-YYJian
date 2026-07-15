@@ -848,28 +848,45 @@ class YueYueRuntimeV3:
             "the facts), and never say you will do it, are doing it, or have done it.\n"
             + json.dumps({"event": event, "facts": facts}, ensure_ascii=False)
         )
-        try:
-            response = self.provider.chat(
-                [
+        # One retry with a concrete critique before surrendering to the canned fallback: the
+        # canned permission line repeating several times in one task (gap battery, live) was
+        # exactly this function giving up after a single failed generation. The model usually
+        # fixes a named violation on the second try; the fallback stays as the final net.
+        critique = ""
+        for _ in range(2):
+            try:
+                messages = [
                     {"role": "system", "content": self.context.system_prompt(TurnMode.TASK)},
-                    {"role": "user", "content": prompt},
-                ],
-                [],
+                    {"role": "user", "content": prompt + critique},
+                ]
                 # Owner-voice lines are persona speech, not planning - they follow the chat
                 # voice model so the register/tone stays consistent across chat and task turns.
-                model=_chat_voice_model(),
-            )
-            candidate = _clean_reply(response.content)
-            if not candidate or _contains_internal_terms(candidate):
-                return fallback
-            # Register gate: task-voice replies had no output-side enforcement, which is how
-            # spoken Cantonese (嘅/喺/㗎) leaked into a live task reply on 2026-07-12. The
-            # fallbacks are all clean written Traditional, so falling back is always safe.
-            if voice_register_violation(candidate):
-                return fallback
-            return candidate
-        except Exception:
-            return fallback
+                response = self.provider.chat(messages, [], model=_chat_voice_model())
+                candidate = _clean_reply(response.content)
+                if not candidate:
+                    critique = "\nYour previous attempt was empty. Write the reply."
+                    continue
+                if _contains_internal_terms(candidate):
+                    critique = (
+                        "\nYour previous attempt leaked internal terms. Rewrite it in plain owner "
+                        "language with no runtime/workflow/system words:\n" + candidate[:200]
+                    )
+                    continue
+                # Register gate: task-voice replies had no output-side enforcement, which is how
+                # spoken Cantonese (嘅/喺/㗎) leaked into a live task reply on 2026-07-12. The
+                # fallbacks are all clean written Traditional, so falling back is always safe.
+                violation = voice_register_violation(candidate)
+                if violation:
+                    critique = (
+                        f"\nYour previous attempt violated the register ({violation}). Rewrite it in "
+                        "standard written Traditional Chinese (香港書面繁體), no Taiwan-flavored final "
+                        "particles, no spoken Cantonese, no Simplified:\n" + candidate[:200]
+                    )
+                    continue
+                return candidate
+            except Exception:
+                break
+        return fallback
 
     def _execution_instruction(self, workflow: WorkflowState, allowed: list[str]) -> str:
         step = workflow.current_step()
