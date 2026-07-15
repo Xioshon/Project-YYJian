@@ -4,10 +4,13 @@ YueYue is a private Telegram cyber-catgirl companion agent runtime with tools, p
 
 ## Setup
 
-1. Install Python 3.
-2. Copy `.env.example` to `.env`.
-3. Fill in your local API and Telegram values in `.env`.
-4. Keep `.env` private.
+1. Install Python 3.11 or newer.
+2. Run `python -m pip install -r requirements.txt`.
+3. Copy `.env.example` to `.env`.
+4. Fill in your local API and Telegram values in `.env`.
+5. Keep `.env` private.
+
+Runtime v3 (`yueyue_v3/`) is the only runtime. It keeps the 30 public tool names and Telegram behavior on one event loop, one workflow state, structured observations, goal verification, and atomic state files.
 
 ## Run
 
@@ -22,43 +25,40 @@ Check startup without launching Telegram:
 powershell -ExecutionPolicy Bypass -File .\start_yueyue.ps1 -CheckOnly
 ```
 
+`CheckOnly` also runs `scripts/system_audit.py`, which verifies UTF-8 source files, static image/WebM assets,
+sticker index references, runtime dependencies, and all 30 public tool schemas. The URL preview dependencies
+(`yt-dlp`, Playwright, and Pillow) are installed from `requirements.txt`; Playwright uses the existing Chrome
+installation before considering its own Chromium runtime.
+
 Restart the Telegram service cleanly if a previous launcher is still running:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start_yueyue.ps1 -Restart
 ```
 
-Run the regression suite:
+Run the full regression gate:
 
 ```powershell
-python self_test.py
+powershell -ExecutionPolicy Bypass -File .\start_yueyue.ps1 -CheckOnly -SelfTest
 ```
 
-Generate the live evaluation gate report:
+This runs the v3 pytest suite (`tests_v3/`), the response-quality script checks (`scripts/*_check.py`), the Ruff lint gate, and a tracked-file secret scan.
+
+Check the live runtime health directly:
 
 ```powershell
-python agent_eval.py
+python -m yueyue_v3.health --root C:\Agent
 ```
 
-## Model Routing
+Generated v3 state lives under `workspace/project_cache/v3/` and is never committed.
 
-YueYue uses `RoutedLLMAdapter` by default. Casual chat/social turns can use a faster chat model, while task/tool/vision turns stay on the stronger model.
+## Model Configuration
 
-Configure in `.env`:
+YueYue talks to the model through `yueyue_v3.providers.SiliconFlowProvider`. Configure the model in `.env`:
 
 ```env
-YUEYUE_CHAT_MODEL=
-YUEYUE_STRONG_MODEL=deepseek-ai/DeepSeek-V4-Pro
 YUEYUE_TASK_MODEL=
-YUEYUE_VISION_MODEL=
-```
-
-If `YUEYUE_CHAT_MODEL` is blank, chat uses the same strong model as tasks.
-
-Rebuild the local engineering knowledge index:
-
-```powershell
-python -c "import agent_knowledge; print(agent_knowledge.reindex_workspace())"
+YUEYUE_STRONG_MODEL=deepseek-ai/DeepSeek-V4-Pro
 ```
 
 ## Repository Hygiene
@@ -77,22 +77,6 @@ Do not commit:
 
 The local workspace may still contain those files; `.gitignore` prevents new runtime/private files from entering Git.
 
-## Knowledge Index
-
-YueYue keeps a lightweight local RAG-style index in `workspace/project_cache/`.
-
-It indexes only low-noise engineering sources such as `ARCHITECTURE.md`, `RUNBOOK.md`, `workspace/brain/*.md`, `workspace/memory/chat_summary/rolling_summary.md`, task transactions, and failure replay cases.
-
-It does not index `.env`, Telegram chat ids, full `workspace/chat_history/`, screenshots, downloaded Telegram media, or generated cache files. The runtime tools are `search_knowledge`, `read_knowledge`, and `reindex_workspace`.
-
-## Live Evaluation
-
-`agent_eval.py` reads the local trace and writes `workspace/project_cache/eval_report.json`.
-
-It reports tool success rate, permission replay success, permission policy health, planner coverage, workflow success rate, observe-needed counts, background worker success/timeout/assimilation rate, subagent health, persona health, render dedupe, context budget, repeated failure cases, latency buckets, knowledge search hit rate, recent errors, and Git hygiene status. Use it after significant runtime changes before moving to larger workflow or social-layer work.
-
-`agent_benchmark.py` runs a small deterministic local task benchmark and writes `workspace/project_cache/task_benchmark_report.json`. It does not touch Telegram or external services; it checks whether recovery planning, permission replay, route policy, workflow verification evidence, blocked workflow handling, outcome follow-ups, owner-facing voice, and knowledge search still work. `agent_eval.py` reads the latest benchmark report and treats failing benchmark cases as a next-stage gate blocker.
-
 ## Permission Model
 
 YueYue uses risk-tiered permission. Low-risk local/read-only tools, safe verifier commands, workspace media sending, and memory/profile updates with quality checks should feel smooth. Destructive actions, arbitrary commands, external file paths, downloads, and UI control still require explicit approval.
@@ -105,23 +89,11 @@ Screen-observe requests such as "截圖" or "幫我看看畫面" use a short rou
 
 ## Durable Workflow
 
-YueYue records durable task graphs in `workspace/project_cache/task_graphs.json` and blocked workflow replay cases in `workspace/project_cache/workflow_replay_cases.jsonl`.
-
-Non-chat tasks are first turned into conservative planned steps by Planner v1. Tool results, observe-needed states, and verifier evidence attach back to those steps. Workflow summaries can be restored after restart, but they do not auto-run protected tools or bypass permission.
-
-## Hybrid Worker
-
-YueYue keeps one main decision thread for chat, permission, TaskGraph, memory, and Telegram replies.
-
-Background verifier workers only run allowlisted checks such as `py_compile`, `self_test`, `agent_eval`, and trace summary. Results are written to `workspace/project_cache/worker_results.jsonl` as evidence; workers do not modify permission, TaskGraph, memory, or Telegram directly.
-
-The main agent thread later assimilates worker results into the active TaskGraph. This keeps verification faster without letting background jobs change state on their own.
+`yueyue_v3.workflow.WorkflowEngine` converts non-chat requests into a structured `GoalContract` with requested outputs and success criteria, then executes one evidence-backed step at a time. Tool success is only action evidence; the workflow completes only after the goal is verified against actual evidence. Workflow state persists across restarts in `workspace/project_cache/v3/runtime_state.json`, but it does not auto-run protected tools or bypass permission.
 
 ## Context Budget
 
-`ContextPackBuilder` writes `workspace/project_cache/context_budget_report.json` when it builds prompt context.
-
-Chat and social turns stay light. Task/tool/vision turns can add SessionBrain, TaskGraph, selected skills, and bounded engineering knowledge without stuffing the whole workspace into the model.
+`yueyue_v3.context.ContextCompiler` builds a bounded, mode-isolated prompt per turn (CHAT/SOCIAL/TASK/VISION/PRESENCE). Chat and social turns stay light; task/vision turns add the current workflow contract without stuffing the whole workspace into the model.
 
 ## Command Execution
 

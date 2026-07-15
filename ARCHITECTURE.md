@@ -2,6 +2,26 @@
 
 This project should be treated as a small agent runtime, not as a pile of prompt tricks.
 
+## Runtime v3 (the only runtime)
+
+Runtime v3 is implemented under `yueyue_v3/`. It is the sole runtime - the earlier `CompanionAgent` control layer and its entire support cluster (`core_agent.py` and ~19 dependent `agent_*.py` modules) were removed once confirmed dead: `main.py` always builds `YueYueRuntimeV3`.
+
+- `YueYueRuntimeV3` is the only workflow/session/permission state writer.
+- `RuntimeEvent` serializes Telegram turns, tool results, permission replay, and worker evidence.
+- `WorkflowState` contains `GoalContract`, `StepContract`, requested outputs, evidence, and verification.
+- `WorkflowEngine` separates action success, step satisfaction, and goal satisfaction.
+- `ObservationService` stores revision-bound `UiSnapshot` and `UiElement` records. Clicks are rejected when a snapshot expires or the active window changes.
+- `PermissionController` directly replays the original pending action. Computer-control approval is workflow scoped; high-risk execution remains single-action.
+- `ContextCompiler` isolates chat/social/task/vision/presence context and bounds execution transcripts. It shares its text-sanitizing helpers (greeting detection, prompt-leak stripping, workflow-meta stripping, benign-testing-note detection) with `agent_short_context.py` via `chat_text_sanitizers.py` - both consumers used to keep independent copies of this logic, which is why it is now a single shared module.
+- `RenderLedger` gives Telegram text/media at-most-once rendering per inbound event.
+- `AtomicJsonStore` uses UTF-8, `fsync`, backup, and `os.replace`; v3 runtime files carry schema version 3.
+
+The execution invariant is `Plan -> Observe -> Decide -> Act -> Verify Step -> Verify Goal -> Reply`. A successful screenshot, click, or command is evidence only; it is never equal to task completion.
+
+Two execution-loop guarantees added 2026-07-15 (gap-battery findings):
+- The evidence tail (`_evidence_note`) is rendered into every execution-loop conversation, so tool results survive permission round-trips (the in-loop transcript resets there). Command stdout/stderr/returncode are captured into evidence facts, and requested-output binding prefers stdout over generic tool status phrases ("Command completed.").
+- `report_result` values must be grounded: `_report_value_grounded` rejects any reported value that does not appear in actual tool evidence, so the model cannot fabricate an answer to finish a task.
+
 ## Design Principles
 
 1. Explicit state beats inferred dialogue.
@@ -17,117 +37,54 @@ This project should be treated as a small agent runtime, not as a pile of prompt
    Low-risk local/read-only tools stay convenient. Single approval retries only the exact pending tool call, and turn approval is bundle-scoped for destructive, privacy-sensitive, or system-control actions.
 
 5. Failures must be inspectable.
-   Runtime events are appended to `workspace/project_cache/agent_trace.jsonl`.
+   Runtime events are appended to `workspace/project_cache/agent_trace.jsonl` (pre-v3 pipeline) and `workspace/project_cache/v3/runtime_events.jsonl` (`YueYueRuntimeV3`).
 
 6. Harness before feature sprawl.
-   Protocols, hooks, skills, replay cases, and verification gates are the control plane that keeps the agent reliable.
+   Protocols, hooks, replay cases, and verification gates are the control plane that keeps the agent reliable. Prefer deleting an unused subsystem over letting it rot alongside its replacement.
 
-## Runtime Layers
+## Runtime Layers (live components)
 
-- `SiliconFlowAdapter`
-  Converts local message/tool objects into OpenAI-compatible SiliconFlow requests.
+- `SiliconFlowAdapter` (`agent_llm.py`)
+  Converts local message/tool objects into OpenAI-compatible SiliconFlow requests. Used by `PresenceEngine`'s background check-in generation.
 
-- `CompanionAgent`
-  Owns conversation memory, model loop, session-brain updates, tool-call handling, history saving, and fail-safe termination.
-
-- `SessionBrain`
-  Tracks whether the agent is idle, doing an active task, waiting for permission, waiting for validation, or blocked. It summarizes current task state into context without bypassing permission rules.
-
-- `PermissionManager`
-  Tracks pending approvals, exact replay actions, and bundle-scoped turn grants. Risk-tiering keeps low-risk local tools free while preserving approval for destructive or privacy-sensitive actions.
-
-- `ToolRegistry`
-  Stores the registered tools and exposes stable names to the model.
-
-- `ToolExecutor`
-  Applies confirmation policy, invokes tools, catches exceptions, emits trace events, and normalizes results.
-
-- `SelfRecoveryController`
-  Diagnoses structured tool failures, selects a bounded recovery plan, and records recovery evidence before the agent asks the owner for help. Current deterministic strategies cover cwd/path retry for safe commands, missing-`mss` screenshot fallback through available local screenshot libraries, and exact retry for transient errors on idempotent tools or allowlisted verifier commands. Unknown or unsafe failures do not get automatic recovery plans.
-
-- `TaskTransactionManager`
-  Stores local JSON task transactions with objective, current step, created files, cleanup intent, tool results, and verification status.
-
-- `TaskGraphManager`
-  Stores durable workflow graphs with objective, planned steps, step state, current step, created files, cleanup intent, worker evidence, and verification state. It can summarize unfinished work after restart without granting any tool permission.
-
-- `PlannerV1`
-  Creates conservative persistent steps for non-chat tasks before tools run. It is deterministic in this phase so the runtime can replay and test task state without depending on a planner model.
-
-- `ActionVerification`
-  Verifies deterministic tool postconditions after execution and marks UI actions as needing observation rather than assuming success.
-
-- `TelegramGateway`
-  Handles Telegram updates, message context, idempotent reply rendering, sticker sending, screenshot marker dedupe, and low-noise tool status updates.
+- `SiliconFlowProvider` (`yueyue_v3/providers.py`)
+  The provider `YueYueRuntimeV3` actually talks to for every real conversation turn.
 
 - `agent_protocol`
   Owns approval phrases, reply markers, status labels, and fail-safe text with Unicode-safe constants.
 
-- `HookManager`
-  Emits lifecycle events, writes trace JSONL, and lets hooks allow, block, annotate, or transform runtime actions.
+- `agent_hooks` (`HookManager`)
+  Emits lifecycle events and writes trace JSONL.
 
-- `SkillRegistry`
-  Discovers `workspace/skills/*/SKILL.md`, selects relevant procedures, and keeps long instructions out of context until needed.
+- `TelegramGateway` (`main.py`)
+  Handles Telegram updates, message context, idempotent reply rendering, sticker sending, screenshot marker dedupe, and low-noise tool status updates. Constructs a `YueYueRuntimeV3` via `build_agent()` and drives every real turn through it. Reply text is split into bubbles on the model's own newlines (sentence-splitting only rescues overlong runs, soft limit 60 chars, max 4 bubbles), and a short trailing afterthought line (不過…/對了…) is sent a beat later like a real follow-up text. During tasks the gateway narrates significant tools to the owner (`TOOL_PROGRESS_LABELS`, deduped and rate-limited, max 6 lines/turn) and reports non-retryable tool failures honestly instead of staying silent.
 
-- `ContextPackBuilder`
-  Builds bounded startup context from compiled memory, selected skills, and task-only context. It writes `context_budget_report.json` and preserves high-priority memory sections instead of blindly stuffing every memory file into every prompt.
-
-- `MemoryCompiler`
-  Compiles personality, rules, owner profile, long-term memory, rolling chat summary, SessionBrain, and bounded engineering context into mode-specific prompt memory. Persona mode is explicit for chat, social sticker, task, vision, and screen observation turns.
-
-- `MemoryHealth`
-  Checks missing files, mojibake-like text, oversized sections, and persona warnings. Health output is written to `workspace/project_cache/memory_health.json`; persona-specific health is written to `workspace/project_cache/persona_health.json`.
-
-- `PermissionHealth`
-  Written by `agent_eval.py` to `workspace/project_cache/permission_health.json`. It lists free tools, guarded tools, bundles, and safe verifier command patterns so the permission model stays observable.
-
-- `ReplayHarness`
-  Runs deterministic regression scenarios for historical bugs and emits structured replay results.
-
-- `FailureReplay`
-  Converts repeated tool failures into minimal JSONL replay cases so failure loops become future regression tests.
-
-- `WorkflowReplay`
-  Converts blocked durable workflows into minimal replay cases with task id, failed step, tool, arguments, and result evidence.
-
-- `SubagentLite`
-  Provides isolated Explorer, Verifier, and Reviewer role interfaces. Explorer and Reviewer are read-only. Verifier can run only allowlisted local verification commands synchronously or submit background verifier jobs.
-
-- `agent_worker.py`
-  Runs allowlisted verifier checks in background threads and writes job/result JSONL evidence. Workers do not mutate permission, TaskGraph, memory, or Telegram directly; the main agent assimilates completed worker results back into TaskGraph steps.
+- `GatewayWatchdog` (`agent_watchdog.py`)
+  Detects the "process alive but nothing happens" failure mode. Heartbeats piggyback on every `get_updates` call (a healthy long-polling loop beats at least every ~25s even during network flaps, because the beat fires on call, not on success); each aggregated turn registers in-flight and deregisters in a `finally`. A turn stuck past 3 minutes alerts the owner once; past 10 minutes - or a wedged polling thread past 150s - it dumps every thread's stack to `workspace/logs/watchdog/` (forensics survive the restart), alerts the owner through a direct HTTPS call with its own timeout (never the possibly-hung TeleBot session), and exits with code 21 so `start_yueyue.bat`'s restart loop self-heals in ~5 seconds. Deterministic coverage lives in `scripts/watchdog_check.py`.
 
 - `agent_latency`
-  Classifies interactions as `chat`, `social_sticker`, `vision_task`, `screen_observe`, or `tool_task`, applies route-specific tool budgets, and caches media analysis.
+  Classifies interactions as `chat`, `social_sticker`, `vision_task`, `screen_observe`, or `tool_task`, applies route-specific tool budgets, and caches media analysis. Bare, everyday action words (打開/關閉/播放/點擊/etc.) require either a named controllable target (瀏覽器/設定/程式/etc.) or an explicit request phrase (幫我/請/可以...) to route to `tool_task` - a bare mention in ordinary chat ("我打開音樂在聽") must not hijack routing. The same co-occurrence discipline applies to screen-observation triggers ("是不是"/"現在"/"狀態" only mean "check the screen" alongside an actual screen/device word).
 
-- `VerificationPlanner`
-  Chooses conservative deterministic verification commands from objective, changed files, and evidence. SessionBrain stores the selected plan while validation is pending.
+- Screen control primitives
+  `capture_screen` creates an internal short-lived screenshot id; `list_windows` and `focus_window` locate the intended application; `click_screen` accepts coordinates only from the latest fresh screenshot and always requires a follow-up observation. Intermediate screenshots are evidence and are not sent to Telegram by default.
 
-- `TraceSummary` / `agent_observability.py`
-  Reads `agent_trace.jsonl` and produces a compact health snapshot with event counts, tool success rate, permission replay metrics, bundle metrics, action verification status, repeated-failure replay counts, interaction modes, latency buckets, social events, and recent errors.
+- Health gate (`yueyue_v3/health.py`)
+  A blocked workflow (owner hasn't said "繼續" yet after a "no fake success" block) is reported in `active_workflow_status` but is deliberately NOT a gate blocker - `start_yueyue.ps1` runs this health check on every startup with `$ErrorActionPreference = "Stop"`, so gating on a normal, resumable blocked state would mean the bot could never restart again after any legitimately blocked task, including via the watchdog's own self-heal restart. Only structural problems (wrong public tool count, state schema mismatch, replay failures) fail the gate.
 
-- `agent_eval.py`
-  Builds the live evaluation gate from trace events: tool success/failure, permission replay success, permission policy health, planner coverage, workflow success, observe-needed counts, worker health, worker assimilation, subagent health, persona health, render dedupe, context budget, recovery count, repeated failures, latency buckets, knowledge hit rate, recent errors, Telegram activity, and Git hygiene.
+- Screen-observe route (`YueYueRuntimeV3._screen_observe_turn`)
+  "What's on my screen" questions never go through the planner. The runtime deterministically chains `capture_screen` -> `analyze_media` and the reply must carry the actual visual content (guarded by `_reply_reflects_content`: a persona reply that fails to reflect the observed summary is replaced by a fallback that does). Capture or analysis failures are reported honestly, including where the screenshot ended up. A reply of "captured it" with no content is a structural impossibility on this route, not a tuning hope.
 
-- `agent_benchmark.py`
-  Runs a deterministic local task benchmark for the control plane. It checks recovery planning, permission replay, route policy, workflow verification evidence, blocked workflow behavior, outcome follow-ups, owner-facing voice, and knowledge search, then writes `workspace/project_cache/task_benchmark_report.json`. `agent_eval.py` reads this report so benchmark failures become next-stage gate blockers.
+- `SocialStickerIndex` / `SocialSessionManager` / `SocialReplyPolicy` / `SocialCurationReminder` (`agent_social.py`)
+  Builds a local emotion index for stickers, catalogs incoming Telegram stickers as metadata, and supports deterministic sticker selection before LLM fallback. Keeps short-lived per-chat social rhythm (sticker battle, affection, teasing) as in-memory runtime state only - it does not update profile, memory, or workflow state.
 
-- `SocialStickerIndex`
-  Builds a local emotion index for stickers, catalogs incoming Telegram stickers as metadata, and supports deterministic sticker selection before LLM fallback.
-  Incoming candidates store Telegram emoji, sticker set name, file unique id, media type, and content hash for tagging and duplicate detection. They remain unapproved until curated.
-  Candidate curation supports single-item and recent-batch approve/reject operations so Telegram commands and future UI surfaces share the same behavior.
-- `SocialCurationReminder`
-  Provides throttled in-memory reminders when pending sticker candidates accumulate, keeping curation discoverable without turning every sticker into a separate notification.
-- `SocialSessionManager`
-  Keeps short-lived per-chat social rhythm such as sticker battle, affection, or teasing. This is in-memory runtime state only; it does not update profile, memory, or task plans.
-  TelegramGateway may attach one suggested local sticker for clear sticker-battle turns when the model did not already emit a sticker marker.
-- `SocialReplyPolicy`
-  Converts short-lived social rhythm into concise reply guidance: sticker battle stays playful and quick, affection stays soft, teasing stays warm, and social turns avoid tool use.
-- `ShortContextBuffer`
-  Keeps the last 20 logical chat turns per chat for lightweight social grounding: recent text, URL summaries, media metadata, mood/topic hints, and the last assistant reply summary. This is short-term context only and does not update long-term memory.
-- `URLContextCache`
+- `ShortContextBuffer` (`agent_short_context.py`)
+  Keeps the last 20 logical chat turns per chat for lightweight social grounding: recent text, URL summaries, media metadata, mood/topic hints, and the last assistant reply summary. This runs in `main.py`'s pre-processing layer, separate from (and in addition to) `YueYueRuntimeV3`'s own `ShortContextStore`.
+
+- `URLContextCache` (`agent_url_context.py`)
   Classifies and caches URL metadata/preview context for YouTube, Bilibili, Douyin, TikTok, Instagram, X/Twitter, direct images, and ordinary websites. Extraction is layered and bounded: metadata first, optional preview only on demand, hard timeouts, no login cookies, no platform bypassing, and clear failure reasons.
-- `PresenceEngine`
-  Evaluates whether YueYue would naturally want to check in after recent chat context. Phase B2 uses adaptive presence: quiet hours are a soft rule, recent owner activity can mark the owner as likely awake, stale task states stop blocking forever, and decisions are written to `presence_debug.jsonl`. In `notify` mode it can send one low-frequency Telegram text check-in through the gateway scheduler; it never runs tools, mutates memory, or changes task state.
+
+- `PresenceEngine` (`agent_presence.py`)
+  Evaluates whether YueYue would naturally want to check in after recent chat context. Quiet hours are a soft rule, recent owner activity can mark the owner as likely awake, stale task states stop blocking forever, and decisions are written to `presence_debug.jsonl`. In `notify` mode it can send one low-frequency Telegram text check-in through the gateway scheduler; it never runs tools, mutates memory, or changes workflow state.
 
 ## Latency Policy
 
@@ -138,36 +95,25 @@ This project should be treated as a small agent runtime, not as a pile of prompt
 - Vision results are cached by file hash and summarized before returning to the main agent loop.
 - Slow vision/tool tasks may send a quick acknowledgement before the heavy work completes.
 - Sticker battles and mood stickers use local sticker search/indexing first; incoming stickers are cataloged as social metadata and are not analyzed unless requested.
-- Sticker auto-selection uses quiet eligibility checks and keeps incoming stickers as unapproved candidates until curated. Affection/teasing is allowed, and intense wording should be handled by warm pivoting rather than abrupt interruption.
-- SocialSession prompt notes may provide candidate sticker filenames and recent rhythm, but must remain separate from durable memory and SessionBrain task state.
+- Sticker auto-selection uses quiet eligibility checks and keeps incoming stickers as unapproved candidates until curated.
 - URL handling follows the same latency principle: cheap metadata/cache is allowed in chat, heavier preview is only triggered when the owner asks to look at or comment on the link. Douyin is treated as Chinese Douyin, not TikTok; app-only, login-gated, or region-restricted pages must degrade honestly instead of inventing content.
 - Presence handling is low-cost. Post-turn evaluation records candidates and debug evidence; a background scheduler performs bounded ticks every configured interval. Quiet hours suppress checks unless recent Telegram context indicates the owner is likely awake. Fresh active tasks, permission waits, validation waits, cooldown, and daily limits still suppress proactive messages.
 
-## Memory Policy
+## Persona and Chat Quality
 
-- Personality is stable SOUL behavior guidance: YueYue is Xioshon's cyber catgirl, not a generic assistant.
-- `profile.json` stores stable owner facts and preferences.
-- `memory.md` stores sparse long-term notes only when explicitly updated.
-- `chat_summary/rolling_summary.md` stores compact recent summaries, not full transcripts.
-- Chat mode uses personality/profile/summary; task mode adds SessionBrain and engineering context; social sticker mode avoids engineering docs. Chat should feel like a cyber catgirl with 喵~ / kaomoji flavor; task mode should stay reliable without turning cold.
-- Full chat history remains out of default prompt and out of the lightweight knowledge layer.
+- Personality is stable SOUL behavior guidance: YueYue is Xioshon's cyber catgirl, not a generic assistant. Personality files live in `workspace/brain/` (`personality.md`, `rules.md`, `personality_samples.md`).
+- CHAT/SOCIAL replies default to one short, natural bubble; splitting into multiple bubbles is the exception for a genuinely heavy moment, not the default. The model controls bubble breaks with newlines (the gateway honors them verbatim), so "hold this line for the next bubble" is a model decision, not a regex accident. `scripts/blocklist_growth_check.py` guards the reject/marker lists in `yueyue_v3/runtime.py`, `yueyue_v3/context.py`, and `response_composer.py` against silent unreviewed growth.
+- Lexical register is Hong Kong **written** Traditional Chinese with mainland-internet chat rhythm (屏幕/網絡/軟件 over 螢幕/網路/軟體; no habitual 喔/喲/耶 endings; written register also means NO spoken-Cantonese characters like 嘅/喺/㗎/咗/唔/冇; 笑死/絕了/？？？-style expressions allowed sparingly; 語氣詞 like 啦/咯 welcome but at most one per line). The single source of truth is **`voice_contract.py`**: `VOICE_REGISTER_ZH` / `VOICE_REGISTER_EN` are the prompt-side instruction (imported by the CHAT mode contract in `yueyue_v3/context.py`, the owner-voice prompt in `yueyue_v3/runtime.py`, `PRESENCE_COMPOSER_SYSTEM_PROMPT` in `agent_presence.py`, and all five composer prompts in `response_composer.py`), and `voice_register_violation()` is the output-side gate (wired into `_chat_reply_violates_social_policy`, `_compose_owner_voice`, the presence quality gate, and the fast-reply validators). `workspace/brain/personality_samples.md` keeps a human-readable copy of the same standard as few-shot calibration.
+
+  When adding ANY new prompt that produces an owner-facing line: import the register constant from `voice_contract.py` (never hand-copy the wording) and run the output through `voice_register_violation()` with a retry or clean-Traditional fallback. Tuning the register means editing `voice_contract.py` + `personality_samples.md` - two files, nothing else.
+- The reply script (Simplified/Traditional Chinese) mirrors the owner's own current message via `yueyue_v3.context.owner_script_is_simplified_with_history` + `to_simplified_script` - a deterministic character-table conversion, not a prompt instruction, because the model's own Traditional-Chinese baseline and an already-Traditional conversation history reliably outweigh a same-turn prompt note.
+- Full chat history remains out of the default prompt; only the last few short-context turns are included.
 
 ## Repository Policy
 
 - Source code, docs, safe examples, and curated non-private assets belong in Git.
 - Runtime logs, traces, chat history, Telegram chat ids, downloaded Telegram media, screenshots, project cache, pycache, and `.env` stay local.
 - Private repository status is useful but not a substitute for `.gitignore` and clean tracking.
-
-## Session State Policy
-
-- Plain chat stays `idle` and should not create or mutate a task plan.
-- Clear task intent enters `active_task`.
-- A protected tool block enters `awaiting_permission`; owner approvals are still handled only by `PermissionManager`.
-- Successful tool work enters `awaiting_validation` so the model can report what should be checked next.
-- Repeated tool failures can enter `blocked` and must be surfaced through trace events and clear replies.
-- Owner cancellation phrases such as "stop/cancel/算了" return the brain to `idle`.
-- Verification success clears pending validation and returns to `idle`; verification failure keeps validation pending or becomes `blocked` after repeated failures.
-- Runtime/Python changes should recommend `py_compile` plus `python self_test.py`; docs-only changes may mark self-test optional.
 
 ## Permission Contract
 
@@ -182,8 +128,6 @@ This project should be treated as a small agent runtime, not as a pile of prompt
 
 - Free low-risk tools include local read/search, screen observation, knowledge search, sticker search, media analysis, message reactions, and memory/profile updates with quality checks.
 
-- Safe verifier commands such as `python -m py_compile ...`, `python self_test.py`, `python agent_eval.py`, and `python agent_observability.py` may run without extra approval.
-
 - High-risk tools:
   Arbitrary `execute_command`, arbitrary `execute_python`, `execute_async_command`, destructive file operations, external downloads, external-path media sending, and UI control require approval and are not smuggled through ordinary bundles.
 
@@ -193,8 +137,8 @@ This project should be treated as a small agent runtime, not as a pile of prompt
 
 Preferred:
 
-- Chinese sticker marker: `[\u8868\u60c5\u5305: filename]`
-- Chinese screenshot marker: `[\u7cfb\u7d71\u622a\u5716: filename]`
+- Chinese sticker marker: `[表情包: filename]`
+- Chinese screenshot marker: `[系統截圖: filename]`
 
 ASCII fallbacks:
 
@@ -207,24 +151,33 @@ Before trusting a change:
 
 ```powershell
 cd C:\Agent
-python -m py_compile core_tools.py core_agent.py main.py self_test.py agent_turns.py agent_session.py agent_context.py agent_memory.py agent_knowledge.py agent_eval.py
-python -m py_compile agent_task_graph.py agent_benchmark.py
-python self_test.py
-python agent_benchmark.py
-python agent_eval.py
+python -m py_compile main.py reply_context.py sticker_flow.py sticker_assets.py telegram_input.py intent_router.py response_composer.py temporal_context.py telegram_outbox.py
+
+python scripts\reply_context_check.py
+python scripts\sticker_flow_check.py
+python scripts\sticker_assets_check.py
+python scripts\sticker_resend_check.py
+python scripts\telegram_input_check.py
+python scripts\intent_router_check.py
+python scripts\response_composer_check.py
+python scripts\temporal_context_check.py
+python scripts\stability_check.py
+python scripts\blocklist_growth_check.py
+python scripts\watchdog_check.py
+
+powershell -ExecutionPolicy Bypass -File .\start_yueyue.ps1 -CheckOnly
 ```
 
-The default suite covers protocol encoding, scoped approval, permission bundles, task transactions, action verification, repeated-failure replay, observability metrics, memory compiler, personality core, session brain, hooks, skills, context pack, replay harness, subagent-lite, Telegram fake gateway, and tool execution.
-It also covers latency routing, media cache hits, dynamic media skipping, and response policy blocking for unwanted vision calls.
-
-Optional live Telegram smoke:
+For a full regression pass including the pytest suite and Ruff:
 
 ```powershell
-$env:RUN_LIVE_TELEGRAM_SMOKE='1'
-python self_test.py
+powershell -ExecutionPolicy Bypass -File .\start_yueyue.ps1 -CheckOnly -SelfTest
 ```
 
-The live smoke sends one message, reacts to it, and sends one local sticker/media file.
+`tests_v3/` (pytest) covers protocol encoding, scoped approval, permission bundles, workflow verification, replay, provider resilience, and Telegram rendering for the v3 runtime.
+
+Live Telegram verification is manual (see RUNBOOK.md's Live Social Smoke Checklist) - there is
+no automated pytest smoke test against the real Telegram API.
 
 ## What Not To Do
 
@@ -233,5 +186,5 @@ The live smoke sends one message, reacts to it, and sends one local sticker/medi
 - Do not let model-chosen stickers go through `send_telegram_media` approval.
 - Do not silently retry code with another LLM inside `execute_python`.
 - Do not hide tool failures in natural-language replies only; preserve structured tool results and trace events.
-- Do not add a workflow directly into the model prompt when it belongs in a skill.
 - Do not bypass hooks when adding new tool execution paths.
+- Do not copy-paste a text sanitizer/classifier into a second file "just for this one caller" - it will quietly diverge from the original the next time either copy gets tuned. Add the caller to the shared module's import list instead.
