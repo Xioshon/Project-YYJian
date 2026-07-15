@@ -74,7 +74,10 @@ _TAIWAN_FINAL_PARTICLE_RE = re.compile(r"[喔喲耶](?=[\s。！？!?~～…，,
 # this only catches raw Simplified leaking out of a model that was asked for Traditional.
 # 数/记/个/为/过/让/点/写 added from gap-battery live leaks 2026-07-15 (「数一数」「快记好啦」
 # reached the owner-facing reply because none of their chars were in the tripwire).
-_SIMPLIFIED_ONLY_CHARS = "这来对时说话现发见还没头买东习级练热压历数记个为过让点写"
+# 实/么/边/远 added 2026-07-16: a live P2 test reply contained 「什么的」「实在不行」 and none of
+# those chars were gated.
+# 听/条/难 added same day: 「听到了哦」 passed the Tier-2 register check unflagged.
+_SIMPLIFIED_ONLY_CHARS = "这来对时说话现发见还没头买东习级练热压历数记个为过让点写实么边远听条难"
 
 # DeepSeek/MiniMax occasionally emit stray Cyrillic mid-sentence when writing Chinese (live
 # gap-battery leak 2026-07-15: 「我想跑一段 Python код 來數一下…」 in a permission request).

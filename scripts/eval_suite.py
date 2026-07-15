@@ -108,9 +108,16 @@ def run_tier2(judge: bool) -> tuple[int, int]:
 
 
 def _judge(rt, owner_text: str, reply: str, rubric: str) -> str:
+    # Judge ONLY against the case rubric. Earlier prompt versions let the judge invent criteria:
+    # it demanded "cocky tone" on a tired-owner case whose rubric asked for warmth, and misread
+    # "Hong Kong written Traditional" as requiring Cantonese STYLE (spoken Cantonese is banned).
     prompt = (
-        "You are a strict persona-quality judge for a mesugaki catgirl companion (cocky-but-loving, "
-        "soft 反差, Hong Kong written Traditional Chinese, never canned/assistant-like). "
+        "You judge one reply from a companion-agent persona. Judge ONLY the rubric below - do not "
+        "invent extra criteria. Context you may assume: the persona is a playful catgirl companion "
+        "who adapts tone to the moment (soft when the owner is down, teasing when playing); the "
+        "reply language is WRITTEN Traditional Chinese (spoken-Cantonese wording would be a "
+        "defect, but that is checked elsewhere - ignore register). Fail only for: violating the "
+        "rubric, sounding like a canned assistant, or ignoring what the owner actually said.\n"
         f"Owner said: {owner_text!r}\nReply: {reply!r}\nRubric: {rubric}\n"
         "Answer with exactly 'PASS: <=8 words' or 'FAIL: <=8 words'."
     )
