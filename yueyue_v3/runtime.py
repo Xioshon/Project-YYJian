@@ -318,6 +318,12 @@ class YueYueRuntimeV3:
         regenerated = self._regenerate_compliant_chat_reply(owner_text, reply)
         if regenerated and not _chat_reply_violates_social_policy(regenerated, owner_text):
             return regenerated
+        # Trace the surrender so live fallbacks are diagnosable (what did the model try to say?).
+        self._emit(
+            "chat.fallback_used",
+            "",
+            {"owner_text": owner_text[:200], "rejected_reply": reply[:300]},
+        )
         return _social_chat_fallback(owner_text)
 
     def _regenerate_compliant_chat_reply(self, owner_text: str, reply: str) -> str:
@@ -1685,7 +1691,9 @@ def _social_chat_fallback(owner_text: str) -> str:
         for marker in ("有點累", "有点累", "好累", "很累", "累死", "累了", "累啦")
     ):
         return "辛苦了。。。先歇一會，其他的月月幫你記著"
-    return "嗯？月月在聽呢，你剛剛那句想說什麼呀"
+    # Universal default: must read naturally after ANY owner message (praise, statement,
+    # question). "Spaced out, say it again" is honest, cute, and never a non-sequitur.
+    return "誒，等等，月月剛剛走神了。。。你再說一次嘛"
 
 
 def _truncate_chat_reply(reply: str, max_lines: int) -> str:
