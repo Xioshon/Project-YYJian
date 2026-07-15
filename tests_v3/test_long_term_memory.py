@@ -159,3 +159,43 @@ def test_runtime_distill_trigger_gated_and_counted(monkeypatch, tmp_path):
     assert rt.maybe_distill_memory("owner", every=2) is False  # 1st counted call
     rt.maybe_distill_memory("owner", every=2)  # 2nd -> fires
     assert calls, "distiller must run on the Nth chat turn"
+
+
+def test_commitment_extraction_and_due_resolution():
+    provider = ScriptedDistillProvider(
+        '{"episode": "主人明天要考試有點緊張", "mood": "緊張", "facts": [], "commitments": ['
+        '{"text": "主人明天有考試", "source": "明天要考試了", "due": "明天"},'
+        '{"text": "主人下週去旅行", "source": "編出來的話", "due": "明天"}]}'
+    )
+    distiller = MemoryDistiller(provider)
+    turns = [
+        ("user", "明天要考試了，好緊張啊，今晚得早點睡才行，不然明天肯定掛"),
+        ("assistant", "主人加油，月月相信你"),
+    ]
+    entries = distiller.distill(turns, "2026-07-16")
+    commitments = [entry for entry in entries if entry.kind == "commitment"]
+    assert len(commitments) == 1  # the ungrounded one ("編出來的話") is dropped
+    assert commitments[0].due_date == "2026-07-17"
+
+
+def test_pop_due_commitments_consumes_once():
+    store = _store()
+    store.add(MemoryEntry("commitment", "主人明天有考試", "2026-07-16", due_date="2026-07-17"))
+    store.add(MemoryEntry("commitment", "主人週五面試", "2026-07-16", due_date="2026-07-25"))
+    due = store.pop_due_commitments("2026-07-17")
+    assert [entry.text for entry in due] == ["主人明天有考試"]
+    assert store.pop_due_commitments("2026-07-17") == []  # consumed - never nags twice
+    # the future one survives on disk
+    reloaded = LongTermMemoryStore(store.path, FakeEmbedder())
+    assert [entry.text for entry in reloaded.entries] == ["主人週五面試"]
+
+
+def test_presence_prioritizes_due_commitment():
+    from agent_presence import PresenceEngine
+
+    engine = PresenceEngine()
+    engine.commitments_source = lambda: ["主人明天有考試"]
+    kind, reason, confidence = engine._select_candidate({"turns": []})
+    assert kind == "commitment_followup"
+    assert "考試" in reason
+    assert confidence >= 0.9

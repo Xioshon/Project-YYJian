@@ -37,8 +37,9 @@ class MemoryEntry:
     date: str  # YYYY-MM-DD (when it happened / was said)
     topics: list[str] = field(default_factory=list)
     mood: str = ""
-    source: str = ""  # for facts: the owner quote that grounds it
+    source: str = ""  # for facts/commitments: the owner quote that grounds it
     confidence: float = 0.8
+    due_date: str = ""  # for commitments: YYYY-MM-DD when a follow-up becomes due
     embedding: list[float] = field(default_factory=list)
     entry_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     created_at: float = field(default_factory=time.time)
@@ -130,6 +131,18 @@ class LongTermMemoryStore:
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [entry for score, entry in scored[:k] if score >= min_similarity]
 
+    def pop_due_commitments(self, today: str) -> list[MemoryEntry]:
+        """Return commitments due today-or-earlier and CONSUME them (a follow-up fires once;
+        repeat-nagging about the same exam is worse than occasionally missing one)."""
+        due = [
+            entry
+            for entry in self.entries
+            if entry.kind == "commitment" and entry.due_date and entry.due_date <= today
+        ]
+        for entry in due:
+            self.forget(entry.entry_id)
+        return due
+
     def forget(self, entry_id: str) -> bool:
         """Owner-correction path: drop a wrong memory and rewrite the file."""
         before = len(self.entries)
@@ -162,11 +175,32 @@ def render_memory_note(entries: list[MemoryEntry], limit_chars: int = 700) -> st
 _DISTILL_PROMPT = (
     "你在為陪伴 agent 月月整理與主人的對話記憶。從下面的對話抽取：\n"
     "1. episode：這段對話的一句話摘要（發生了什麼、主人狀態如何），40字內。\n"
-    "2. facts：值得長期記住的穩定事實（喜好/人物/習慣/計劃/紀念日），每條都必須附 source——"
+    "2. facts：值得長期記住的穩定事實（喜好/人物/習慣/紀念日），每條都必須附 source——"
     "主人原話的逐字片段。沒有就給空陣列。猜測、模型自己說的話、一次性瑣事都不要。\n"
-    '只回 JSON：{"episode": "...", "mood": "...", "facts": [{"text": "...", "source": "..."}]}\n\n'
+    "3. commitments：主人提到的、之後值得關心跟進的事（明天考試/週末面試/等下出門），"
+    "每條附 source（主人原話逐字片段）和 due（今天/明天/後天 或 YYYY-MM-DD）。沒有就空陣列。\n"
+    "只回 JSON："
+    '{"episode": "...", "mood": "...", "facts": [{"text": "...", "source": "..."}], '
+    '"commitments": [{"text": "...", "source": "...", "due": "..."}]}\n\n'
     "對話：\n{transcript}"
 )
+
+
+def _resolve_due(hint: str, today: str) -> str:
+    hint = str(hint or "").strip()
+    if re.fullmatch(r"20\d{2}-\d{2}-\d{2}", hint):
+        return hint
+    try:
+        import datetime
+
+        base = datetime.date.fromisoformat(today)
+        offsets = {"今天": 0, "今晚": 0, "等下": 0, "明天": 1, "聽日": 1, "後天": 2, "后天": 2}
+        for key, days in offsets.items():
+            if key in hint:
+                return (base + datetime.timedelta(days=days)).isoformat()
+    except Exception:
+        pass
+    return ""
 
 
 class MemoryDistiller:
@@ -207,6 +241,16 @@ class MemoryDistiller:
             # as report_result grounding).
             if text and source and _normalized(source) in _normalized(owner_text):
                 entries.append(MemoryEntry("fact", text[:200], date, source=source[:160]))
+        for item in raw.get("commitments") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            source = str(item.get("source") or "").strip()
+            due = _resolve_due(str(item.get("due") or ""), date)
+            # Same grounding stance; a commitment additionally needs a resolvable due date -
+            # "sometime" follow-ups would nag randomly instead of caringly.
+            if text and due and source and _normalized(source) in _normalized(owner_text):
+                entries.append(MemoryEntry("commitment", text[:200], date, source=source[:160], due_date=due))
         return entries
 
 

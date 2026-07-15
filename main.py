@@ -425,6 +425,12 @@ class TelegramGateway:
         self.bot = telebot.TeleBot(token)
         self.agent = agent
         self.agent.interactive_mode = False
+        # ROADMAP P4: due commitments from the long-term memory layer feed presence as the
+        # top-priority follow-up candidate ("明天考試" -> next day "考完了嗎？"). Consuming pop:
+        # each commitment follows up at most once.
+        DEFAULT_PRESENCE_ENGINE.commitments_source = lambda: [
+            entry.text for entry in self.agent.memory.pop_due_commitments(time.strftime("%Y-%m-%d"))
+        ]
         self.turn_coalescer = MessageCoalescer()
         self._presence_stop = threading.Event()
         self._presence_thread: threading.Thread | None = None

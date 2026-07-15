@@ -390,6 +390,11 @@ class PresenceEngine:
         self.debug_file = debug_file
         self.config = config or PresenceConfig.from_env()
         self.composer = composer or PresenceComposer()
+        # ROADMAP P4: optional zero-arg callable returning due commitment texts (things the owner
+        # actually said, distilled by the memory layer - e.g. 「明天考試」). A due commitment
+        # outranks every mood-guessed candidate: following up on the owner's own words is the
+        # most human move presence can make. Wired by main.py; None keeps legacy behavior.
+        self.commitments_source = None
 
     def load_state(self) -> PresenceState:
         try:
@@ -674,6 +679,14 @@ class PresenceEngine:
         return health
 
     def _select_candidate(self, short_context: dict[str, Any], now: float | None = None) -> tuple[str, str, float]:
+        # ROADMAP P4: a due commitment the owner actually voiced outranks every mood guess.
+        if callable(self.commitments_source):
+            try:
+                due = [str(item) for item in (self.commitments_source() or []) if str(item).strip()]
+            except Exception:
+                due = []
+            if due:
+                return "commitment_followup", f"約定到期：{due[0][:120]}", 0.9
         text = _flatten_context_text(short_context).casefold()
         if any(marker in text for marker in LOW_MOOD_MARKERS):
             return "care", "recent_low_mood", 0.76
