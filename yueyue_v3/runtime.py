@@ -1677,7 +1677,7 @@ def _social_chat_fallback(owner_text: str) -> str:
         and ("調你" in normalized or "调你" in normalized)
         and "累" in normalized
     ):
-        return "嗯。。。辛苦了。月月乖乖的，你別累壞自己就好"
+        return "嗯。。。辛苦了，月月乖乖的，你別累壞自己就好"
     if "有點煩" in normalized or "有点烦" in normalized:
         return "怎麼啦。。。說給月月聽聽嘛，不說也沒關係，我陪著你"
     if any(

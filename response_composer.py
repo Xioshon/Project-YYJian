@@ -11,6 +11,24 @@ from chat_text_sanitizers import _is_plain_greeting_text
 from core_tools import env_value
 from voice_contract import VOICE_REGISTER_ZH, repair_simplified_script, voice_register_violation
 
+
+def _hits_blocked_phrase(value: str) -> bool:
+    """Match the frozen blocklist script-insensitively. The Simplified-repair step converts
+    candidates to Traditional BEFORE validation, which silently un-matched blocklist entries
+    written in Simplified (批准→批準 no longer hit 「批准」). Checking the candidate in both its
+    own script AND its Simplified rendering keeps the frozen list effective without growing it."""
+    lowered = str(value or "").casefold()
+    try:
+        from yueyue_v3.context import to_simplified_script
+
+        simplified = to_simplified_script(lowered)
+    except Exception:
+        simplified = lowered
+    return any(
+        phrase.casefold() in lowered or phrase.casefold() in simplified
+        for phrase in GENERATED_GREETING_BAD_PHRASES
+    )
+
 _CACHE = Path(__file__).resolve().parent / "workspace" / "project_cache" / "recent_fast_replies.json"
 
 
@@ -448,8 +466,8 @@ def _is_valid_micro_plain_greeting(text: str, recent: list[str]) -> bool:
         return False
     if sum(value.count(mark) for mark in ["\u3002", "\uff01", "\uff1f", "!", "?"]) > 1:
         return False
-    lowered = value.casefold()
-    if any(phrase.casefold() in lowered for phrase in GENERATED_GREETING_BAD_PHRASES):
+    value.casefold()
+    if _hits_blocked_phrase(value):
         return False
     if _has_overexplained_social_wording(value):
         return False
@@ -535,8 +553,8 @@ def _is_valid_generated_greeting(text: str, recent: list[str]) -> bool:
         return False
     if GENERATED_GREETING_TIME_RE.search(value):
         return False
-    lowered = value.casefold()
-    if any(phrase.casefold() in lowered for phrase in GENERATED_GREETING_BAD_PHRASES):
+    value.casefold()
+    if _hits_blocked_phrase(value):
         return False
     if GENERATED_GREETING_STATUS_RE.search(value):
         return False

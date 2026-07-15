@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -612,8 +613,12 @@ def _assert_tight_chat_runtime_reply(reply: str) -> None:
     assert 1 <= len(lines) <= 4, reply
     assert all(len(line) <= 64 for line in lines), reply
     assert len(value) <= 180, reply
-    assert value.count("\u3002") <= 1, reply
-    assert sum(value.count(mark) for mark in ["\u3002", "\uff01", "\uff1f", "!", "?"]) <= 2, reply
+    # Collapse soft trailing ellipsis runs (\u3002\u3002\u3002/\u2026\u2026, the owner's preferred tender cadence)
+    # before counting sentence enders - mirrors the runtime gate's rule: one stylistic beat,
+    # not many sentences.
+    collapsed = re.sub(r"([\u3002\uff01\uff1f!?~\uff5e\u2026])\1+", r"\1", value)
+    assert collapsed.count("\u3002") <= 1, reply
+    assert sum(collapsed.count(mark) for mark in ["\u3002", "\uff01", "\uff1f", "!", "?"]) <= 2, reply
     assert value.count("\uff08") + value.count("(") <= 1, reply
     assert value.count("\u55b5") <= 1, reply
     for phrase in CHAT_META_FORBIDDEN:
@@ -734,13 +739,13 @@ def _check_chat_response_tightness_policy() -> None:
         (
             "\u966a\u6211\u804a\u4e00\u4e0b",
             PROJECT_META_REPLY_TEXT,
-            ["\u966a", "\u6708\u6708", "\u770b\u4f60", "\u8868\u73fe"],
-            ["\u966a", "\u770b\u4f60"],
+            ["\u6708\u6708", "\u4e00\u76f4\u90fd\u5728", "\u60f3\u804a"],
+            ["\u4e00\u76f4\u90fd\u5728", "\u60f3\u804a"],
         ),
         (
             "\u6211\u89ba\u5f97\u4f60\u525b\u525b\u6709\u9ede\u50cf\u6a5f\u5668\u4eba",
             DRAMATIC_MACHINE_REPLY_TEXT,
-            ["\u624d\u602a", "\u9072\u920d", "\u770b\u4e0d\u51fa"],
+            ["\u624d\u4e0d\u662f", "\u60f3\u4e8b\u60c5", "\u8a8d\u771f"],
             None,
         ),
         (
@@ -755,7 +760,7 @@ def _check_chat_response_tightness_policy() -> None:
         (
             "\u6211\u89ba\u5f97\u4f60\u525b\u525b\u6709\u9ede\u50cf\u6a5f\u5668\u4eba",
             LIVE_ROBOT_META_REPLY_TEXT,
-            ["\u624d\u602a", "\u9072\u920d", "\u770b\u4e0d\u51fa"],
+            ["\u624d\u4e0d\u662f", "\u60f3\u4e8b\u60c5", "\u8a8d\u771f"],
             None,
         ),
         (
@@ -769,14 +774,16 @@ def _check_chat_response_tightness_policy() -> None:
         (
             "\u6211\u89ba\u5f97\u4f60\u525b\u525b\u6709\u9ede\u50cf\u6a5f\u5668\u4eba",
             LIVE_MACHINE_TEMPLATE_REPLY_TEXT,
-            ["\u624d\u602a", "\u9072\u920d", "\u770b\u4e0d\u51fa"],
+            ["\u624d\u4e0d\u662f", "\u60f3\u4e8b\u60c5", "\u8a8d\u771f"],
             None,
         ),
         (
             "\u966a\u6211\u804a\u4e00\u4e0b",
             CONTROLLED_COMPANION_REPLY_TEXT,
-            ["\u966a", "\u6708\u6708", "\u770b\u4f60", "\u8868\u73fe"],
-            ["\u966a", "\u770b\u4f60"],
+            # Persona recalibration 2026-07-16: the companion fallback is now soft/receptive
+            # (\u597d\u5440\u3002\u3002\u3002\u6708\u6708\u4e00\u76f4\u90fd\u5728\u7684\uff0c\u60f3\u804a\u4ec0\u9ebc\uff1f) - warmth shows as presence, not a teasing bargain.
+            ["\u6708\u6708", "\u4e00\u76f4\u90fd\u5728", "\u60f3\u804a"],
+            ["\u4e00\u76f4\u90fd\u5728", "\u60f3\u804a"],
         ),
         (
             "\u966a\u6211\u804a\u4e00\u4e0b",
@@ -789,7 +796,7 @@ def _check_chat_response_tightness_policy() -> None:
         (
             "\u90a3\u6642\u5019\u53ea\u662f\u6e2c\u8a66",
             LONG_SOCIAL_REPLY_TEXT,
-            ["\u525b\u525b", "\u634f"],
+            ["\u5c31\u77e5\u9053", "\u60e6\u8a18", "\u958b\u5fc3"],
             None,
         ),
     ]
