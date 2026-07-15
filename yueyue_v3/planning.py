@@ -49,6 +49,26 @@ CANONICAL_FACT_KEYS = {
 # wandered into react_to_message (no real message existed) and blocked on the error.
 _SOCIAL_SIDE_TOOLS = {"react_to_message", "search_sticker"}
 
+# ROADMAP P3: golden plan shapes for the most common task families. Gap-battery evidence: with a
+# bare prompt the SAME task got a good plan one run and a shallow/one-step plan the next
+# (write-append-verify planned as a single step; a count task planned around the answer instead of
+# deriving it). Few-shot shapes anchor the stochasticity at near-zero token cost.
+_GOLDEN_PLAN_EXAMPLES = (
+    "\n\nGolden plan shapes (adapt names/tools, keep the SHAPE):\n"
+    "1. Count/derive from observation ('數一下X有幾個'): step1 observe (execute_command or "
+    "list_files) -> the answer appears in stdout/results; requested_output = the number (value). "
+    "Do NOT plan extra verification commands - report_result submits the observed number.\n"
+    "2. Create/modify then confirm ('建立檔案寫A，再加B，讀回確認'): one act step PER mutation "
+    "(write A; append B), then one observe step reading the final state; requested_output = the "
+    "final content read back (text).\n"
+    "3. Find which file contains X: step1 observe with search_in_files(keyword=X); "
+    "requested_output = the matching filename(s) (text).\n"
+    "4. Look up an environment value ('查Python版本'): step1 observe with execute_command running "
+    "the exact command; requested_output = the value from stdout (text).\n"
+    "5. Screen question ('屏幕上是什麼'): step1 observe capture_screen + analyze_media; "
+    "requested_output = screen_state with required_facts."
+)
+
 
 @dataclass
 class PlannedWorkflow:
@@ -143,6 +163,7 @@ class GoalPlannerV3:
             "To locate which file contains a text, prefer search_in_files over reading files one "
             "by one. Use only these tools: "
             + ", ".join(allowed_domain)
+            + _GOLDEN_PLAN_EXAMPLES
         )
         if contract_issues:
             system += (

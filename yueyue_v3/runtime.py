@@ -219,6 +219,36 @@ class YueYueRuntimeV3:
         self._emit("turn.replied", turn.turn_id, {"mode": turn.mode.value, "reply": reply[:500]})
         return reply
 
+    def _post_completion_veto(self, workflow: WorkflowState) -> str:
+        """Return a veto reason when the outputs plainly do not answer the objective, else "".
+        Opt-in (YUEYUE_TASK_POSTCHECK=1): one cheap chat-model call per completed task, live path
+        only - scripted test providers never see it. Errors and ambiguity always allow."""
+        if env_value("YUEYUE_TASK_POSTCHECK") != "1":
+            return ""
+        # Never consume a scripted test provider's queued responses (the .env opt-in leaks into
+        # tests via env_value); the check is only meaningful against the real provider anyway.
+        if type(self.provider).__name__ != "SiliconFlowProvider":
+            return ""
+        try:
+            prompt = (
+                "任務目標與提取到的結果如下。結果是否真的回答了目標要的東西？"
+                "只回 YES，或 NO: 一句原因（結果空泛/答非所問/缺了目標要求的部分才算 NO；"
+                "格式醜但內容對就是 YES）。\n"
+                + json.dumps(
+                    {"objective": workflow.goal.objective, "outputs": workflow.outputs},
+                    ensure_ascii=False,
+                )
+            )
+            response = self.provider.chat(
+                [{"role": "user", "content": prompt}], [], model=_chat_voice_model()
+            )
+            verdict = str(getattr(response, "content", "") or "").strip()
+            if verdict.upper().startswith("NO"):
+                return verdict[:160]
+        except Exception:
+            pass
+        return ""
+
     def maybe_distill_memory(self, chat_id: str, every: int = 12) -> bool:
         """ROADMAP P2 write path: every N chat turns, distill the recent window into long-term
         memory (one episode + grounded facts). Called from the LIVE Telegram path (main.py) after
@@ -492,6 +522,18 @@ class YueYueRuntimeV3:
                 return self._compose_owner_voice("workflow_state_missing", {}, "任務狀態不見了，我先停下，避免繼續誤操作。")
             decision = self.workflow_engine.verify(workflow)
             if decision.goal_satisfied:
+                # ROADMAP P3: post-completion sanity check - a cheap model call asks whether the
+                # extracted outputs actually ANSWER the objective (catches "答非所問" completions
+                # where structurally-valid outputs miss the point). Confident NO -> honest block
+                # with the reason, never a fake success; any ambiguity/error -> allow.
+                veto = self._post_completion_veto(workflow)
+                if veto:
+                    self.workflow_engine.block(workflow, f"完成前自查沒過：{veto}")
+                    state = copy.deepcopy(self.state)
+                    state.workflow = workflow
+                    self.permission_controller.clear(state.permission)
+                    self._replace_state(state, "workflow.blocked", turn.turn_id)
+                    return self._compose_blocked_reply(workflow)
                 self.permission_controller.clear(self.state.permission)
                 state = copy.deepcopy(self.state)
                 state.workflow = workflow
