@@ -199,3 +199,25 @@ def test_presence_prioritizes_due_commitment():
     assert kind == "commitment_followup"
     assert "考試" in reason
     assert confidence >= 0.9
+
+
+def test_greeting_surfaces_yesterday_episode(monkeypatch):
+    # Emotional continuity: a plain greeting has no similarity signal, so yesterday's episode
+    # (e.g. the owner was exhausted) surfaces instead - dated and hedged like every memory note.
+    import datetime
+
+    from yueyue_v3.context import ContextCompiler, ShortContextStore
+    from yueyue_v3.models import TurnEnvelope, TurnMode
+
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "workspace" / "brain").mkdir(parents=True)
+    (tmp / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
+    (tmp / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
+    compiler = ContextCompiler(tmp, ShortContextStore(tmp / "sc.json"))
+    store = _store(DeadEmbedder())  # similarity recall unavailable -> forces the fallback path
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    store.add(MemoryEntry("episode", "主人加班到深夜，情緒很低落", yesterday))
+    compiler.memory = store
+    messages = compiler.compile_turn(TurnEnvelope("owner", "早安", TurnMode.CHAT))
+    joined = "\n".join(m["content"] for m in messages if m["role"] == "system")
+    assert "低落" in joined and yesterday in joined

@@ -131,6 +131,12 @@ class LongTermMemoryStore:
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [entry for score, entry in scored[:k] if score >= min_similarity]
 
+    def episodes_on(self, date: str, limit: int = 2) -> list[MemoryEntry]:
+        """Episodes from a specific day (newest first) - powers emotional continuity: yesterday's
+        low mood surfacing naturally when the owner opens today's first conversation."""
+        matches = [entry for entry in self.entries if entry.kind == "episode" and entry.date == date]
+        return list(reversed(matches))[:limit]
+
     def pop_due_commitments(self, today: str) -> list[MemoryEntry]:
         """Return commitments due today-or-earlier and CONSUME them (a follow-up fires once;
         repeat-nagging about the same exam is worse than occasionally missing one)."""

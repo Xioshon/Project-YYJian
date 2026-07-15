@@ -144,11 +144,20 @@ class ContextCompiler:
                 messages.append({"role": "system", "content": temporal_note})
             # ROADMAP P2: recall long-term memories relevant to this message. Bounded, dated,
             # hedged - and zero recall injects nothing (never a fabricated past).
+            # ROADMAP P4 (emotional continuity): when the owner OPENS with a plain greeting,
+            # similarity recall has nothing to bite on - surface yesterday's episode instead, so
+            # "昨天主人很累" can shape today's first exchange without any keyword rule.
             if self.memory is not None:
                 try:
                     from .memory import render_memory_note
 
-                    note = render_memory_note(self.memory.retrieve(turn.text))
+                    recalled = self.memory.retrieve(turn.text)
+                    if not recalled and _is_conversation_opener(turn.text):
+                        import datetime
+
+                        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+                        recalled = self.memory.episodes_on(yesterday)
+                    note = render_memory_note(recalled)
                     if note:
                         messages.append({"role": "system", "content": note})
                 except Exception:
@@ -205,6 +214,18 @@ class ContextCompiler:
             return json.dumps(raw, ensure_ascii=False)[:2500]
         except (OSError, ValueError, UnicodeError):
             return "{}"
+
+
+def _is_conversation_opener(text: str) -> bool:
+    """Short day-opening messages (早安/我回來了/在嗎) - the moment yesterday's episode is most
+    naturally worth surfacing. Deliberately positive-trigger and tiny; not another blocklist."""
+    value = str(text or "").strip()
+    if not value or len(value) > 12:
+        return False
+    if _is_plain_greeting_text(value):
+        return True
+    openers = ("早安", "早晨", "早上好", "晚安", "我回來", "回來啦", "回来啦", "在嗎", "在吗", "醒了", "下班")
+    return any(marker in value for marker in openers) or value in {"早", "晚"}
 
 
 _INTERACTION_TO_TURN_MODE = {
