@@ -137,3 +137,17 @@ def test_social_chat_fallback_is_register_clean_on_every_branch() -> None:
     for owner_text in branch_triggers:
         line = _social_chat_fallback(owner_text)
         assert voice_register_violation(line) == "", f"{owner_text!r} -> {line!r}"
+
+
+def test_simplified_leaks_are_repaired_not_rejected() -> None:
+    """Owner requirement 2026-07-16: the canned permission line kept appearing because Simplified
+    leaks burned both generation attempts. Simplified is the one register violation that is
+    mechanically fixable - repair converts it, the gate then passes, no canned fallback."""
+    from voice_contract import repair_simplified_script
+
+    repaired = repair_simplified_script("我先处理一下，写个东西给你，条理很清楚")
+    assert repaired == "我先處理一下，寫個東西給你，條理很清楚"
+    assert voice_register_violation(repaired) == ""
+    # non-Chinese and already-Traditional text pass through untouched
+    assert repair_simplified_script("hello 月月") == "hello 月月"
+    assert repair_simplified_script("我先處理一下") == "我先處理一下"

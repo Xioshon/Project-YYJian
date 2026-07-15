@@ -9,7 +9,7 @@ from typing import Any
 
 from chat_text_sanitizers import _is_plain_greeting_text
 from core_tools import env_value
-from voice_contract import VOICE_REGISTER_ZH, voice_register_violation
+from voice_contract import VOICE_REGISTER_ZH, repair_simplified_script, voice_register_violation
 
 _CACHE = Path(__file__).resolve().parent / "workspace" / "project_cache" / "recent_fast_replies.json"
 
@@ -593,6 +593,7 @@ def _compose_generated_plain_greeting(agent: Any, owner_prompt: str, recent: lis
             return ""
         text = str(raw or "").strip()
         text = re.sub(r"^['\"「『]+|['\"」』]+$", "", text).strip()
+        text = repair_simplified_script(text)
         if _is_valid_generated_greeting(text, recent):
             return text
         # Retry once with a named critique before surrendering to the pooled fallback.
@@ -621,6 +622,7 @@ def _compose_generated_short_line(agent: Any, system: str, user: str, recent: li
             return ""
         text = str(raw or "").strip()
         text = re.sub(r"^['\"「『]+|['\"」』]+$", "", text).strip()
+        text = repair_simplified_script(text)
         if _is_valid_micro_plain_greeting(text, recent):
             return text
         prompt = user + f"\n你剛寫的「{text[:40]}」被拒：{_greeting_rejection_reason(text, recent)}。"

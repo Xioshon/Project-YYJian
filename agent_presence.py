@@ -12,7 +12,7 @@ from typing import Any
 from agent_hooks import emit_trace
 from agent_llm import SiliconFlowAdapter
 from core_tools import PROJECT_CACHE_DIR, env_value
-from voice_contract import VOICE_REGISTER_ZH, voice_register_violation
+from voice_contract import VOICE_REGISTER_ZH, repair_simplified_script, voice_register_violation
 
 PRESENCE_MODE_ENV = "YUEYUE_PRESENCE_MODE"
 PRESENCE_DAILY_LIMIT_ENV = "YUEYUE_PRESENCE_DAILY_LIMIT"
@@ -258,6 +258,8 @@ class PresenceComposer:
         opportunity: PresenceOpportunity,
         recent_candidates: list[PresenceCandidate] | None = None,
     ) -> PresenceQualityDecision:
+        # Simplified leaks are mechanically repairable - fix before gating instead of rejecting.
+        draft.message = repair_simplified_script(draft.message or "")
         message = " ".join((draft.message or "").split())
         recent_candidates = recent_candidates or []
         recent_sent = self.recent_topic_history(limit=12)

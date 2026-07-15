@@ -122,6 +122,21 @@ def voice_register_violation(text: str, allow_simplified: bool = False) -> str:
     return ""
 
 
+def repair_simplified_script(text: str) -> str:
+    """Deterministic Simplified→Traditional repair for output-side use, BEFORE gating.
+
+    Simplified leaks are the most common register violation and the only mechanically fixable
+    one - repairing instead of rejecting saves a regeneration round and avoids the canned
+    fallback. Lazy import: voice_contract is imported by yueyue_v3.context, so the character
+    table is pulled at call time, not import time."""
+    try:
+        from yueyue_v3.context import to_traditional_script
+
+        return to_traditional_script(str(text or ""))
+    except Exception:
+        return str(text or "")
+
+
 def owner_text_is_simplified(owner_text: str) -> bool:
     """Cheap same-turn check used to decide allow_simplified for the gate."""
     value = str(owner_text or "")

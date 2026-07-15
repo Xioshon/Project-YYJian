@@ -105,8 +105,9 @@ class ContextCompiler:
             # this keeps ONLY the few semantic rules the code gate cannot catch, in Chinese to
             # match the output language.
             TurnMode.CHAT: (
-                "你在跟熟悉的主人閒聊，是個賽博貓娘朋友，不是助理。照上面的風格範例那樣講話："
-                "短、口語、俏皮、帶點傲嬌，關心藏在調侃裡；預設一句話就夠，別長篇。\n"
+                "你在跟熟悉的主人閒聊，是個清新軟萌的貓娘女孩，不是助理。照上面的風格範例那樣講話："
+                "短、口語、軟軟的、被動接住主人的話；調皮是偶爾藏在細節裡的小彩蛋，不主動嗆人；"
+                "關心可以直接給。預設一句話就夠，別長篇。\n"
                 + VOICE_REGISTER_ZH
                 + "\n聊天時不會真的動用工具，所以絕不要說「我去看一下」「我先開一下」這種其實做不到的承諾——"
                 "想幫忙就直接講你知道的，或請主人把它當任務叫你做，別假裝已經在做。\n"
@@ -269,7 +270,7 @@ _SIMPLIFIED_CHARS_ORDERED = (
     "购贯贱贴贵贷贸费贺贼贾贿资赋赌赎赏赐赔赖赚赛赞赠赢趋转轮软轻载较边达迁运进远连迟适选递逻遗遥邮邻郑酿释针钉钟钢钱钻"
     "铁铃铅铜银错锁锅锈键锦锡镜闭闷闲闻阅阳队阶际陆陈险随隐难雾静韩页顶项顺须顽顾顿预领频题颜额风飞饭饮饱饰饺饼饿馆马驱"
     "验骑骗鱼鲜鸟鸡鸣鸭鸿鹅鹤鹰麦齐龙气华义极讯尽凑赶"
-    "么里刚"
+    "么里刚写条"
 )
 _TRADITIONAL_CHARS_ORDERED = (
     "國會說時學現覺後無電長門語應還關點東車來這個們為從頭讓動經過對兒開見問間該給樣萬書買賣樂習親產眾優價傳傷體黨興養決"
@@ -280,11 +281,12 @@ _TRADITIONAL_CHARS_ORDERED = (
     "購貫賤貼貴貸貿費賀賊賈賄資賦賭贖賞賜賠賴賺賽贊贈贏趨轉輪軟輕載較邊達遷運進遠連遲適選遞邏遺遙郵鄰鄭釀釋針釘鐘鋼錢鑽"
     "鐵鈴鉛銅銀錯鎖鍋銹鍵錦錫鏡閉悶閑聞閱陽隊階際陸陳險隨隱難霧靜韓頁頂項順須頑顧頓預領頻題顏額風飛飯飲飽飾餃餅餓館馬驅"
     "驗騎騙魚鮮鳥雞鳴鴨鴻鵝鶴鷹麥齊龍氣華義極訊盡湊趕"
-    "麼裡剛"
+    "麼裡剛寫條"
 )
 _SIMPLIFIED_ONLY_CHARS = frozenset(_SIMPLIFIED_CHARS_ORDERED)
 _TRADITIONAL_ONLY_CHARS = frozenset(_TRADITIONAL_CHARS_ORDERED)
 _TRADITIONAL_TO_SIMPLIFIED_TABLE = str.maketrans(_TRADITIONAL_CHARS_ORDERED, _SIMPLIFIED_CHARS_ORDERED)
+_SIMPLIFIED_TO_TRADITIONAL_TABLE = str.maketrans(_SIMPLIFIED_CHARS_ORDERED, _TRADITIONAL_CHARS_ORDERED)
 
 
 def _detect_chinese_script(text: str) -> str:
@@ -340,6 +342,16 @@ def to_simplified_script(reply: str) -> str:
     complies.
     """
     return reply.translate(_TRADITIONAL_TO_SIMPLIFIED_TABLE)
+
+
+def to_traditional_script(reply: str) -> str:
+    """Deterministically repair Simplified-script leaks back to Traditional.
+
+    The chat models intermittently drop Simplified characters into an otherwise-Traditional
+    reply (「我先处理一下」). Rejecting those replies burned a regeneration attempt and often
+    ended in a canned fallback - the owner's top pet hate - when the leak is mechanically
+    fixable with the same character table the mirroring path already trusts."""
+    return reply.translate(_SIMPLIFIED_TO_TRADITIONAL_TABLE)
 
 
 def _temporal_fact_note(owner_text: str) -> str:

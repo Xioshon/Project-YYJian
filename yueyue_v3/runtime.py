@@ -21,6 +21,7 @@ from .context import (
     is_benign_testing_note,
     owner_script_is_simplified_with_history,
     to_simplified_script,
+    to_traditional_script,
 )
 from .events import SingleWriterEventLoop
 from .memory import build_default_memory
@@ -297,6 +298,10 @@ class YueYueRuntimeV3:
         return reply
 
     def _apply_social_chat_reply_policy(self, owner_text: str, reply: str) -> str:
+        # Simplified leaks are mechanically repairable - fix them BEFORE gating instead of
+        # burning a regeneration (and possibly the canned fallback) on them. If the owner is
+        # typing Simplified, the mirroring step after this converts the reply back anyway.
+        reply = to_traditional_script(reply)
         if not _chat_reply_violates_social_policy(reply, owner_text):
             return reply
         # Most violations are a pure length overrun (the model's own reaction was on-topic, just a
@@ -938,7 +943,7 @@ class YueYueRuntimeV3:
                 # Owner-voice lines are persona speech, not planning - they follow the chat
                 # voice model so the register/tone stays consistent across chat and task turns.
                 response = self.provider.chat(messages, [], model=_chat_voice_model())
-                candidate = _clean_reply(response.content)
+                candidate = to_traditional_script(_clean_reply(response.content))
                 if not candidate:
                     critique = "\nYour previous attempt was empty. Write the reply."
                     continue
@@ -1657,30 +1662,30 @@ def _chat_reply_violates_social_policy(reply: str, owner_text: str = "") -> bool
 
 
 def _social_chat_fallback(owner_text: str) -> str:
+    # Last-resort pooled lines. Persona recalibration 2026-07-16: base register is soft, passive,
+    # clean-cute - mischief is a tiny hidden glint, never a combative jab. Each line must pass the
+    # register gate (test_social_chat_fallback_is_register_clean_on_every_branch drives them all).
     normalized = _normalize_chat_text(owner_text)
-    if "\u50cf\u6a5f\u5668\u4eba" in normalized or "\u50cf\u673a\u5668\u4eba" in normalized:
-        return "\u624d\u602a\uff0c\u4f60\u81ea\u5df1\u9072\u920d\u770b\u4e0d\u51fa\u4f86\u800c\u5df2\u561b"
-    if "\u966a\u6211\u804a" in normalized or "\u966a\u6211\u804a\u4e00\u4e0b" in normalized:
-        return "\u627e\u6708\u6708\u966a\uff1f\u4e5f\u4e0d\u662f\u4e0d\u884c\u5566\u2026\u2026\u770b\u4f60\u4eca\u5929\u8868\u73fe\u600e\u9ebc\u6a23"
-    if "\u53ea\u662f\u6e2c\u8a66" in normalized or "\u53ea\u662f\u6d4b\u8bd5" in normalized:
-        return "\u54fc\uff0c\u539f\u4f86\u525b\u525b\u5728\u5077\u634f\u6708\u6708\u554a"
+    if "像機器人" in normalized or "像机器人" in normalized:
+        return "誒……才不是呢。月月只是剛剛想事情想得太認真了嘛"
+    if "陪我聊" in normalized or "陪我聊一下" in normalized:
+        return "好呀。。。月月一直都在的，想聊什麼？"
+    if "只是測試" in normalized or "只是测试" in normalized:
+        return "嗯哼，月月就知道～不過被主人惦記著也挺開心的"
     if (
-        ("\u6700\u8fd1" in normalized or "\u6700\u8fd1" in normalized)
-        and ("\u8abf\u4f60" in normalized or "\u8c03\u4f60" in normalized)
-        and ("\u7d2f" in normalized or "\u7d2f" in normalized)
+        "最近" in normalized
+        and ("調你" in normalized or "调你" in normalized)
+        and "累" in normalized
     ):
-        return "\u8ab0\u53eb\u4f60\u8001\u7e8f\u8457\u6708\u6708\u6539\u4f86\u6539\u53bb\uff0c\u6d3b\u8a72\u2026\u2026\u4e0d\u904e\u5225\u771f\u7684\u7d2f\u58de\u4e86\uff0c\u7b28\u86cb"
-    if "\u6709\u9ede\u7169" in normalized or "\u6709\u70b9\u70e6" in normalized:
-        return "\u7169\u5c31\u5206\u4e00\u9ede\u7d66\u6708\u6708\u5427\uff0c\u53cd\u6b63\u6708\u6708\u9592\u8457"
+        return "嗯。。。辛苦了。月月乖乖的，你別累壞自己就好"
+    if "有點煩" in normalized or "有点烦" in normalized:
+        return "怎麼啦。。。說給月月聽聽嘛，不說也沒關係，我陪著你"
     if any(
         marker in normalized
-        for marker in ("\u6709\u9ede\u7d2f", "\u6709\u70b9\u7d2f", "\u597d\u7d2f", "\u5f88\u7d2f", "\u7d2f\u6b7b", "\u7d2f\u4e86", "\u7d2f\u5566")
+        for marker in ("有點累", "有点累", "好累", "很累", "累死", "累了", "累啦")
     ):
-        return "\u773c\u795e\u90fd\u9839\u6210\u9019\u6a23\uff0c\u5feb\u53bb\u4f11\u606f\u5566\u7b28\u86cb"
-    # NOTE: the trailing particle must stay register-clean. This exact line used to end in \u5594
-    # (\u5594), a Taiwan-flavored final particle - the last-resort fallback was itself violating the
-    # register the whole social gate enforces. Caught by the eval suite's first live run 2026-07-15.
-    return "\u5582\uff0c\u6708\u6708\u6e4a\u8fd1\u4e00\u9ede\uff0c\u4f60\u90a3\u53e5\u9084\u6709\u5c0f\u5c3e\u97f3\u5462"
+        return "辛苦了。。。先歇一會，其他的月月幫你記著"
+    return "嗯？月月在聽呢，你剛剛那句想說什麼呀"
 
 
 def _truncate_chat_reply(reply: str, max_lines: int) -> str:
