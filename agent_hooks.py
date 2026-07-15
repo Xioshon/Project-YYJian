@@ -1,11 +1,12 @@
 import json
 import os
 import time
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from core_tools import PROJECT_CACHE_DIR
-
 
 TRACE_LOG_FILE = os.path.join(PROJECT_CACHE_DIR, "agent_trace.jsonl")
 
@@ -61,7 +62,9 @@ class HookManager:
     def __init__(self, trace_file: str = TRACE_LOG_FILE):
         self.trace_file = trace_file
         self._hooks: dict[str, list[Callable[[HookEvent], HookDecision | None]]] = {}
-        self.events: list[HookEvent] = []
+        # Bounded ring for interactive debugging only - the durable record is the JSONL trace
+        # file. An unbounded list here leaks memory over a long-running bot process.
+        self.events: deque[HookEvent] = deque(maxlen=200)
 
     def register(self, event_name: str, handler: Callable[[HookEvent], HookDecision | None]) -> None:
         self._hooks.setdefault(event_name, []).append(handler)
@@ -110,13 +113,22 @@ class HookManager:
                 merged.append_context += decision.append_context
         return merged
 
+    _TRACE_ROTATE_BYTES = 20 * 1024 * 1024
+
     def _write_trace(self, event: HookEvent) -> None:
         try:
             os.makedirs(os.path.dirname(self.trace_file), exist_ok=True)
+            try:
+                if os.path.getsize(self.trace_file) > self._TRACE_ROTATE_BYTES:
+                    os.replace(self.trace_file, self.trace_file + ".1")
+            except OSError:
+                pass
             with open(self.trace_file, "a", encoding="utf-8") as file:
                 file.write(json.dumps(event.to_dict(), ensure_ascii=False, default=str) + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            # This is the project's own audit trail - a silent failure here would hide the
+            # exact evidence needed to debug production issues, so at least surface it.
+            print(f"[agent_hooks] failed to write trace event {event.name!r}: {exc}")
 
 
 DEFAULT_HOOK_MANAGER = HookManager()

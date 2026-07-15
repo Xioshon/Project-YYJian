@@ -7,7 +7,13 @@ from typing import Any
 
 from agent_hooks import emit_trace
 from agent_url_context import URLContextEntry, inspect_urls_for_text, render_url_context, should_preview_url
-
+from chat_text_sanitizers import (
+    _asks_about_development,
+    _has_current_time_claim,
+    _is_plain_greeting_text,
+    _is_prompt_shaped_context,
+    _sanitize_context_text,
+)
 
 ROOT_DIR = os.path.abspath(os.getenv("YUEYUE_ROOT_DIR") or os.path.dirname(__file__))
 PROJECT_CACHE_DIR = os.path.join(ROOT_DIR, "workspace", "project_cache")
@@ -30,6 +36,7 @@ REFERENCE_MARKERS = [
     "这个视频",
     "這個影片",
 ]
+
 
 
 @dataclass
@@ -56,7 +63,7 @@ class ShortContextBuffer:
             self.turns = {}
             return
         try:
-            with open(self.path, "r", encoding="utf-8") as file:
+            with open(self.path, encoding="utf-8") as file:
                 raw = json.load(file)
             self.turns = {
                 str(chat_id): [ShortContextTurn(**item) for item in items[-self.max_turns :] if isinstance(item, dict)]
@@ -75,13 +82,14 @@ class ShortContextBuffer:
     def observe_turn(self, chat_id: int | str, text: str = "", media: list[dict[str, str]] | None = None, depth: str = "metadata") -> ShortContextTurn:
         chat_key = str(chat_id)
         entries = inspect_urls_for_text(text, depth=depth)
+        stored_text = _sanitize_context_text(text, role="user")
         turn = ShortContextTurn(
             chat_id=chat_key,
-            text=(text or "")[:1200],
+            text=stored_text[:1200],
             urls=[entry.to_dict() for entry in entries],
             media=(media or [])[:8],
-            mood=infer_mood(text, media or []),
-            topic=infer_topic(text, entries, media or []),
+            mood=infer_mood(stored_text, media or []),
+            topic=infer_topic(stored_text, entries, media or []),
         )
         self.turns.setdefault(chat_key, []).append(turn)
         self.turns[chat_key] = self.turns[chat_key][-self.max_turns :]
@@ -93,10 +101,17 @@ class ShortContextBuffer:
         items = self.turns.get(str(chat_id)) or []
         if not items:
             return
-        items[-1].assistant_summary = re.sub(r"\s+", " ", text or "").strip()[:500]
+        items[-1].assistant_summary = _sanitize_context_text(text, role="assistant")[:500]
         self.save()
 
-    def render_for_turn(self, chat_id: int | str, current_text: str = "", max_chars: int = 1600) -> str:
+    def render_for_turn(
+        self, chat_id: int | str, current_text: str = "", max_chars: int = 1600, include_conversation: bool = True
+    ) -> str:
+        # include_conversation=False drops the raw conversation lines (text=/last_reply=) while
+        # keeping this store's UNIQUE contribution (reference resolution, topic/mood, URL and media
+        # context). The v3 ContextCompiler already injects the same recent turns as proper
+        # role-tagged messages for CHAT/SOCIAL, so emitting them here too fed the model the same
+        # conversation twice. TASK/VISION do NOT get v3 recent(), so they still pass True.
         items = self.turns.get(str(chat_id)) or []
         if not items:
             if has_reference_marker(current_text):
@@ -107,30 +122,44 @@ class ShortContextBuffer:
         candidate = latest_referent(items)
         if candidate and has_reference_marker(current_text):
             lines.append("可能指代：" + candidate)
+        current_is_plain_greeting = _is_plain_greeting_text(current_text)
+        allow_project_meta = _asks_about_development(current_text)
         for turn in recent:
             parts = []
             if turn.topic:
-                parts.append(f"topic={turn.topic}")
+                clean_topic = _sanitize_context_text(turn.topic, role="user", allow_project_meta=allow_project_meta)
+                if clean_topic and not _has_current_time_claim(clean_topic) and not (
+                    current_is_plain_greeting and _is_plain_greeting_text(clean_topic)
+                ):
+                    parts.append(f"topic={clean_topic}")
             if turn.mood:
                 parts.append(f"mood={turn.mood}")
-            if turn.text:
-                parts.append("text=" + turn.text[:180])
+            if turn.text and include_conversation:
+                clean_text = _sanitize_context_text(turn.text, role="user", allow_project_meta=allow_project_meta)
+                if clean_text and not (current_is_plain_greeting and _is_plain_greeting_text(clean_text)):
+                    parts.append("text=" + clean_text[:180])
             if turn.urls:
                 url_entries = [_entry_from_dict(item) for item in turn.urls[:2]]
                 parts.append(render_url_context([entry for entry in url_entries if entry], max_entries=2))
             if turn.media:
                 parts.append("media=" + ", ".join(f"{item.get('kind', '')}:{item.get('media_type', '')}" for item in turn.media[:3]))
-            if turn.assistant_summary:
-                parts.append("last_reply=" + turn.assistant_summary[:160])
+            if turn.assistant_summary and include_conversation:
+                clean_reply = _sanitize_context_text(
+                    turn.assistant_summary, role="assistant", allow_project_meta=allow_project_meta
+                )
+                if clean_reply:
+                    parts.append("last_reply=" + clean_reply[:160])
             if parts:
                 lines.append("- " + " | ".join(part for part in parts if part))
         rendered = "\n".join(lines)
         return rendered[-max_chars:]
 
 
-def build_context_for_turn(chat_id: int | str, text: str, media: list[dict[str, str]] | None = None) -> tuple[str, ShortContextTurn]:
+def build_context_for_turn(
+    chat_id: int | str, text: str, media: list[dict[str, str]] | None = None, include_conversation: bool = True
+) -> tuple[str, ShortContextTurn]:
     depth = "preview" if should_preview_url(text) else "metadata"
-    before = DEFAULT_SHORT_CONTEXT_BUFFER.render_for_turn(chat_id, text)
+    before = DEFAULT_SHORT_CONTEXT_BUFFER.render_for_turn(chat_id, text, include_conversation=include_conversation)
     turn = DEFAULT_SHORT_CONTEXT_BUFFER.observe_turn(chat_id, text, media=media or [], depth=depth)
     current_url_context = render_url_context([_entry_from_dict(item) for item in turn.urls if isinstance(item, dict)])
     sections = [before]
@@ -183,6 +212,8 @@ def infer_topic(text: str, urls: list[URLContextEntry], media: list[dict[str, st
         return (entry.title or f"{entry.platform} link" or "url")[:120]
     if media:
         return "media/sticker context"
+    if _is_prompt_shaped_context(text):
+        return ""
     clean = re.sub(r"https?://\S+", "", text or "")
     clean = re.sub(r"\s+", " ", clean).strip()
     return clean[:120]

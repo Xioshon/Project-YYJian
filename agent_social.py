@@ -2,10 +2,10 @@ import json
 import os
 import shutil
 import time
-import hashlib
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
-from typing import Iterable
 
+from agent_latency import file_hash as _sha256_file_hash
 
 ROOT_DIR = os.path.abspath(os.getenv("YUEYUE_ROOT_DIR") or os.path.dirname(__file__))
 ASSETS_DIR = os.path.join(ROOT_DIR, "workspace", "assets")
@@ -248,8 +248,6 @@ class SocialCurationReminder:
             self.states[key] = state
             _emit_trace("social_sticker.curation_reminder", chat_id=key, pending_count=pending_count)
             return True
-        state.last_count = max(state.last_count, pending_count)
-        self.states[key] = state
         return False
 
     def message(self, pending_count: int) -> str:
@@ -271,7 +269,7 @@ class SocialStickerIndex:
             self.entries = {}
             return
         try:
-            with open(self.path, "r", encoding="utf-8") as file:
+            with open(self.path, encoding="utf-8") as file:
                 data = json.load(file)
             self.entries = {}
             changed = False
@@ -600,11 +598,7 @@ def _unique_filename(directory: str, filename: str) -> str:
 
 def file_hash(path: str) -> str:
     try:
-        digest = hashlib.sha256()
-        with open(path, "rb") as file:
-            for chunk in iter(lambda: file.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
+        return _sha256_file_hash(path)
     except Exception:
         return ""
 

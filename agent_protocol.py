@@ -1,6 +1,4 @@
 import re
-from dataclasses import dataclass
-
 
 # Keep protocol strings here as Unicode escapes where useful. This prevents
 # Windows console/code-page mojibake from becoming runtime behavior.
@@ -80,20 +78,6 @@ PRIMARY_MESSAGE_LABELS = [
     "Owner primary message:",
 ]
 
-TELEGRAM_STATUS_LABELS = {
-    "get_screen_ui": "\u6b63\u5728\u89e3\u6790\u87a2\u5e55...",
-    "click_ui_element": "\u6b63\u5728\u9ede\u64ca\u4ecb\u9762...",
-    "type_keyboard": "\u6b63\u5728\u8f38\u5165\u6587\u5b57...",
-    "press_hotkey": "\u6b63\u5728\u6309\u5feb\u6377\u9375...",
-    "execute_command": "\u6b63\u5728\u57f7\u884c\u7cfb\u7d71\u547d\u4ee4...",
-    "execute_python": "\u6b63\u5728\u57f7\u884c Python...",
-    "analyze_media": "\u6b63\u5728\u5206\u6790\u5716\u7247...",
-    "send_telegram_media": "\u6b63\u5728\u767c\u9001\u5a92\u9ad4...",
-    "react_to_message": "\u6b63\u5728\u52a0\u5165 reaction...",
-    "list_files": "\u6b63\u5728\u8b80\u53d6\u6a94\u6848\u5217\u8868...",
-}
-
-
 def sticker_marker(filename: str) -> str:
     return f"[{STICKER_MARKER_LABEL}: {filename}]"
 
@@ -107,11 +91,14 @@ def screenshot_tags(filename: str) -> str:
 
 
 def sticker_pattern() -> re.Pattern:
-    return re.compile(rf"\[(?:{re.escape(STICKER_MARKER_LABEL)}|sticker):\s*(.*?)\]", re.IGNORECASE)
+    # Tolerate 1-2 surrounding brackets: the prompt instructs single-bracket [表情包: name], but the
+    # model stochastically emits [[sticker: name]]. With a single-[ pattern the inner marker matched
+    # while the outer [ ] survived sub() and leaked a stray "[]" into the user's message bubble.
+    return re.compile(rf"\[{{1,2}}(?:{re.escape(STICKER_MARKER_LABEL)}|sticker):\s*(.*?)\]{{1,2}}", re.IGNORECASE)
 
 
 def screenshot_pattern() -> re.Pattern:
-    return re.compile(rf"\[(?:{re.escape(SCREENSHOT_MARKER_LABEL)}|screenshot):\s*(.*?)\]", re.IGNORECASE)
+    return re.compile(rf"\[{{1,2}}(?:{re.escape(SCREENSHOT_MARKER_LABEL)}|screenshot):\s*(.*?)\]{{1,2}}", re.IGNORECASE)
 
 
 def classify_approval(text: str, has_pending: bool) -> str:
@@ -125,7 +112,9 @@ def classify_approval(text: str, has_pending: bool) -> str:
             return "deny"
         if any(marker.casefold() in normalized for marker in TURN_APPROVAL_PHRASES):
             return "turn"
-        if any(marker.casefold() == normalized or marker.casefold() in normalized for marker in SINGLE_APPROVAL_PHRASES):
+        if any(
+            marker.casefold() == normalized or marker.casefold() in normalized for marker in SINGLE_APPROVAL_PHRASES
+        ):
             return "single"
         if _looks_like_turn_approval(normalized):
             return "turn"
@@ -179,9 +168,26 @@ def _approval_text_candidates(text: str) -> list[str]:
 def _normalize_approval_text(text: str) -> str:
     normalized = (text or "").strip().casefold()
     normalized = re.sub(r"[\s　]+", "", normalized)
-    normalized = normalized.replace("輪", "轮").replace("許", "许").replace("權", "权").replace("續", "续").replace("這", "这")
-    normalized = normalized.replace("執", "执").replace("給", "给")
-    return normalized
+    return normalized.translate(
+        str.maketrans(
+            {
+                "\u7e7c": "\u7ee7",
+                "\u7e8c": "\u7eed",
+                "\u8a31": "\u8bb8",
+                "\u6b0a": "\u6743",
+                "\u57f7": "\u6267",
+                "\u9019": "\u8fd9",
+                "\u8f2a": "\u8f6e",
+                "\u7d66": "\u7ed9",
+                "\u9ede": "\u70b9",
+                "\u982d": "\u5934",
+                "\u55ce": "\u5417",
+                "\u958b": "\u5f00",
+                "\u95dc": "\u5173",
+                "\u4f86": "\u6765",
+            }
+        )
+    )
 
 
 def _looks_like_turn_approval(text: str) -> bool:
@@ -198,12 +204,3 @@ def _looks_like_single_approval(text: str) -> bool:
         r"(可以了|允许了|同意了|授权了|放行吧|继续做|继续执行)",
     ]
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in approval_patterns)
-
-
-@dataclass(frozen=True)
-class ProtocolMarkers:
-    sticker_label: str = STICKER_MARKER_LABEL
-    screenshot_label: str = SCREENSHOT_MARKER_LABEL
-    single_approval: tuple[str, ...] = tuple(SINGLE_APPROVAL_PHRASES)
-    turn_approval: tuple[str, ...] = tuple(TURN_APPROVAL_PHRASES)
-    deny: tuple[str, ...] = tuple(DENY_PHRASES)

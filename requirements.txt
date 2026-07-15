@@ -1,0 +1,12 @@
+ddgs>=9.0,<10
+httpx>=0.27,<1
+openai>=1.50,<3
+Pillow>=10,<13
+playwright>=1.50,<2
+pyautogui>=0.9.54,<1
+pyperclip>=1.9,<2
+pyTelegramBotAPI>=4.20,<5
+pywin32>=306
+pywinauto>=0.6.9,<1
+requests>=2.32,<3
+yt-dlp>=2025.1

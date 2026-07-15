@@ -11,6 +11,9 @@ Set-Location $Root
 
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
+if (-not $env:YUEYUE_RUNTIME) {
+    $env:YUEYUE_RUNTIME = "v3"
+}
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -133,6 +136,7 @@ try {
     Write-Host "YueYue Agent one-click launcher" -ForegroundColor Green
     Write-Host "Root: $Root"
     Write-Host "Log : $LogFile"
+    Write-Host "Runtime: $env:YUEYUE_RUNTIME"
     if (-not $CheckOnly) {
         Assert-SingleLauncher
     }
@@ -144,12 +148,14 @@ try {
     Write-Step "Checking required files"
     $requiredFiles = @(
         "main.py",
-        "core_agent.py",
         "core_tools.py",
         "agent_social.py",
         "agent_turns.py",
         "agent_latency.py",
-        "agent_observability.py"
+        "yueyue_v3\runtime.py",
+        "yueyue_v3\workflow.py",
+        "yueyue_v3\observations.py",
+        "yueyue_v3\storage.py"
     )
     foreach ($file in $requiredFiles) {
         if (-not (Test-Path (Join-Path $Root $file))) {
@@ -176,38 +182,52 @@ try {
 
     Write-Step "Runtime health"
     Invoke-Python -Python $Python -Arguments @("main.py", "--health")
+    Invoke-Python -Python $Python -Arguments @("-m", "yueyue_v3.health", "--root", $Root)
+    Invoke-Python -Python $Python -Arguments @("scripts\system_audit.py")
+    Invoke-Python -Python $Python -Arguments @("scripts\secret_scan.py")
 
     if (-not $NoCompile) {
         Write-Step "Compiling core Python files"
         Invoke-Python -Python $Python -Arguments @(
-            "-m", "py_compile",
+            "-W", "error", "-m", "py_compile",
             "core_tools.py",
-            "core_agent.py",
             "main.py",
-            "self_test.py",
             "agent_turns.py",
-            "agent_session.py",
-            "agent_context.py",
-            "agent_memory.py",
-            "agent_knowledge.py",
-            "agent_eval.py",
-            "agent_benchmark.py",
-            "agent_task_graph.py",
-            "agent_worker.py",
-            "agent_planner.py",
-            "agent_replay.py",
-        "agent_subagents.py",
-        "agent_verification.py",
-        "agent_action_verification.py",
-        "agent_transactions.py",
-        "agent_social.py",
-        "agent_observability.py"
-    )
+            "agent_social.py",
+            "agent_short_context.py",
+            "chat_text_sanitizers.py",
+            "yueyue_v3\models.py",
+            "yueyue_v3\storage.py",
+            "yueyue_v3\events.py",
+            "yueyue_v3\observations.py",
+            "yueyue_v3\permissions.py",
+            "yueyue_v3\context.py",
+            "yueyue_v3\providers.py",
+            "yueyue_v3\planning.py",
+            "yueyue_v3\tools.py",
+            "yueyue_v3\workflow.py",
+            "yueyue_v3\runtime.py",
+            "yueyue_v3\rendering.py",
+            "yueyue_v3\replay.py",
+            "yueyue_v3\health.py"
+        )
     }
 
     if ($SelfTest) {
         Write-Step "Running full self-test"
-        Invoke-Python -Python $Python -Arguments @("self_test.py")
+        Invoke-Python -Python $Python -Arguments @("-m", "pytest", "tests_v3", "-q")
+        Invoke-Python -Python $Python -Arguments @("scripts\reply_context_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\sticker_flow_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\sticker_assets_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\sticker_resend_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\telegram_input_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\intent_router_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\response_composer_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\temporal_context_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\stability_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\blocklist_growth_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\watchdog_check.py")
+        Invoke-Python -Python $Python -Arguments @("-m", "ruff", "check", "yueyue_v3", "tests_v3", "main.py", "agent_protocol.py", "scripts")
     } else {
         Write-Host ""
         Write-Host "Tip: run start_yueyue.bat -SelfTest when you want the full regression suite before startup." -ForegroundColor DarkGray

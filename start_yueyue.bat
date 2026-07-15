@@ -1,21 +1,40 @@
 @echo off
-setlocal
-title YueYue Agent Launcher
-cd /d "%~dp0"
+chcp 65001 >nul
+title YueYue Launcher
+cd /d C:\Agent
 
-set PYTHONUTF8=1
-set PYTHONIOENCODING=utf-8
-
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_yueyue.ps1" %*
-set EXITCODE=%ERRORLEVEL%
-
+echo ==========================================
+echo YueYue Launcher
+echo ==========================================
 echo.
-if not "%EXITCODE%"=="0" (
-  echo YueYue launcher exited with code %EXITCODE%.
-  echo Check the messages above or logs under workspace\logs.
-) else (
-  echo YueYue launcher stopped normally.
+echo This is the only file you need to double-click.
+echo.
+
+:CHECK
+echo [1/2] Running CheckOnly...
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\start_yueyue.ps1" -CheckOnly
+if errorlevel 1 (
+    echo.
+    echo [ERROR] CheckOnly failed.
+    echo Please fix the audit/runtime error first.
+    echo.
+    pause
+    exit /b 1
 )
+
+:RUN
 echo.
-pause
-exit /b %EXITCODE%
+echo [2/2] Starting YueYue Telegram bot...
+echo.
+echo Network unstable? YueYue will auto-reconnect polling.
+echo If Python exits completely, this launcher will restart it after 5 seconds.
+echo Press Ctrl+C twice to stop.
+echo.
+
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\start_yueyue.ps1"
+
+echo.
+echo [WARN] YueYue process exited.
+echo Restarting in 5 seconds...
+timeout /t 5 /nobreak >nul
+goto RUN

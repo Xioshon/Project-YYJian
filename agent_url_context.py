@@ -15,7 +15,6 @@ import requests
 
 from agent_hooks import emit_trace
 
-
 ROOT_DIR = os.path.abspath(os.getenv("YUEYUE_ROOT_DIR") or os.path.dirname(__file__))
 WORKSPACE_DIR = os.path.join(ROOT_DIR, "workspace")
 PROJECT_CACHE_DIR = os.path.join(WORKSPACE_DIR, "project_cache")
@@ -78,6 +77,10 @@ class URLContextEntry:
 
 
 class URLContextCache:
+    # Every shared URL adds an entry; cap it so a long-lived deployment does not
+    # accumulate an ever-growing cache in memory and on disk.
+    MAX_ENTRIES = 300
+
     def __init__(self, path: str = URL_CACHE_FILE):
         self.path = path
         self.entries: dict[str, URLContextEntry] = {}
@@ -88,13 +91,16 @@ class URLContextCache:
             self.entries = {}
             return
         try:
-            with open(self.path, "r", encoding="utf-8") as file:
+            with open(self.path, encoding="utf-8") as file:
                 raw = json.load(file)
             self.entries = {key: URLContextEntry(**value) for key, value in raw.items() if isinstance(value, dict)}
         except Exception:
             self.entries = {}
 
     def save(self) -> None:
+        if len(self.entries) > self.MAX_ENTRIES:
+            kept = sorted(self.entries.items(), key=lambda item: item[1].updated_at)[-self.MAX_ENTRIES :]
+            self.entries = dict(kept)
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as file:
             json.dump({key: value.to_dict() for key, value in self.entries.items()}, file, ensure_ascii=False, indent=2, sort_keys=True)
@@ -122,9 +128,7 @@ class URLContextCache:
         entry.failure_reason = ""
         try:
             _inspect_metadata(entry)
-            if depth in {"preview", "full"}:
-                _inspect_preview(entry)
-            elif depth == "auto" and entry.content_type in {"image"}:
+            if depth in {"preview", "full"} or depth == "auto" and entry.content_type in {"image"}:
                 _inspect_preview(entry)
         except Exception as exc:
             entry.status = "partial" if (entry.title or entry.description or entry.thumbnail_path) else "error"
@@ -151,7 +155,7 @@ def extract_urls(text: str) -> list[str]:
 
 
 def normalize_url(url: str) -> str:
-    return (url or "").strip().rstrip("。。，，、)")
+    return re.sub(r"[。。，，、)]+$", "", (url or "").strip())
 
 
 def url_cache_key(url: str) -> str:
@@ -160,7 +164,7 @@ def url_cache_key(url: str) -> str:
 
 def domain_for_url(url: str) -> str:
     try:
-        return (urlparse(url).netloc or "").casefold().lstrip("www.")
+        return (urlparse(url).netloc or "").casefold().removeprefix("www.")
     except Exception:
         return ""
 
@@ -267,9 +271,7 @@ def _cache_fresh(entry: URLContextEntry, depth: str) -> bool:
     ttl = FAILED_TTL_SECONDS if entry.status == "error" else METADATA_TTL_SECONDS
     if age > ttl:
         return False
-    if depth in {"preview", "full"} and entry.depth not in {"preview", "full"}:
-        return False
-    return True
+    return not (depth in {"preview", "full"} and entry.depth not in {"preview", "full"})
 
 
 def _inspect_metadata(entry: URLContextEntry) -> None:
@@ -404,7 +406,7 @@ def parse_douyin_metadata(text: str) -> dict[str, str]:
 
 def _parse_attrs(raw: str) -> dict[str, str]:
     attrs: dict[str, str] = {}
-    for key, quote, value in re.findall(r"([\w:-]+)\s*=\s*(['\"])(.*?)\2", raw, flags=re.DOTALL):
+    for key, _quote, value in re.findall(r"([\w:-]+)\s*=\s*(['\"])(.*?)\2", raw, flags=re.DOTALL):
         attrs[key.casefold()] = value
     return attrs
 
@@ -539,6 +541,7 @@ def _maybe_analyze_preview_image(entry: URLContextEntry) -> None:
         if os.path.getsize(entry.thumbnail_path) > 8 * 1024 * 1024:
             return
         import base64
+
         import httpx
         from openai import OpenAI
 
@@ -555,21 +558,22 @@ def _maybe_analyze_preview_image(entry: URLContextEntry) -> None:
         prompt = "用中文简短描述这张视频封面/预览帧里能看到什么。只说画面，不要猜完整视频剧情。"
         for model in model_candidates:
             try:
-                client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1", http_client=httpx.Client(timeout=45.0))
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": image_url}},
-                            ],
-                        }
-                    ],
-                    max_tokens=240,
-                )
-                entry.vision_summary = (response.choices[0].message.content or "").strip()[:500]
+                with httpx.Client(timeout=45.0) as http_client:
+                    client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1", http_client=http_client)
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {"type": "image_url", "image_url": {"url": image_url}},
+                                ],
+                            }
+                        ],
+                        max_tokens=240,
+                    )
+                    entry.vision_summary = (response.choices[0].message.content or "").strip()[:500]
                 return
             except Exception:
                 continue
@@ -582,7 +586,7 @@ def _load_api_key() -> str:
         return os.getenv("SILICONFLOW_API_KEY", "")
     env_path = os.path.join(ROOT_DIR, ".env")
     try:
-        with open(env_path, "r", encoding="utf-8") as file:
+        with open(env_path, encoding="utf-8") as file:
             for line in file:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -603,7 +607,10 @@ def _try_playwright_screenshot(entry: URLContextEntry) -> None:
         "from playwright.async_api import async_playwright\n"
         "async def main():\n"
         "    async with async_playwright() as p:\n"
-        "        browser = await p.chromium.launch(headless=True)\n"
+        "        try:\n"
+        "            browser = await p.chromium.launch(channel='chrome', headless=True)\n"
+        "        except Exception:\n"
+        "            browser = await p.chromium.launch(headless=True)\n"
         "        page = await browser.new_page(viewport={'width': 1280, 'height': 900})\n"
         "        await page.goto(sys.argv[1], wait_until='domcontentloaded', timeout=9000)\n"
         "        await page.screenshot(path=sys.argv[2], full_page=False)\n"

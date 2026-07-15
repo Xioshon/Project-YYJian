@@ -3,14 +3,16 @@ import os
 import random
 import re
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time as day_time
-from typing import Any, Callable
+from datetime import datetime
+from datetime import time as day_time
+from typing import Any
 
 from agent_hooks import emit_trace
 from agent_llm import SiliconFlowAdapter
-from core_tools import PROJECT_CACHE_DIR
-
+from core_tools import PROJECT_CACHE_DIR, env_value
+from voice_contract import VOICE_REGISTER_ZH, voice_register_violation
 
 PRESENCE_MODE_ENV = "YUEYUE_PRESENCE_MODE"
 PRESENCE_DAILY_LIMIT_ENV = "YUEYUE_PRESENCE_DAILY_LIMIT"
@@ -31,6 +33,22 @@ DEFAULT_TICK_MINUTES = 45
 DEFAULT_ICEBREAK_AFTER_MINUTES = 6 * 60
 
 PRESENCE_STATE_FILE = os.path.join(PROJECT_CACHE_DIR, "presence_state.json")
+_JSONL_ROTATE_BYTES = 10 * 1024 * 1024
+
+
+def _append_jsonl_line(path: str, payload: dict[str, Any]) -> None:
+    """Append one JSONL row with single-generation size rotation, so per-turn debug
+    files cannot grow without bound on a long-running deployment."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        if os.path.getsize(path) > _JSONL_ROTATE_BYTES:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    with open(path, "a", encoding="utf-8") as file:
+        file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
 PRESENCE_CANDIDATES_FILE = os.path.join(PROJECT_CACHE_DIR, "presence_candidates.jsonl")
 PRESENCE_HEALTH_FILE = os.path.join(PROJECT_CACHE_DIR, "presence_health.json")
 PRESENCE_DEBUG_FILE = os.path.join(PROJECT_CACHE_DIR, "presence_debug.jsonl")
@@ -185,7 +203,14 @@ class PresenceComposer:
         self.llm = llm
         self.debug_file = debug_file
         self.topic_history_file = topic_history_file
-        self.model = model or os.getenv("YUEYUE_PRESENCE_COMPOSER_MODEL", "").strip() or "deepseek-ai/DeepSeek-V4-Pro"
+        self.model = (
+            model
+            or env_value("YUEYUE_PRESENCE_COMPOSER_MODEL").strip()
+            # Presence lines are persona speech - default to the chat voice model when one
+            # is configured, so proactive check-ins sound like the same YueYue as chat turns.
+            or env_value("YUEYUE_CHAT_MODEL").strip()
+            or "deepseek-ai/DeepSeek-V4-Pro"
+        )
 
     def compose(
         self,
@@ -222,9 +247,7 @@ class PresenceComposer:
             "reason": candidate.reason,
             "opportunity": opportunity.to_dict(),
         }
-        os.makedirs(os.path.dirname(self.topic_history_file), exist_ok=True)
-        with open(self.topic_history_file, "a", encoding="utf-8") as file:
-            file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        _append_jsonl_line(self.topic_history_file, payload)
 
     def recent_topic_history(self, limit: int = 20) -> list[dict[str, Any]]:
         return _read_jsonl_file(self.topic_history_file)[-max(1, limit) :]
@@ -251,11 +274,18 @@ class PresenceComposer:
         if len(message) > 180:
             return PresenceQualityDecision(False, "message_too_long", checks=checks)
         lowered = message.casefold()
-        if any(marker in lowered for marker in BLAND_MESSAGE_MARKERS):
-            if opportunity.reason not in {"recent_low_mood", "recent_url_or_media_topic", "recent_social_mood"}:
-                return PresenceQualityDecision(False, "generic_checkin_without_context", checks=checks)
+        if any(marker in lowered for marker in BLAND_MESSAGE_MARKERS) and opportunity.reason not in {
+            "recent_low_mood",
+            "recent_url_or_media_topic",
+            "recent_social_mood",
+        }:
+            return PresenceQualityDecision(False, "generic_checkin_without_context", checks=checks)
         if any(marker in lowered for marker in FORMAL_MESSAGE_MARKERS):
             return PresenceQualityDecision(False, "too_formal_or_notification_like", checks=checks)
+        register_violation = voice_register_violation(message)
+        if register_violation:
+            checks["register_violation"] = register_violation
+            return PresenceQualityDecision(False, "voice_register_violation", checks=checks)
         if any(marker in lowered for marker in TOOL_PROMISE_MARKERS):
             return PresenceQualityDecision(False, "tool_or_task_promise_not_allowed", checks=checks)
         for item in recent_candidates:
@@ -339,10 +369,7 @@ class PresenceComposer:
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _append_debug(self, payload: dict[str, Any]) -> None:
-        payload = {"ts": _now_iso(), **payload}
-        os.makedirs(os.path.dirname(self.debug_file), exist_ok=True)
-        with open(self.debug_file, "a", encoding="utf-8") as file:
-            file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        _append_jsonl_line(self.debug_file, {"ts": _now_iso(), **payload})
 
 
 class PresenceEngine:
@@ -366,7 +393,7 @@ class PresenceEngine:
 
     def load_state(self) -> PresenceState:
         try:
-            with open(self.state_file, "r", encoding="utf-8") as file:
+            with open(self.state_file, encoding="utf-8") as file:
                 payload = json.load(file)
             if isinstance(payload, dict):
                 return PresenceState.from_dict(payload)
@@ -678,16 +705,6 @@ class PresenceEngine:
             context_summary=self.context_summary(short_context),
         )
 
-    def _message_for(self, kind: str, reason: str, quiet_now: bool = False, owner_likely_awake: bool = False) -> str:
-        prefix = "我看你剛剛好像還醒著，所以小聲冒一下泡：" if quiet_now and owner_likely_awake else ""
-        if kind == "care":
-            return prefix + "主人，月月剛剛有點想來看看你還好不好。要是累了就先歇一下，我在旁邊待命～"
-        if kind == "followup":
-            return prefix + "主人，剛剛那個連結我還惦記著。你想接著聊的話，月月可以陪你看下去～"
-        if kind == "social":
-            return prefix + "月月剛剛有點想丟個小反應，但先乖乖輕聲問一句：還要繼續鬧嗎～"
-        return prefix + "主人，月月剛剛有點想找你說句話。沒事的話我就繼續乖乖待命～"
-
     def _task_is_active(self, session_summary: str, session_updated_at: float | None, now: float) -> tuple[bool, dict[str, Any]]:
         text = (session_summary or "").casefold()
         markers = ["active_task", "awaiting_permission", "awaiting_validation", "blocked", "等待授權", "等待验证", "等待驗證"]
@@ -714,19 +731,15 @@ class PresenceEngine:
         return PresenceDecision("suppressed", reason, debug=debug)
 
     def _append_candidate(self, candidate: PresenceCandidate) -> None:
-        os.makedirs(os.path.dirname(self.candidates_file), exist_ok=True)
-        with open(self.candidates_file, "a", encoding="utf-8") as file:
-            file.write(json.dumps(candidate.to_dict(), ensure_ascii=False, sort_keys=True) + "\n")
+        _append_jsonl_line(self.candidates_file, candidate.to_dict())
 
     def _append_debug(self, payload: dict[str, Any]) -> None:
-        os.makedirs(os.path.dirname(self.debug_file), exist_ok=True)
-        with open(self.debug_file, "a", encoding="utf-8") as file:
-            file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        _append_jsonl_line(self.debug_file, payload)
 
     def _read_jsonl(self, path: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         try:
-            with open(path, "r", encoding="utf-8") as file:
+            with open(path, encoding="utf-8") as file:
                 for line in file:
                     try:
                         payload = json.loads(line)
@@ -753,19 +766,22 @@ BLAND_MESSAGE_MARKERS = ["你還好嗎", "你还好吗", "今天怎麼樣", "今
 FORMAL_MESSAGE_MARKERS = ["通知", "提醒您", "根據目前", "系统", "系統", "待命狀態", "presence", "runtime", "任務狀態"]
 TOOL_PROMISE_MARKERS = ["我幫你跑", "我帮你跑", "我去執行", "我去执行", "工具", "截圖", "截图", "命令"]
 
-PRESENCE_COMPOSER_SYSTEM_PROMPT = """你是月月的主動陪伴訊息 composer。
-你的任務不是發通知，而是判斷此刻有沒有一句值得主人回的短消息。
-人格方向：親近、熟、偏女友/伴侶式陪伴，可以可愛、好奇、輕微調侃，但不要客服腔、報告腔、任務腔。
-如果沒有具體語境或好話題，請輸出 should_send=false。
-如果 reason 是 long_silence_icebreak，代表主人很久沒回；可以開一個輕、小、有趣的新話題，但不要質問、不要查崗、不要讓人有壓力。
-只輸出 JSON，格式：
-{"should_send": true/false, "message": "繁體中文短句", "message_type": "followup|playful|care|share|icebreak|none", "topic_source": "短話題來源", "confidence": 0.0-1.0, "reason": "簡短原因"}
-"""
+PRESENCE_COMPOSER_SYSTEM_PROMPT = (
+    "你是月月的主動陪伴訊息 composer。\n"
+    "你的任務不是發通知，而是判斷此刻有沒有一句值得主人回的短消息。\n"
+    "人格方向：親近、熟、偏女友/伴侶式陪伴，可以可愛、好奇、輕微調侃，但不要客服腔、報告腔、任務腔。\n"
+    + VOICE_REGISTER_ZH
+    + "\n如果沒有具體語境或好話題，請輸出 should_send=false。\n"
+    "如果 reason 是 long_silence_icebreak，代表主人很久沒回；可以開一個輕、小、有趣的新話題，但不要質問、不要查崗、不要讓人有壓力。\n"
+    "只輸出 JSON，格式：\n"
+    '{"should_send": true/false, "message": "繁體中文短句", "message_type": "followup|playful|care|share|icebreak|none", '
+    '"topic_source": "短話題來源", "confidence": 0.0-1.0, "reason": "簡短原因"}\n'
+)
 
 
 def load_presence_health(path: str = PRESENCE_HEALTH_FILE) -> dict[str, Any]:
     try:
-        with open(path, "r", encoding="utf-8") as file:
+        with open(path, encoding="utf-8") as file:
             payload = json.load(file)
         if isinstance(payload, dict):
             if "composer_enabled" not in payload:
@@ -869,7 +885,7 @@ def _similar_text(a: str, b: str) -> bool:
 def _read_jsonl_file(path: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     try:
-        with open(path, "r", encoding="utf-8") as file:
+        with open(path, encoding="utf-8") as file:
             for line in file:
                 try:
                     payload = json.loads(line)

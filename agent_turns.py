@@ -1,12 +1,11 @@
 import os
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 from agent_hooks import emit_trace
 from agent_latency import InteractionMode, classify_interaction
-
 
 ROOT_DIR = os.path.abspath(os.getenv("YUEYUE_ROOT_DIR") or os.path.dirname(__file__))
 TURN_DEBOUNCE_ENV = "YUEYUE_TURN_DEBOUNCE_SECONDS"
@@ -18,7 +17,7 @@ def _read_env_file_value(key: str) -> str:
     if not os.path.exists(env_path):
         return ""
     try:
-        with open(env_path, "r", encoding="utf-8") as file:
+        with open(env_path, encoding="utf-8") as file:
             for line in file:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:

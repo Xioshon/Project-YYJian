@@ -1,0 +1,17 @@
+[tool.pytest.ini_options]
+testpaths = ["tests_v3"]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = [
+  "workspace",
+  "__pycache__",
+  "Agent-Backups",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+ignore = ["E501"]
+

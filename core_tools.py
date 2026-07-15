@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import fnmatch
 import html
 import json
@@ -10,14 +11,17 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from html.parser import HTMLParser
+from typing import Any
 
 import httpx
 import requests
 from openai import OpenAI
 
-from agent_latency import DEFAULT_MEDIA_CACHE, media_type_for, summarize_vision_text
+from agent_latency import DEFAULT_MEDIA_CACHE, media_type_for
 from agent_social import DEFAULT_SOCIAL_STICKER_INDEX, is_safe_sticker
 
 try:
@@ -27,10 +31,8 @@ except ImportError:
 
 
 for stream in (sys.stdout, sys.stderr):
-    try:
+    with contextlib.suppress(Exception):
         stream.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
 
 
 ROOT_DIR = os.path.abspath(os.getenv("YUEYUE_ROOT_DIR") or os.path.dirname(__file__))
@@ -53,7 +55,6 @@ PROFILE_FILE = os.path.join(MEMORY_DIR, "profile.json")
 MEMORY_FILE = os.path.join(MEMORY_DIR, "memory.md")
 TASK_PLAN_FILE = os.path.join(TASKS_DIR, "task_plan.md")
 CHAT_ID_FILE = os.path.join(WORKSPACE_DIR, "tg_chat_id.txt")
-UI_MAP_FILE = os.path.join(PROJECT_CACHE_DIR, "ui_map.json")
 
 for folder in [
     WORKSPACE_DIR,
@@ -77,7 +78,7 @@ def _read_env_file() -> dict[str, str]:
     if not os.path.exists(env_path):
         return values
     try:
-        with open(env_path, "r", encoding="utf-8") as file:
+        with open(env_path, encoding="utf-8") as file:
             for line in file:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -90,7 +91,16 @@ def _read_env_file() -> dict[str, str]:
 
 
 _ENV_FILE = _read_env_file()
-API_KEY = os.getenv("SILICONFLOW_API_KEY") or _ENV_FILE.get("SILICONFLOW_API_KEY", "")
+
+
+def env_value(key: str, default: str = "") -> str:
+    """Shared "real OS env var wins, .env file is fallback" lookup - main.py never loads
+    .env into process environment generically, so every config key needs this, not just
+    the two (API_KEY/TG_TOKEN) that already had it hand-rolled here."""
+    return os.getenv(key) or _ENV_FILE.get(key, default)
+
+
+API_KEY = env_value("SILICONFLOW_API_KEY")
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or _ENV_FILE.get("TELEGRAM_BOT_TOKEN", "")
 
 
@@ -117,7 +127,12 @@ def resolve_path(filename: str) -> str:
         return WORKSPACE_DIR
     if os.path.isabs(filename):
         return os.path.abspath(filename)
-    return os.path.abspath(os.path.join(WORKSPACE_DIR, filename))
+    normalized = os.path.normpath(str(filename).strip().replace("/", os.sep))
+    parts = normalized.split(os.sep)
+    workspace_name = os.path.basename(os.path.normpath(WORKSPACE_DIR))
+    if parts and parts[0].casefold() == workspace_name.casefold():
+        normalized = os.path.join(*parts[1:]) if len(parts) > 1 else ""
+    return os.path.abspath(os.path.join(WORKSPACE_DIR, normalized))
 
 
 def is_workspace_path(path: str) -> bool:
@@ -141,7 +156,8 @@ def find_sticker_file(name: str) -> str:
     candidates: list[tuple[str, str]] = []
     for actual in os.listdir(STICKERS_DIR):
         actual_path = os.path.join(STICKERS_DIR, actual)
-        if os.path.isfile(actual_path):
+        # Zero-byte files pass isfile() but Telegram rejects them ("file must be non-empty").
+        if os.path.isfile(actual_path) and os.path.getsize(actual_path) > 0:
             candidates.append((actual, actual_path))
             if actual == base:
                 return actual_path
@@ -223,7 +239,7 @@ def resolve_command_cwd(cwd: str = "project") -> tuple[str, str]:
 
 def _cwd_retry_hint(command: str, resolved_cwd: str) -> str:
     command = command or ""
-    if resolved_cwd == WORKSPACE_DIR and any(name in command for name in ("core_tools.py", "core_agent.py", "main.py", "self_test.py")):
+    if resolved_cwd == WORKSPACE_DIR and any(name in command for name in ("core_tools.py", "main.py")):
         return "This looks like a project-root command. Retry with cwd='project'."
     if "No such file" in command or "cannot find" in command.casefold():
         return "Check cwd and file path, then retry with cwd='project' or cwd='workspace'."
@@ -277,67 +293,15 @@ def _run_command(command: str, timeout: int = 60, cwd: str = "project") -> ToolR
         return ToolResult("error", "Command raised an exception.", data={"cwd": cwd_label, "resolved_cwd": resolved_cwd}, error=str(exc))
 
 
-def real_get_screen_ui() -> ToolResult:
-    try:
-        import pywinauto
-        import win32gui
-    except ImportError:
-        return _error("Missing dependencies. Install pywinauto pyautogui pywin32.")
-    try:
-        hwnd = win32gui.GetForegroundWindow()
-        if not hwnd:
-            return _error("No active foreground window.")
-        title = win32gui.GetWindowText(hwnd)
-        window = pywinauto.Desktop(backend="uia").window(handle=hwnd)
-        ui_map = {}
-        lines = [f"Active window: {title}", "Clickable/input elements:"]
-        element_id = 1
-        valid_types = {"Button", "Edit", "MenuItem", "TabItem", "ListItem", "Document"}
-        for wrapper in window.descendants():
-            try:
-                ctrl_type = wrapper.element_info.control_type
-                name = wrapper.window_text() or wrapper.element_info.name
-                if ctrl_type not in valid_types or not name or not wrapper.is_visible():
-                    continue
-                rect = wrapper.rectangle()
-                ui_map[str(element_id)] = {
-                    "name": name,
-                    "type": ctrl_type,
-                    "x": (rect.left + rect.right) // 2,
-                    "y": (rect.top + rect.bottom) // 2,
-                }
-                lines.append(f"[{element_id}] {ctrl_type}: {name}")
-                element_id += 1
-                if element_id > 100:
-                    lines.append("...(truncated)")
-                    break
-            except Exception:
-                continue
-        with open(UI_MAP_FILE, "w", encoding="utf-8") as file:
-            json.dump(ui_map, file, ensure_ascii=False, indent=2)
-        return _ok("\n".join(lines), {"count": len(ui_map)})
-    except Exception as exc:
-        return _error("Failed to inspect screen UI.", str(exc))
+def observation_tool_stub(**_kwargs: Any) -> ToolResult:
+    """Placeholder handler for the six observation tool names.
 
-
-def real_click_ui_element(element_id: str, double_click: bool = False) -> ToolResult:
-    try:
-        import pyautogui
-    except ImportError:
-        return _error("Missing pyautogui.")
-    if not os.path.exists(UI_MAP_FILE):
-        return _error("UI map not found. Call get_screen_ui first.")
-    try:
-        with open(UI_MAP_FILE, "r", encoding="utf-8") as file:
-            ui_map = json.load(file)
-        target = ui_map.get(str(element_id))
-        if not target:
-            return _error(f"Element id {element_id} was not found.")
-        pyautogui.moveTo(target["x"], target["y"], duration=0.4)
-        pyautogui.doubleClick() if double_click else pyautogui.click()
-        return _ok(f"Clicked {target['type']} {target['name']}.")
-    except Exception as exc:
-        return _error("Click failed.", str(exc))
+    The real implementations live in `yueyue_v3.observations.ObservationService`;
+    `ToolCatalogV3._override_observation_tools` replaces these entries at runtime
+    construction, so this stub only exists to keep the public tool names and
+    schemas registered in ALL_TOOLS. It must never execute on a live path.
+    """
+    return _error("This observation tool is provided by the v3 runtime's ObservationService.")
 
 
 def real_type_keyboard(text: str, press_enter: bool = False) -> ToolResult:
@@ -374,7 +338,7 @@ def _background_worker(command: str, task_name: str, output_file: str) -> None:
         file.write(result.to_text())
     if os.path.exists(CHAT_ID_FILE) and TG_TOKEN:
         try:
-            with open(CHAT_ID_FILE, "r", encoding="utf-8") as file:
+            with open(CHAT_ID_FILE, encoding="utf-8") as file:
                 chat_id = file.read().strip()
             if chat_id:
                 requests.post(
@@ -387,7 +351,10 @@ def _background_worker(command: str, task_name: str, output_file: str) -> None:
 
 
 def real_execute_async_command(command: str, task_name: str) -> ToolResult:
-    task_id = int(time.time())
+    # uuid suffix: two async commands started within the same wall-clock second used to
+    # collide on the same output file/notification path (real_execute_python already
+    # avoids this class of bug the same way).
+    task_id = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
     output_file = os.path.join(ASYNC_LOGS_DIR, f"task_result_{task_id}.txt")
     thread = threading.Thread(target=_background_worker, args=(command, task_name, output_file), daemon=True)
     thread.start()
@@ -410,9 +377,9 @@ def real_update_plan(step_number: int, status: str, notes: str = "") -> ToolResu
     if not os.path.exists(TASK_PLAN_FILE):
         return _error("Task plan file not found.")
     try:
-        with open(TASK_PLAN_FILE, "r", encoding="utf-8") as file:
+        with open(TASK_PLAN_FILE, encoding="utf-8") as file:
             lines = file.readlines()
-        done_values = {"done", "complete", "completed", "完成", "瀹屾垚", "x", "yes", "true"}
+        done_values = {"done", "complete", "completed", "完成", "x", "yes", "true"}
         mark = "x" if str(status).strip().casefold() in done_values else " "
         updated = False
         for index, line in enumerate(lines):
@@ -434,7 +401,10 @@ def real_update_plan(step_number: int, status: str, notes: str = "") -> ToolResu
 def real_execute_python(code: str, timeout: int = 30) -> ToolResult:
     if not code or not code.strip():
         return _error("Python code is empty.")
-    filepath = os.path.join(PROJECT_CACHE_DIR, "_temp_script.py")
+    # Unique per call - a fixed shared filename would let two overlapping execute_python calls
+    # (e.g. the main turn and a background worker) race on write/read and silently run the wrong
+    # code with no error surfaced.
+    filepath = os.path.join(PROJECT_CACHE_DIR, f"_temp_script_{uuid.uuid4().hex}.py")
     try:
         timeout = max(1, min(int(timeout), 120))
     except Exception:
@@ -453,10 +423,15 @@ def real_execute_python(code: str, timeout: int = 30) -> ToolResult:
         return _error(f"Python timed out after {timeout}s.")
     except Exception as exc:
         return _error("Python raised an exception.", str(exc))
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(filepath)
 
 
 def real_search_in_files(keyword: str, directory: str = ".") -> ToolResult:
     target_dir = resolve_path(directory)
+    if not is_workspace_path(target_dir):
+        return _error("search_in_files can only search inside workspace.")
     if not os.path.exists(target_dir):
         return _error("Directory not found.")
     results = []
@@ -469,7 +444,7 @@ def real_search_in_files(keyword: str, directory: str = ".") -> ToolResult:
                     continue
                 path = os.path.join(root, filename)
                 try:
-                    with open(path, "r", encoding="utf-8", errors="replace") as file:
+                    with open(path, encoding="utf-8", errors="replace") as file:
                         for number, line in enumerate(file, 1):
                             if keyword.casefold() in line.casefold():
                                 results.append(f"{os.path.relpath(path, WORKSPACE_DIR)}:{number}: {line.strip()}")
@@ -527,6 +502,59 @@ def real_web_search(query: str) -> ToolResult:
         return _error("Web search failed.", str(exc))
 
 
+class _ReadablePageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._ignored_depth = 0
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() in {"script", "style", "noscript", "svg", "canvas"}:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() in {"script", "style", "noscript", "svg", "canvas"} and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth:
+            return
+        value = re.sub(r"\s+", " ", data or "").strip()
+        if value:
+            self._parts.append(value)
+
+    def readable_text(self) -> str:
+        return "\n".join(self._parts)
+
+
+def _read_webpage_direct(url: str) -> ToolResult:
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) YueYue/3",
+                "Accept": "text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.5",
+            },
+            timeout=30,
+        )
+        if not response.ok:
+            return _error(f"Direct webpage request returned HTTP {response.status_code}.")
+        content_type = str(response.headers.get("content-type") or "").casefold()
+        raw_text = str(response.text or "")[:2_000_000]
+        if "html" in content_type or "<html" in raw_text[:1000].casefold():
+            parser = _ReadablePageParser()
+            parser.feed(raw_text)
+            readable = parser.readable_text()
+            if not readable:
+                return _error("Direct webpage response contained no readable text.")
+            return _ok("Webpage read directly.", truncate_text(readable, 8000))
+        if any(marker in content_type for marker in ("text/", "json", "xml")):
+            return _ok("Webpage read directly.", truncate_text(raw_text, 8000))
+        return _error(f"Direct webpage response is not readable text ({content_type or 'unknown content type'}).")
+    except Exception as exc:
+        return _error("Direct webpage request failed.", str(exc))
+
+
 def real_read_webpage(url: str) -> ToolResult:
     if not re.match(r"^https?://", url or "", flags=re.IGNORECASE):
         return _error("URL must start with http:// or https://.")
@@ -553,11 +581,23 @@ def real_read_webpage(url: str) -> ToolResult:
             clean_error = payload.get("readableMessage") or payload.get("message") or clean_error
         except Exception:
             pass
+        direct = _read_webpage_direct(url)
+        if direct.status == "ok":
+            return direct
         if re.search(r"bad network reputation|anonymous queries|authenticate|40103", clean_error, flags=re.IGNORECASE):
-            return _error("Reader service requires authentication or was blocked by network reputation.", "reader_service_blocked")
-        return _error(f"Reader returned HTTP {response.status_code}.", truncate_text(clean_error, 500))
+            return _error(
+                "Reader service was blocked and the direct webpage fallback also failed.",
+                f"reader_service_blocked; {direct.error or direct.message}",
+            )
+        return _error(
+            f"Reader returned HTTP {response.status_code}, and the direct webpage fallback failed.",
+            truncate_text(direct.error or direct.message or clean_error, 500),
+        )
     except Exception as exc:
-        return _error("Failed to read webpage.", str(exc))
+        direct = _read_webpage_direct(url)
+        if direct.status == "ok":
+            return direct
+        return _error("Failed to read webpage through both reader and direct request.", f"{exc}; {direct.error or direct.message}")
 
 
 def real_download_file(url: str, filename: str) -> ToolResult:
@@ -566,12 +606,13 @@ def real_download_file(url: str, filename: str) -> ToolResult:
     filepath = resolve_path(filename)
     if not is_workspace_path(filepath):
         return _error("download_file can only save inside workspace.")
+    tmp_path = filepath + ".part"
     try:
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         total = 0
         with requests.get(url, stream=True, timeout=60, headers={"User-Agent": "Mozilla/5.0"}) as response:
             response.raise_for_status()
-            with open(filepath, "wb") as file:
+            with open(tmp_path, "wb") as file:
                 for chunk in response.iter_content(chunk_size=8192):
                     if not chunk:
                         continue
@@ -579,18 +620,19 @@ def real_download_file(url: str, filename: str) -> ToolResult:
                     if total > 50 * 1024 * 1024:
                         raise ValueError("File exceeds 50MB limit.")
                     file.write(chunk)
+        os.replace(tmp_path, filepath)
         return _ok("File downloaded.", {"path": filepath, "bytes": total})
     except Exception as exc:
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except Exception:
-            pass
+        with contextlib.suppress(OSError):
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
         return _error("Download failed.", str(exc))
 
 
 def real_analyze_media(file_path: str, prompt: str = "Describe this image.") -> ToolResult:
     filepath = resolve_path(file_path)
+    if not is_workspace_path(filepath):
+        return _error("analyze_media can only read files inside workspace.")
     if not os.path.exists(filepath):
         return _error(f"File not found: {filepath}")
     media_type = media_type_for(filepath)
@@ -618,21 +660,22 @@ def real_analyze_media(file_path: str, prompt: str = "Describe this image.") -> 
     errors = []
     for model in model_candidates:
         try:
-            client = OpenAI(api_key=API_KEY, base_url="https://api.siliconflow.cn/v1", http_client=httpx.Client(timeout=90.0))
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": image_url}},
-                        ],
-                    }
-                ],
-                max_tokens=800,
-            )
-            content = response.choices[0].message.content.strip()
+            with httpx.Client(timeout=90.0) as http_client:
+                client = OpenAI(api_key=API_KEY, base_url="https://api.siliconflow.cn/v1", http_client=http_client)
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": image_url}},
+                            ],
+                        }
+                    ],
+                    max_tokens=800,
+                )
+                content = response.choices[0].message.content.strip()
             entry = DEFAULT_MEDIA_CACHE.set_vision_summary(filepath, content)
             return _ok("Image analyzed.", {"summary": entry.vision_summary, "cache_key": entry.file_hash})
         except Exception as exc:
@@ -642,6 +685,8 @@ def real_analyze_media(file_path: str, prompt: str = "Describe this image.") -> 
 
 def real_read_file(filename: str) -> ToolResult:
     filepath = resolve_path(filename)
+    if not is_workspace_path(filepath):
+        return _error("read_file can only read files inside workspace.")
     if not os.path.exists(filepath):
         return _error(f"File not found: {filepath}")
     try:
@@ -652,7 +697,7 @@ def real_read_file(filename: str) -> ToolResult:
             return _error("File exceeds 2MB text read limit.")
         for encoding in ("utf-8", "utf-8-sig", "mbcs"):
             try:
-                with open(filepath, "r", encoding=encoding) as file:
+                with open(filepath, encoding=encoding) as file:
                     return _ok("File read.", file.read())
             except UnicodeDecodeError:
                 continue
@@ -678,6 +723,8 @@ def real_delete_file(filename: str) -> ToolResult:
 
 def real_send_telegram_media(file_path: str, caption: str = "") -> ToolResult:
     filepath = resolve_path(file_path)
+    if not is_workspace_path(filepath):
+        return _error("send_telegram_media can only send files inside workspace.")
     if not os.path.exists(filepath):
         sticker_candidate = find_sticker_file(file_path)
         if sticker_candidate:
@@ -689,7 +736,7 @@ def real_send_telegram_media(file_path: str, caption: str = "") -> ToolResult:
     if not os.path.exists(CHAT_ID_FILE):
         return _error("Telegram chat id is not recorded yet. Send /start to the bot first.")
     try:
-        with open(CHAT_ID_FILE, "r", encoding="utf-8") as file:
+        with open(CHAT_ID_FILE, encoding="utf-8") as file:
             chat_id = file.read().strip()
         if not chat_id:
             return _error("Telegram chat id is empty.")
@@ -718,7 +765,7 @@ def real_send_telegram_media(file_path: str, caption: str = "") -> ToolResult:
         try:
             chat_id = ""
             if os.path.exists(CHAT_ID_FILE):
-                with open(CHAT_ID_FILE, "r", encoding="utf-8") as file:
+                with open(CHAT_ID_FILE, encoding="utf-8") as file:
                     chat_id = file.read().strip()
             fallback = _send_telegram_media_text_fallback(chat_id, filepath, caption, str(exc))
             if fallback.status == "ok":
@@ -769,9 +816,13 @@ def real_react_to_message(emoji: str, chat_id: str = "", message_id: int | str =
         return _error("Reaction emoji is empty.")
     if not TG_TOKEN:
         return _error("TELEGRAM_BOT_TOKEN is not configured.")
+    try:
+        message_id_int = int(message_id)
+    except ValueError:
+        return _error(f"Reaction message_id is not a valid integer: {message_id!r}")
     payload = {
         "chat_id": chat_id,
-        "message_id": int(message_id),
+        "message_id": message_id_int,
         "reaction": json.dumps([{"type": "emoji", "emoji": emoji}], ensure_ascii=False),
         "is_big": False,
     }
@@ -825,7 +876,7 @@ def real_update_profile(key: str, value: str, category: str = "important_facts")
         return _error(bad)
     try:
         if os.path.exists(PROFILE_FILE) and os.path.getsize(PROFILE_FILE) > 0:
-            with open(PROFILE_FILE, "r", encoding="utf-8") as file:
+            with open(PROFILE_FILE, encoding="utf-8") as file:
                 profile = json.load(file)
         else:
             profile = {"basic_info": {}, "preferences": [], "important_facts": []}
@@ -840,7 +891,6 @@ def real_update_profile(key: str, value: str, category: str = "important_facts")
                 profile[category].append(item)
         with open(PROFILE_FILE, "w", encoding="utf-8") as file:
             json.dump(profile, file, ensure_ascii=False, indent=2)
-        _refresh_compiled_memory()
         return _ok("Profile updated.", {"category": category, "key": key})
     except Exception as exc:
         return _error("Profile update failed.", str(exc))
@@ -859,25 +909,14 @@ def real_update_memory(content: str, mode: str = "append") -> ToolResult:
         else:
             old = ""
             if os.path.exists(MEMORY_FILE):
-                with open(MEMORY_FILE, "r", encoding="utf-8") as file:
+                with open(MEMORY_FILE, encoding="utf-8") as file:
                     old = file.read()
             text = old + f"\n- [{timestamp}] {content}\n"
         with open(MEMORY_FILE, "w", encoding="utf-8") as file:
             file.write(text)
-        _refresh_compiled_memory()
         return _ok("Memory updated.", {"mode": mode})
     except Exception as exc:
         return _error("Memory update failed.", str(exc))
-
-
-def _refresh_compiled_memory() -> None:
-    try:
-        from agent_memory import compile_memory, memory_health_check
-
-        memory_health_check()
-        compile_memory("chat", "")
-    except Exception:
-        pass
 
 
 def real_search_sticker(emotion_or_keyword: str) -> ToolResult:
@@ -892,7 +931,7 @@ def real_search_sticker(emotion_or_keyword: str) -> ToolResult:
     index_data = {}
     if os.path.exists(STICKERS_INDEX_FILE):
         try:
-            with open(STICKERS_INDEX_FILE, "r", encoding="utf-8") as file:
+            with open(STICKERS_INDEX_FILE, encoding="utf-8") as file:
                 index_data = json.load(file)
         except Exception:
             pass
@@ -903,57 +942,24 @@ def real_search_sticker(emotion_or_keyword: str) -> ToolResult:
     if API_KEY and len(API_KEY) > 10 and actual_files:
         try:
             options = "\n".join([f"- {f} {index_data.get(f, '')}" for f in actual_files[:120]])
-            client = OpenAI(api_key=API_KEY, base_url="https://api.siliconflow.cn/v1", http_client=httpx.Client(timeout=10.0))
-            response = client.chat.completions.create(
-                model="deepseek-ai/DeepSeek-V3",
-                messages=[{"role": "user", "content": f"Pick 1-3 sticker filenames for: {emotion_or_keyword}. Reply filenames only.\n{options}"}],
-                max_tokens=80,
-                temperature=0.2,
-            )
-            picked = []
-            for line in response.choices[0].message.content.splitlines():
-                candidate = line.strip().lstrip("- ").strip()
-                if candidate in actual_files:
-                    picked.append(candidate)
+            with httpx.Client(timeout=10.0) as http_client:
+                client = OpenAI(api_key=API_KEY, base_url="https://api.siliconflow.cn/v1", http_client=http_client)
+                response = client.chat.completions.create(
+                    model="deepseek-ai/DeepSeek-V3",
+                    messages=[{"role": "user", "content": f"Pick 1-3 sticker filenames for: {emotion_or_keyword}. Reply filenames only.\n{options}"}],
+                    max_tokens=80,
+                    temperature=0.2,
+                )
+                picked = []
+                for line in response.choices[0].message.content.splitlines():
+                    candidate = line.strip().lstrip("- ").strip()
+                    if candidate in actual_files:
+                        picked.append(candidate)
             if picked:
                 return _ok("Semantic sticker matches found.", picked[:3])
         except Exception:
             pass
     return _ok("No matching sticker found.", [])
-
-
-def real_search_knowledge(query: str, limit: int = 5) -> ToolResult:
-    try:
-        from agent_knowledge import search_knowledge
-        from agent_hooks import emit_trace
-
-        hits = search_knowledge(query, limit=limit)
-        emit_trace("KnowledgeSearch", query=(query or "")[:160], hit_count=len(hits), source="tool")
-        return _ok("Knowledge search completed.", {"query": query, "hits": hits})
-    except Exception as exc:
-        return _error("Knowledge search failed.", str(exc))
-
-
-def real_read_knowledge(chunk_id: str) -> ToolResult:
-    try:
-        from agent_knowledge import read_knowledge
-
-        chunk = read_knowledge(chunk_id)
-        if not chunk:
-            return _ok("Knowledge chunk not found.", {"chunk_id": chunk_id})
-        return _ok("Knowledge chunk loaded.", chunk)
-    except Exception as exc:
-        return _error("Knowledge read failed.", str(exc))
-
-
-def real_reindex_workspace() -> ToolResult:
-    try:
-        from agent_knowledge import reindex_workspace
-
-        manifest = reindex_workspace()
-        return _ok("Knowledge index rebuilt.", manifest)
-    except Exception as exc:
-        return _error("Knowledge reindex failed.", str(exc))
 
 
 def real_inspect_url(url: str, depth: str = "auto") -> ToolResult:
@@ -988,8 +994,12 @@ def real_reindex_url_cache() -> ToolResult:
         return _error("URL cache index failed.", str(exc))
 
 
-get_screen_ui_tool = AgentTool("get_screen_ui", "Inspect visible UI controls on the active window.", real_get_screen_ui, {"type": "object", "properties": {}}, False)
-click_ui_element_tool = AgentTool("click_ui_element", "Click an element id returned by get_screen_ui.", real_click_ui_element, {"type": "object", "properties": {"element_id": {"type": "string"}, "double_click": {"type": "boolean"}}, "required": ["element_id"]}, True)
+get_screen_ui_tool = AgentTool("get_screen_ui", "Inspect visible UI controls on the active window.", observation_tool_stub, {"type": "object", "properties": {}}, False)
+capture_screen_tool = AgentTool("capture_screen", "Capture one internal screenshot and return a short-lived screenshot id and local path.", observation_tool_stub, {"type": "object", "properties": {}}, False)
+list_windows_tool = AgentTool("list_windows", "List visible top-level windows with stable ids and titles.", observation_tool_stub, {"type": "object", "properties": {"max_results": {"type": "integer"}}}, False)
+focus_window_tool = AgentTool("focus_window", "Focus a window id returned by list_windows and verify it became active.", observation_tool_stub, {"type": "object", "properties": {"window_id": {"type": "string"}}, "required": ["window_id"]}, True)
+click_screen_tool = AgentTool("click_screen", "Click coordinates from the latest fresh capture_screen screenshot id; requires a fresh observation afterwards.", observation_tool_stub, {"type": "object", "properties": {"screenshot_id": {"type": "string"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "double_click": {"type": "boolean"}}, "required": ["screenshot_id", "x", "y"]}, True)
+click_ui_element_tool = AgentTool("click_ui_element", "Click an element id returned by get_screen_ui.", observation_tool_stub, {"type": "object", "properties": {"element_id": {"type": "string"}, "double_click": {"type": "boolean"}}, "required": ["element_id"]}, True)
 type_keyboard_tool = AgentTool("type_keyboard", "Type text into the active UI using clipboard paste.", real_type_keyboard, {"type": "object", "properties": {"text": {"type": "string"}, "press_enter": {"type": "boolean"}}, "required": ["text"]}, True)
 press_hotkey_tool = AgentTool("press_hotkey", "Press a system hotkey, e.g. ctrl,c or win,d.", real_press_hotkey, {"type": "object", "properties": {"keys": {"type": "string"}}, "required": ["keys"]}, True)
 create_plan_tool = AgentTool("create_plan", "Create a task plan file.", real_create_plan, {"type": "object", "properties": {"objective": {"type": "string"}, "steps": {"type": "array", "items": {"type": "string"}}}, "required": ["objective", "steps"]}, False)
@@ -1017,15 +1027,16 @@ update_memory_tool = AgentTool("update_memory", "Update long-term narrative memo
 execute_python_tool = AgentTool("execute_python", "Run Python code once with timeout and structured output.", real_execute_python, {"type": "object", "properties": {"code": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["code"]}, True)
 execute_command_tool = AgentTool("execute_command", "Run a shell command with timeout and structured output.", real_execute_command, {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}, "cwd": {"type": "string", "enum": ["project", "workspace"]}}, "required": ["command"]}, True)
 search_sticker_tool = AgentTool("search_sticker", "Search local sticker filenames by emotion or keyword.", real_search_sticker, {"type": "object", "properties": {"emotion_or_keyword": {"type": "string"}}, "required": ["emotion_or_keyword"]}, False)
-search_knowledge_tool = AgentTool("search_knowledge", "Search the local engineering knowledge index.", real_search_knowledge, {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}, False)
-read_knowledge_tool = AgentTool("read_knowledge", "Read one local engineering knowledge chunk by id.", real_read_knowledge, {"type": "object", "properties": {"chunk_id": {"type": "string"}}, "required": ["chunk_id"]}, False)
-reindex_workspace_tool = AgentTool("reindex_workspace", "Rebuild the local engineering knowledge index.", real_reindex_workspace, {"type": "object", "properties": {}}, False)
 inspect_url_tool = AgentTool("inspect_url", "Inspect a URL with cached metadata and optional preview.", real_inspect_url, {"type": "object", "properties": {"url": {"type": "string"}, "depth": {"type": "string", "enum": ["metadata", "auto", "preview", "full"]}}, "required": ["url"]}, False)
 read_url_context_tool = AgentTool("read_url_context", "Read cached URL context by URL or cache id.", real_read_url_context, {"type": "object", "properties": {"url_or_id": {"type": "string"}}, "required": ["url_or_id"]}, False)
 reindex_url_cache_tool = AgentTool("reindex_url_cache", "Reload the local URL context cache.", real_reindex_url_cache, {"type": "object", "properties": {}}, False)
 
 ALL_TOOLS = [
     get_screen_ui_tool,
+    capture_screen_tool,
+    list_windows_tool,
+    focus_window_tool,
+    click_screen_tool,
     click_ui_element_tool,
     type_keyboard_tool,
     press_hotkey_tool,
@@ -1048,9 +1059,6 @@ ALL_TOOLS = [
     execute_python_tool,
     execute_command_tool,
     search_sticker_tool,
-    search_knowledge_tool,
-    read_knowledge_tool,
-    reindex_workspace_tool,
     inspect_url_tool,
     read_url_context_tool,
     reindex_url_cache_tool,
