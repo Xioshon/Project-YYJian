@@ -21,7 +21,10 @@ workspace/telegram_images/
 workspace/memory/chat_summary/rolling_summary.md
 workspace/assets/tg_images/
 workspace/assets/screenshots/
-workspace/assets/stickers/tg_sticker_*
+# Personal sticker collection (publish-readiness: repo ships no personal images; see
+# docs/PERSONA_GUIDE.md for supplying your own)
+workspace/assets/stickers/
+workspace/assets/stickers_index.json
 workspace/assets/stickers_archive/
 workspace/assets/social_sticker_index.json
 workspace/screenshot_*.png
