@@ -1143,6 +1143,13 @@ class TelegramGateway:
                 reply_summary_for_context(reply_data) if isinstance(reply_data, dict) else "",
             )
             self._record_presence_candidate(turn, reply_data)
+            # ROADMAP P2: long-term memory distillation runs on the live path only, in the
+            # background, AFTER the reply is out - the owner never waits on it and scripted
+            # test providers never see it. Chat/social turns only; task turns are workflows.
+            if turn.mode.value in {"chat", "social_sticker"}:
+                threading.Thread(
+                    target=lambda: self.agent.maybe_distill_memory("telegram"), daemon=True
+                ).start()
         except Exception as exc:
             print(f"[TG warning] aggregated turn failed: {type(exc).__name__}: {exc}")
             try:

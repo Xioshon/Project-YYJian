@@ -84,6 +84,8 @@ class ContextCompiler:
     def __init__(self, root: str | Path, short_context: ShortContextStore):
         self.root = Path(root)
         self.short_context = short_context
+        # Optional long-term memory store (ROADMAP P2), attached by the runtime. None = no recall.
+        self.memory = None
 
     def system_prompt(self, mode: TurnMode) -> str:
         personality = self._read("workspace/brain/personality.md", 6500)
@@ -140,6 +142,17 @@ class ContextCompiler:
             temporal_note = _temporal_fact_note(turn.text)
             if temporal_note:
                 messages.append({"role": "system", "content": temporal_note})
+            # ROADMAP P2: recall long-term memories relevant to this message. Bounded, dated,
+            # hedged - and zero recall injects nothing (never a fabricated past).
+            if self.memory is not None:
+                try:
+                    from .memory import render_memory_note
+
+                    note = render_memory_note(self.memory.retrieve(turn.text))
+                    if note:
+                        messages.append({"role": "system", "content": note})
+                except Exception:
+                    pass
             current_is_plain_greeting = _is_plain_greeting_text(turn.text)
             allow_project_meta = _asks_about_development(turn.text)
             for item in self.short_context.recent(turn.chat_id, 6):

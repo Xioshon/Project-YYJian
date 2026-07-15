@@ -624,7 +624,11 @@ for bad_generated in invalid_generated_cases:
     finally:
         response_composer.plain_greeting_social_generation_enabled = original_generation_flag
     assert fallback_reply.get("_composer_source") == "fallback", fallback_reply
-    assert bad_agent.provider.calls == 1, bad_agent.provider.calls
+    # ROADMAP P1: a rejected generation retries ONCE with a named critique before the pooled
+    # fallback (2 provider calls, not 1) - the blocklist is now a self-correction signal, not a
+    # straight-to-canned discard trigger. The agent here always regenerates the same bad line,
+    # so both attempts fail and the fallback still wins.
+    assert bad_agent.provider.calls == 2, bad_agent.provider.calls
     assert fallback_reply["content"] != bad_generated, fallback_reply
     _assert_tight_social_text(fallback_reply["content"])
 

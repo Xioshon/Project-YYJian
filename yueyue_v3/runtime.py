@@ -23,6 +23,7 @@ from .context import (
     to_simplified_script,
 )
 from .events import SingleWriterEventLoop
+from .memory import build_default_memory
 from .models import (
     ActionEnvelope,
     ExecutionEvidence,
@@ -89,6 +90,14 @@ class YueYueRuntimeV3:
         self.planner = GoalPlannerV3(provider, self.tools.names)
         self.short_context = ShortContextStore(self.state_dir / "short_context.json")
         self.context = ContextCompiler(self.root, self.short_context)
+        # ROADMAP P2: long-term memory. Retrieval failures degrade to "no recall" (chat still
+        # works with zero API balance); distillation runs every N chat turns and drops any fact
+        # the owner's own words cannot ground.
+        self.memory, self.memory_distiller = build_default_memory(
+            self.root, env_value("SILICONFLOW_API_KEY"), provider, env_value("YUEYUE_CHAT_MODEL")
+        )
+        self.context.memory = self.memory
+        self._turns_since_distill = 0
         self.interactive_mode = False
         self.max_iterations = 18
         set_event_sink = getattr(self.provider, "set_event_sink", None)
@@ -209,6 +218,31 @@ class YueYueRuntimeV3:
         self.context.remember(turn, reply)
         self._emit("turn.replied", turn.turn_id, {"mode": turn.mode.value, "reply": reply[:500]})
         return reply
+
+    def maybe_distill_memory(self, chat_id: str, every: int = 12) -> bool:
+        """ROADMAP P2 write path: every N chat turns, distill the recent window into long-term
+        memory (one episode + grounded facts). Called from the LIVE Telegram path (main.py) after
+        the reply is dispatched - deliberately NOT from _chat_turn, so scripted-provider tests
+        never get a surprise distill call eating their queued responses, and the owner never
+        waits on distillation latency. Failures are silent - memory is an enhancement, never a
+        chat-breaking dependency. Explicit opt-in via YUEYUE_LTM=1."""
+        if env_value("YUEYUE_LTM") != "1":
+            return False
+        self._turns_since_distill += 1
+        if self._turns_since_distill < every:
+            return False
+        self._turns_since_distill = 0
+        try:
+            window = [
+                (item.role, item.text) for item in self.context.short_context.recent(chat_id, every + 4)
+            ]
+            date = time.strftime("%Y-%m-%d")
+            for entry in self.memory_distiller.distill(window, date):
+                self.memory.add(entry)
+                self._emit("memory.distilled", "", {"kind": entry.kind, "text": entry.text[:200]})
+            return True
+        except Exception:
+            return False
 
     def _deduplicate_emoji_against_recent(self, chat_id: str, reply: str) -> str:
         """Strip any emoji from this reply that already appeared in a recent assistant reply,
