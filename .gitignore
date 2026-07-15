@@ -22,6 +22,7 @@ workspace/memory/chat_summary/rolling_summary.md
 workspace/assets/tg_images/
 workspace/assets/screenshots/
 workspace/assets/stickers/tg_sticker_*
+workspace/assets/stickers_archive/
 workspace/assets/social_sticker_index.json
 workspace/screenshot_*.png
 workspace/fullscreen_screenshot.png
@@ -35,3 +36,26 @@ workspace/project/**/*.pyc
 workspace/project_cache/
 *.tmp
 *.bak
+
+# --- Local lint/test caches ---
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Codex / ChatGPT handoff private exports ---
+docs/codex_handoff/chat_exports/raw/
+docs/codex_handoff/chat_exports/private/
+*.zip
+conversations.json
+message_feedback.json
+user.json
+
+# --- YueYue private runtime memory/state ---
+workspace/memory/
+workspace/brain/
+
+# --- Local Codex logs/sessions ---
+.codex-log/
+codex-tui.log
+session-*.jsonl
