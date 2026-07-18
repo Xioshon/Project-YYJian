@@ -12,6 +12,7 @@ from typing import Any
 
 from agent_protocol import classify_approval, extract_primary_message
 from core_tools import AgentTool, ToolResult, env_value
+from skill_engine import try_skill
 from voice_contract import VOICE_REGISTER_EN, owner_text_is_simplified, voice_register_violation
 
 from .context import (
@@ -251,6 +252,20 @@ class YueYueRuntimeV3:
         return ""
 
     def _chat_turn(self, turn: TurnEnvelope) -> str:
+        # ROADMAP P6: skill layer. A keyword prefilter gates this so ordinary chat pays nothing;
+        # only a plausibly-actionable message reaches the model router. A handled skill is phrased
+        # in-persona (never canned) and short-circuits normal chat generation. Opt-in YUEYUE_SKILLS=1.
+        if turn.mode == TurnMode.CHAT and env_value("YUEYUE_SKILLS") == "1":
+            try:
+                outcome = try_skill(turn.text, turn.chat_id, self.provider, _chat_voice_model())
+            except Exception:
+                outcome = None
+            if outcome is not None:
+                reply = self._compose_skill_reply(turn, outcome.note)
+                self.context.remember(turn, reply)
+                self._emit("skill.used", turn.turn_id, {"note": outcome.note[:200], "ok": outcome.ok})
+                return reply
+
         messages = self.context.compile_turn(turn)
         try:
             response = self.provider.chat(messages, [], model=_chat_voice_model())
@@ -266,6 +281,55 @@ class YueYueRuntimeV3:
         self.context.remember(turn, reply)
         self._emit("turn.replied", turn.turn_id, {"mode": turn.mode.value, "reply": reply[:500]})
         return reply
+
+    def _compose_skill_reply(self, turn: TurnEnvelope, note: str) -> str:
+        """Phrase a skill outcome in YueYue's own voice (never a canned confirmation). Falls back
+        to the plain factual note if generation fails - still correct, just less flavored."""
+        instruction = (
+            "你剛剛順手幫主人處理好了一件事。用你自己的語氣自然地把結果告訴主人，一到兩句，"
+            "別像系統通知或客服，就像你隨手幫了個小忙。結果是：" + note
+        )
+        try:
+            response = self.provider.chat(
+                [
+                    {"role": "system", "content": self.context.system_prompt(TurnMode.CHAT)},
+                    {"role": "user", "content": instruction},
+                ],
+                [],
+                model=_chat_voice_model(),
+            )
+            reply = _drop_trailing_full_stop(to_traditional_script(_clean_reply(response.content)))
+            reply = self._apply_social_chat_reply_policy(turn.text, reply)
+            if reply and not _chat_reply_violates_social_policy(reply, turn.text):
+                if owner_script_is_simplified_with_history(turn.text, self.context.short_context, turn.chat_id):
+                    reply = to_simplified_script(reply)
+                return reply
+        except Exception:
+            pass
+        return note
+
+    def compose_reminder_fire(self, text: str) -> str:
+        """Compose the owner-facing line when a scheduled reminder fires, in persona. Deterministic
+        fallback keeps a firing reminder from ever silently failing to deliver its content."""
+        instruction = (
+            "現在是你之前答應主人要提醒他的時間到了。自然、親切地提醒主人這件事，一到兩句，"
+            "帶點你自己的語氣。要提醒的事：" + str(text)
+        )
+        try:
+            response = self.provider.chat(
+                [
+                    {"role": "system", "content": self.context.system_prompt(TurnMode.CHAT)},
+                    {"role": "user", "content": instruction},
+                ],
+                [],
+                model=_chat_voice_model(),
+            )
+            reply = _drop_trailing_full_stop(to_traditional_script(_clean_reply(response.content)))
+            if reply and not voice_register_violation(reply):
+                return reply
+        except Exception:
+            pass
+        return f"主人，時間到囉，該「{text}」了"
 
     def _post_completion_veto(self, workflow: WorkflowState) -> str:
         """Return a veto reason when the outputs plainly do not answer the objective, else "".

@@ -54,6 +54,7 @@ from core_tools import (
     set_telegram_context,
 )
 from intent_router import classify_owner_intent
+from reminders import DEFAULT_REMINDER_STORE, ReminderScheduler
 from reply_context import reply_summary_for_context
 from response_composer import compose_fast_reply, is_plain_greeting, is_simple_wake_greeting
 from sticker_assets import direct_sticker_reply
@@ -1243,6 +1244,23 @@ class TelegramGateway:
         except Exception:
             return ""
 
+    def _start_reminder_scheduler(self) -> None:
+        """ROADMAP P6: fire scheduled reminders on time (independent of presence throttling). The
+        owner is single, so a fired reminder is always sent to the stored owner chat id; the fire
+        line is composed in persona."""
+        def _fire(reminder) -> None:
+            chat_id = self._read_presence_chat_id() or str(reminder.chat_id)
+            if not chat_id or chat_id == "telegram":
+                return
+            try:
+                line = self.agent.compose_reminder_fire(reminder.text)
+            except Exception:
+                line = f"主人，時間到囉，該「{reminder.text}」了"
+            self._telegram_call(self.bot.send_message, chat_id, line)
+
+        self._reminder_scheduler = ReminderScheduler(DEFAULT_REMINDER_STORE, _fire)
+        self._reminder_scheduler.start()
+
     def _maybe_send_first_contact(self) -> None:
         """One-time model-composed icebreaker for a brand-new relationship (owner request
         2026-07-16). Fires exactly once, guarded by a marker file that is only absent on a genuine
@@ -1440,6 +1458,7 @@ class TelegramGateway:
     def start(self) -> None:
         print("\n>>> Telegram bot mode started.")
         self._start_presence_scheduler()
+        self._start_reminder_scheduler()
         # First-contact icebreaker: delayed so polling is up before the unprompted send.
         threading.Timer(8.0, self._maybe_send_first_contact).start()
         self.watchdog.beat("tg_get_updates")
