@@ -1243,6 +1243,33 @@ class TelegramGateway:
         except Exception:
             return ""
 
+    def _maybe_send_first_contact(self) -> None:
+        """One-time model-composed icebreaker for a brand-new relationship (owner request
+        2026-07-16). Fires exactly once, guarded by a marker file that is only absent on a genuine
+        fresh start (a memory wipe removes it, so re-introducing after a wipe re-fires). Never
+        canned - if the model can't produce a clean opener, nothing is sent. Independent of the
+        presence engine, which keeps running as normal."""
+        try:
+            marker = os.path.join(PROJECT_CACHE_DIR, "first_contact.json")
+            if os.path.exists(marker):
+                return
+            chat_id = self._read_presence_chat_id()
+            if not chat_id:
+                return
+            # Fresh relationship only: skip if there is already ongoing conversation history.
+            if DEFAULT_SHORT_CONTEXT_BUFFER.turns.get(str(chat_id)):
+                return
+            opener = self.agent.compose_opener()
+            if not opener:
+                return
+            self._telegram_call(self.bot.send_message, chat_id, opener)
+            os.makedirs(PROJECT_CACHE_DIR, exist_ok=True)
+            with open(marker, "w", encoding="utf-8") as handle:
+                json.dump({"sent_at": time.time(), "text": opener[:200]}, handle, ensure_ascii=False)
+            print(f"[first-contact] sent opener: {opener[:60]}")
+        except Exception as exc:
+            print(f"[first-contact warning] {exc}")
+
     def _presence_scheduler_loop(self) -> None:
         interval = max(60, int(DEFAULT_PRESENCE_ENGINE.config.tick_minutes * 60))
         while not self._presence_stop.wait(interval):
@@ -1413,6 +1440,8 @@ class TelegramGateway:
     def start(self) -> None:
         print("\n>>> Telegram bot mode started.")
         self._start_presence_scheduler()
+        # First-contact icebreaker: delayed so polling is up before the unprompted send.
+        threading.Timer(8.0, self._maybe_send_first_contact).start()
         self.watchdog.beat("tg_get_updates")
         self.watchdog.start()
 

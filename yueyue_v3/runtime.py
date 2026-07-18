@@ -203,6 +203,53 @@ class YueYueRuntimeV3:
 
         return self._start_task(turn, tool_callback)
 
+    _OPENER_FORBIDDEN = (
+        "系統", "系统", "初始化", "ai", "模型", "workflow", "工作流", "記憶", "记忆", "清空",
+        "上線", "上线", "重啟", "重启", "載入", "加载", "程式", "程序", "指令", "tool",
+    )
+
+    def _opener_leaks_meta(self, text: str) -> bool:
+        lowered = str(text or "").casefold()
+        return any(word in lowered for word in self._OPENER_FORBIDDEN)
+
+    def compose_opener(self) -> str:
+        """Model-composed first-contact icebreaker (owner request 2026-07-16).
+
+        A fresh companion that sits silent until spoken to feels dead; YueYue opens warmly in her
+        own voice to set the tone and give 主人 an easy entry point. Fully generated - never a
+        canned line - and validated for register/internal-term leaks. Returns "" if it cannot
+        produce a clean opener (then nothing is sent; the owner just messages first, as before).
+        The caller decides WHEN this fires (once per fresh relationship)."""
+        instruction = (
+            "這是你和主人的第一次見面，你的記憶是全新的。你主動先開口，自然地打個招呼、破個冰。"
+            "溫柔、清新、帶一點點你自己的小俏皮，一到兩句就好。可以順口起個輕鬆的小話題、或問一句"
+            "讓主人好接話。不要提到系統、AI、模型、初始化、記憶被清空這類話，就像一個剛認識、但已經"
+            "有點自來熟的可愛女孩子在跟主人搭話。"
+        )
+        prompt = instruction
+        for _ in range(2):
+            try:
+                response = self.provider.chat(
+                    [
+                        {"role": "system", "content": self.context.system_prompt(TurnMode.CHAT)},
+                        {"role": "user", "content": prompt},
+                    ],
+                    [],
+                    model=_chat_voice_model(),
+                )
+                reply = _drop_trailing_full_stop(to_traditional_script(_clean_reply(response.content)))
+            except Exception:
+                return ""
+            if (
+                reply
+                and len(reply) <= 120
+                and not voice_register_violation(reply)
+                and not self._opener_leaks_meta(reply)
+            ):
+                return reply
+            prompt = instruction + "\n（你剛才那句不合適，重寫一句更自然、更短、字感乾淨的開場白）"
+        return ""
+
     def _chat_turn(self, turn: TurnEnvelope) -> str:
         messages = self.context.compile_turn(turn)
         try:
