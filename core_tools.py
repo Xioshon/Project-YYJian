@@ -494,12 +494,67 @@ def real_execute_command(command: str, timeout: int = 60, cwd: str = "project") 
     return _run_command(command, timeout, cwd)
 
 
-def real_web_search(query: str) -> ToolResult:
+def _fetch_page_excerpt(url: str, limit: int = 1400) -> str:
+    """Fetch one result page and return readable body text (best-effort, short timeout)."""
     try:
-        results = list(DDGS().text(query, max_results=3))
-        return _ok("Search completed.", results)
+        response = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,*/*;q=0.5"},
+            timeout=8,
+        )
+        if not response.ok:
+            return ""
+        raw_text = str(response.text or "")[:800_000]
+        parser = _ReadablePageParser()
+        parser.feed(raw_text)
+        text = re.sub(r"\s+", " ", parser.readable_text() or "").strip()
+        # Skip leading navigation/menu boilerplate. Nav renders as space-separated SHORT tokens
+        # (首頁 分類索引 登入 ...); real prose is a LONG unbroken run of characters reaching a
+        # sentence ender. Anchor on the first such run and start there.
+        match = re.search(r"[^\s]{20,}[^。.!?！？]{0,300}[。.！？]", text)
+        prose = text[match.start():] if match else text
+        return prose[:limit]
+    except Exception:
+        return ""
+
+
+def real_web_search(query: str) -> ToolResult:
+    """Search the web and return EVIDENCE, not bare links (rebuilt 2026-07-16, owner: 要準).
+
+    Old behavior returned 3 raw DuckDuckGo snippet dicts - the model answered from 100-char
+    snippets and was often wrong. Now: pull more results, fetch the top pages' actual body text,
+    and hand back titled, dated, source-attributed evidence blocks the model can genuinely
+    answer from (and cite). Page fetch failures degrade to the snippet - search never hard-fails
+    because one site blocked us."""
+    query = str(query or "").strip()
+    if not query:
+        return _error("Empty search query.")
+    try:
+        results = list(DDGS().text(query, max_results=6))
     except Exception as exc:
         return _error("Web search failed.", str(exc))
+    if not results:
+        return _ok("Search returned no results.", [])
+    evidence: list[dict] = []
+    for index, item in enumerate(results):
+        url = str(item.get("href") or item.get("url") or "")
+        entry = {
+            "title": str(item.get("title") or "")[:160],
+            "url": url,
+            "snippet": str(item.get("body") or "")[:400],
+        }
+        # Fetch full body for the top 3 only - accuracy where it matters, bounded latency.
+        if index < 3 and url:
+            excerpt = _fetch_page_excerpt(url)
+            if excerpt and len(excerpt) > len(entry["snippet"]):
+                entry["excerpt"] = excerpt
+        evidence.append(entry)
+    lines = [f"Search evidence for: {query}  (searched at {time.strftime('%Y-%m-%d %H:%M')})"]
+    for i, entry in enumerate(evidence, 1):
+        lines.append(f"[{i}] {entry['title']} — {entry['url']}")
+        lines.append("    " + (entry.get("excerpt") or entry["snippet"] or "(no text)"))
+    message = "\n".join(lines)
+    return _ok(truncate_text(message, 6000), evidence)
 
 
 class _ReadablePageParser(HTMLParser):

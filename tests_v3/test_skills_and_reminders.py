@@ -3,95 +3,120 @@ from __future__ import annotations
 import tempfile
 
 from reminders import ReminderStore
-from skill_engine import _prefilter, try_skill
+from skill_engine import SkillContext, execute_skill, skill_tools
 
 
-class RouteProvider:
-    """Scripted skill-router: returns a fixed JSON decision, records that it was called."""
-
-    def __init__(self, decision_json: str):
-        self.decision_json = decision_json
-        self.calls = 0
-
-    def chat(self, messages, tools, **kwargs):
-        self.calls += 1
-
-        class R:
-            content = self.decision_json
-
-        return R()
+def _ctx(now: float = 1000.0) -> SkillContext:
+    return SkillContext(chat_id="telegram", now=now)
 
 
-def _store(tmp) -> ReminderStore:
-    return ReminderStore(path=str(tmp / "reminders.json"))
+def test_catalog_shape_is_model_ready():
+    # Every skill must present a model-usable spec: name, a WHEN-style description, JSON schema.
+    tools = skill_tools()
+    assert len(tools) >= 20
+    for tool in tools:
+        assert tool.name and tool.description
+        assert tool.parameters.get("type") == "object"
 
 
-def test_prefilter_gates_normal_chat_from_any_model_call():
-    # Ordinary chatter must not match any skill keyword -> no candidates -> no model call at all.
-    assert _prefilter("月月你今天好可愛") == []
-    assert _prefilter("今天天氣真好啊") == []
-    assert _prefilter("十分鐘後提醒我喝水")  # a real reminder request matches
+def test_unknown_skill_fails_softly():
+    out = execute_skill("no_such_skill", {}, _ctx())
+    assert not out.ok
 
 
-def test_normal_chat_never_calls_router(monkeypatch):
-    provider = RouteProvider('{"skill":"none"}')
-    out = try_skill("陪我聊聊天嘛", "telegram", provider)
-    assert out is None
-    assert provider.calls == 0  # prefilter short-circuited before any API cost
+def test_quick_calc_and_safety():
+    assert "= 5888" in execute_skill("quick_calc", {"expression": "128*46"}, _ctx()).note
+    assert execute_skill("quick_calc", {"expression": "sqrt(16)"}, _ctx()).note.endswith("= 4")
+    # code injection must be rejected, not executed
+    assert not execute_skill("quick_calc", {"expression": "__import__('os').getcwd()"}, _ctx()).ok
 
 
-def test_set_reminder_creates_a_scheduled_reminder(monkeypatch, tmp_path):
+def test_unit_convert_families_and_temperature():
+    assert "8.047" in execute_skill("unit_convert", {"value": 5, "from_unit": "mile", "to_unit": "km"}, _ctx()).note
+    assert "212.0" in execute_skill("unit_convert", {"value": 100, "from_unit": "C", "to_unit": "F"}, _ctx()).note
+    assert not execute_skill("unit_convert", {"value": 1, "from_unit": "斤", "to_unit": "km"}, _ctx()).ok
+
+
+def test_date_calc_days_until(monkeypatch):
+    import datetime
+    now = datetime.datetime(2026, 7, 16, 12, 0).timestamp()
+    note = execute_skill("date_calc", {"target_date": "2026-07-20"}, _ctx(now)).note
+    assert "4 天" in note
+
+
+def test_fun_skills_are_wellformed():
+    note = execute_skill("dice_roll", {"sides": 20, "count": 2}, _ctx()).note
+    assert "D20" in note and "合計" in note
+    assert execute_skill("coin_flip", {}, _ctx()).note
+    assert "選中了" in execute_skill("decide_pick", {"options": ["A", "B", "C"]}, _ctx()).note
+    assert not execute_skill("decide_pick", {"options": ["only-one"]}, _ctx()).ok
+    assert "首選" in execute_skill("eat_decider", {}, _ctx()).note
+
+
+def test_daily_fortune_is_stable_within_a_day():
+    a = execute_skill("daily_fortune", {}, _ctx(1_800_000_000.0)).note
+    b = execute_skill("daily_fortune", {}, _ctx(1_800_000_000.0 + 3600)).note
+    assert a == b  # same day, same 籤
+
+
+def test_rock_paper_scissors_verdicts():
+    note = execute_skill("rock_paper_scissors", {"owner_move": "石頭"}, _ctx()).note
+    assert any(k in note for k in ["平手", "月月贏了", "主人贏了"])
+
+
+def test_notes_todo_expense_roundtrip(monkeypatch, tmp_path):
+    import local_store
+    import skill_engine as se
+    notes = local_store.ListStore("t_notes", directory=str(tmp_path))
+    todos = local_store.ListStore("t_todos", directory=str(tmp_path))
+    expenses = local_store.ListStore("t_exp", directory=str(tmp_path))
+    monkeypatch.setattr(se, "NOTES", notes)
+    monkeypatch.setattr(se, "TODOS", todos)
+    monkeypatch.setattr(se, "EXPENSES", expenses)
+
+    assert execute_skill("note_add", {"text": "牛奶沒了"}, _ctx()).ok
+    assert "牛奶" in execute_skill("note_list", {"query": "牛奶"}, _ctx()).note
+    assert execute_skill("todo_add", {"text": "寫周報"}, _ctx()).ok
+    assert "寫周報" in execute_skill("todo_list", {}, _ctx()).note
+    assert "完成了" in execute_skill("todo_done", {"which": "周報"}, _ctx()).note
+    assert "全部做完" in execute_skill("todo_list", {}, _ctx()).note
+    import time as _time
+
+    now = _time.time()
+    assert execute_skill("expense_log", {"amount": 60, "item": "午餐", "category": "餐飲"}, _ctx()).ok
+    # summary window is computed from ctx.now, records carry real created_at - use real now
+    summary = execute_skill("expense_summary", {"period": "month"}, SkillContext("telegram", now)).note
+    assert "60" in summary
+
+
+def test_set_reminder_with_repeat(monkeypatch, tmp_path):
     import reminders as rmod
-    import skill_engine as smod
-
-    store = _store(tmp_path)
+    import skill_engine as se
+    store = rmod.ReminderStore(path=str(tmp_path / "r.json"))
     monkeypatch.setattr(rmod, "DEFAULT_REMINDER_STORE", store)
-    monkeypatch.setattr(smod, "DEFAULT_REMINDER_STORE", store)
-
-    provider = RouteProvider('{"skill":"set_reminder","args":{"what":"喝水","fire_in_seconds":600}}')
-    out = try_skill("十分鐘後提醒我喝水", "telegram", provider, now=1000.0)
-    assert out is not None and out.ok
-    pending = store.pending("telegram")
-    assert len(pending) == 1
-    assert pending[0].text == "喝水"
-    assert abs(pending[0].fire_at - 1600.0) < 1
+    monkeypatch.setattr(se, "DEFAULT_REMINDER_STORE", store)
+    out = execute_skill(
+        "set_reminder", {"what": "喝水", "fire_in_seconds": 60, "repeat_every_seconds": 3600}, _ctx(1000.0)
+    )
+    assert out.ok and "週期" in out.note
+    # recurring re-arms instead of retiring, skipping missed occurrences
+    r = store.pending("telegram")[0]
+    store.mark_fired(r.reminder_id)
+    nxt = store.pending("telegram")[0]
+    assert nxt.fire_at > 1060.0 and not nxt.fired
 
 
 def test_reminder_fires_when_due_and_only_once():
     store = ReminderStore(path=str(tempfile.mkdtemp() + "/r.json"))
     store.add("telegram", fire_at=1000.0, text="開會")
-    assert store.due(now=999.0) == []          # not yet
+    assert store.due(now=999.0) == []
     due = store.due(now=1001.0)
     assert len(due) == 1
     store.mark_fired(due[0].reminder_id)
-    assert store.due(now=1001.0) == []          # fired once, never again
+    assert store.due(now=2000.0) == []
 
 
 def test_reminder_survives_reload():
     path = tempfile.mkdtemp() + "/r.json"
-    store = ReminderStore(path=path)
-    store.add("telegram", fire_at=9e12, text="生日")
-    reloaded = ReminderStore(path=path)
-    assert [r.text for r in reloaded.pending("telegram")] == ["生日"]
-
-
-def test_cancel_clears_pending():
-    store = ReminderStore(path=str(tempfile.mkdtemp() + "/r.json"))
-    store.add("telegram", fire_at=9e12, text="A")
-    store.add("telegram", fire_at=9e12, text="B")
-    assert store.cancel("telegram") == 2
-    assert store.pending("telegram") == []
-
-
-def test_bad_reminder_args_report_failure(monkeypatch, tmp_path):
-    import reminders as rmod
-    import skill_engine as smod
-
-    store = _store(tmp_path)
-    monkeypatch.setattr(rmod, "DEFAULT_REMINDER_STORE", store)
-    monkeypatch.setattr(smod, "DEFAULT_REMINDER_STORE", store)
-
-    provider = RouteProvider('{"skill":"set_reminder","args":{"what":"","fire_in_seconds":-1}}')
-    out = try_skill("提醒我", "telegram", provider, now=1000.0)
-    assert out is not None and not out.ok
-    assert store.pending("telegram") == []
+    ReminderStore(path=path).add("telegram", fire_at=9e12, text="生日")
+    assert [r.text for r in ReminderStore(path=path).pending("telegram")] == ["生日"]

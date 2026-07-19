@@ -12,7 +12,7 @@ from typing import Any
 
 from agent_protocol import classify_approval, extract_primary_message
 from core_tools import AgentTool, ToolResult, env_value
-from skill_engine import try_skill
+from skill_engine import SkillContext, execute_skill, skill_tools
 from voice_contract import VOICE_REGISTER_EN, owner_text_is_simplified, voice_register_violation
 
 from .context import (
@@ -252,24 +252,23 @@ class YueYueRuntimeV3:
         return ""
 
     def _chat_turn(self, turn: TurnEnvelope) -> str:
-        # ROADMAP P6: skill layer. A keyword prefilter gates this so ordinary chat pays nothing;
-        # only a plausibly-actionable message reaches the model router. A handled skill is phrased
-        # in-persona (never canned) and short-circuits normal chat generation. Opt-in YUEYUE_SKILLS=1.
+        # ROADMAP P6 v2 (native tool calling, the Claude architecture): every chat turn the model
+        # sees the FULL skill catalog as function tools and decides itself whether to reach for
+        # one - "冷不冷" can call weather, "幫我記一下" can call notes, plain chatter calls
+        # nothing. No keyword routing, no separate router call. Opt-in YUEYUE_SKILLS=1.
+        tools = []
         if turn.mode == TurnMode.CHAT and env_value("YUEYUE_SKILLS") == "1":
             try:
-                outcome = try_skill(turn.text, turn.chat_id, self.provider, _chat_voice_model())
+                tools = skill_tools()
             except Exception:
-                outcome = None
-            if outcome is not None:
-                reply = self._compose_skill_reply(turn, outcome.note)
-                self.context.remember(turn, reply)
-                self._emit("skill.used", turn.turn_id, {"note": outcome.note[:200], "ok": outcome.ok})
-                return reply
-
+                tools = []
         messages = self.context.compile_turn(turn)
         try:
-            response = self.provider.chat(messages, [], model=_chat_voice_model())
-            reply = _clean_reply(response.content) or "我在呢，主人。"
+            response = self.provider.chat(messages, tools, model=_chat_voice_model())
+            if tools and getattr(response, "tool_calls", None):
+                reply = self._run_chat_skills(turn, messages, response)
+            else:
+                reply = _clean_reply(response.content) or "我在呢，主人。"
         except Exception:
             reply = "我這邊剛剛斷了一下，不過還在。你再說一次就好。"
         if turn.mode in {TurnMode.CHAT, TurnMode.SOCIAL}:
@@ -282,31 +281,33 @@ class YueYueRuntimeV3:
         self._emit("turn.replied", turn.turn_id, {"mode": turn.mode.value, "reply": reply[:500]})
         return reply
 
-    def _compose_skill_reply(self, turn: TurnEnvelope, note: str) -> str:
-        """Phrase a skill outcome in YueYue's own voice (never a canned confirmation). Falls back
-        to the plain factual note if generation fails - still correct, just less flavored."""
-        instruction = (
-            "你剛剛順手幫主人處理好了一件事。用你自己的語氣自然地把結果告訴主人，一到兩句，"
-            "別像系統通知或客服，就像你隨手幫了個小忙。結果是：" + note
-        )
-        try:
-            response = self.provider.chat(
-                [
-                    {"role": "system", "content": self.context.system_prompt(TurnMode.CHAT)},
-                    {"role": "user", "content": instruction},
-                ],
-                [],
-                model=_chat_voice_model(),
+    def _run_chat_skills(self, turn: TurnEnvelope, messages: list[dict[str, Any]], response: Any) -> str:
+        """Execute the model's chosen skill calls, then let it weave the results into its own
+        reply (one bounded round - chat skills are quick lookups/actions, not agentic loops)."""
+        messages = [*messages, _assistant_tool_message(response)]
+        ctx = SkillContext(chat_id=turn.chat_id, now=time.time())
+        for call in response.tool_calls[:4]:
+            name = str(call.get("name") or "")
+            outcome = execute_skill(name, dict(call.get("arguments") or {}), ctx)
+            self._emit(
+                "skill.used", turn.turn_id, {"skill": name, "ok": outcome.ok, "note": outcome.note[:200]}
             )
-            reply = _drop_trailing_full_stop(to_traditional_script(_clean_reply(response.content)))
-            reply = self._apply_social_chat_reply_policy(turn.text, reply)
-            if reply and not _chat_reply_violates_social_policy(reply, turn.text):
-                if owner_script_is_simplified_with_history(turn.text, self.context.short_context, turn.chat_id):
-                    reply = to_simplified_script(reply)
-                return reply
-        except Exception:
-            pass
-        return note
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(call.get("id") or name),
+                    "name": name,
+                    "content": outcome.note,
+                }
+            )
+        messages.append(
+            {
+                "role": "system",
+                "content": "把上面工具結果自然地講給主人聽，用你自己的語氣，一到兩句，別像系統通知。",
+            }
+        )
+        final = self.provider.chat(messages, [], model=_chat_voice_model())
+        return _clean_reply(final.content) or "我在呢，主人。"
 
     def compose_reminder_fire(self, text: str) -> str:
         """Compose the owner-facing line when a scheduled reminder fires, in persona. Deterministic

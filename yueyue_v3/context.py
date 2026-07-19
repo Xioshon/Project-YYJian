@@ -176,6 +176,13 @@ class ContextCompiler:
             if turn.mode == TurnMode.SOCIAL and social_note:
                 messages.append({"role": "system", "content": _compact(social_note, 800)})
         elif turn.mode in {TurnMode.TASK, TurnMode.VISION} and workflow:
+            # workspace/skills/*/SKILL.md were declared long ago but never loaded by anything
+            # (found 2026-07-16). Wire them in: when a task's text matches a skill's triggers,
+            # its behavior guidance rides along as a system note - cheap, declarative, and the
+            # md files become a real extension point instead of dead weight.
+            guidance = _md_skill_guidance(self.root, turn.text)
+            if guidance:
+                messages.append({"role": "system", "content": guidance})
             step = workflow.current_step()
             task = {
                 "objective": workflow.goal.objective,
@@ -215,6 +222,48 @@ class ContextCompiler:
             return json.dumps(raw, ensure_ascii=False)[:2500]
         except (OSError, ValueError, UnicodeError):
             return "{}"
+
+
+_MD_SKILL_CACHE: list[dict[str, Any]] | None = None
+
+
+def _load_md_skills(root: Path) -> list[dict[str, Any]]:
+    """Parse workspace/skills/*/SKILL.md (frontmatter: name/description/triggers + body guidance).
+    Cached for the process lifetime - these files change only when the owner edits them."""
+    global _MD_SKILL_CACHE
+    if _MD_SKILL_CACHE is not None:
+        return _MD_SKILL_CACHE
+    skills: list[dict[str, Any]] = []
+    try:
+        for path in sorted((Path(root) / "workspace" / "skills").glob("*/SKILL.md")):
+            raw = path.read_text(encoding="utf-8")
+            match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", raw, re.S)
+            if not match:
+                continue
+            front, body = match.group(1), match.group(2).strip()
+            fields: dict[str, str] = {}
+            for line in front.splitlines():
+                if ":" in line:
+                    key, _, value = line.partition(":")
+                    fields[key.strip()] = value.strip()
+            triggers = [t.strip().casefold() for t in fields.get("triggers", "").split(",") if t.strip()]
+            if fields.get("name") and triggers and body:
+                skills.append({"name": fields["name"], "triggers": triggers, "body": body[:600]})
+    except Exception:
+        skills = []
+    _MD_SKILL_CACHE = skills
+    return skills
+
+
+def _md_skill_guidance(root: Path, task_text: str) -> str:
+    lowered = str(task_text or "").casefold()
+    matched = [
+        s for s in _load_md_skills(root) if any(trigger in lowered for trigger in s["triggers"])
+    ]
+    if not matched:
+        return ""
+    parts = [f"### Task guidance ({s['name']})\n{s['body']}" for s in matched[:2]]
+    return "\n\n".join(parts)
 
 
 def _is_conversation_opener(text: str) -> bool:

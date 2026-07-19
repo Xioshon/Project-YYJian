@@ -27,6 +27,7 @@ class Reminder:
     text: str               # what to remind about (the owner's own words)
     created_at: float = field(default_factory=time.time)
     fired: bool = False
+    repeat_every: float = 0.0  # seconds; >0 = recurring (daily meds, weekly review) - re-arms on fire
     reminder_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 
@@ -63,8 +64,11 @@ class ReminderStore:
         except Exception:
             pass
 
-    def add(self, chat_id: str, fire_at: float, text: str) -> Reminder:
-        reminder = Reminder(chat_id=str(chat_id), fire_at=float(fire_at), text=str(text)[:300])
+    def add(self, chat_id: str, fire_at: float, text: str, repeat_every: float = 0.0) -> Reminder:
+        reminder = Reminder(
+            chat_id=str(chat_id), fire_at=float(fire_at), text=str(text)[:300],
+            repeat_every=max(0.0, float(repeat_every or 0.0)),
+        )
         with self._lock:
             self.reminders.append(reminder)
             self._save()
@@ -76,9 +80,17 @@ class ReminderStore:
             return [r for r in self.reminders if not r.fired and r.fire_at <= now]
 
     def mark_fired(self, reminder_id: str) -> None:
+        """One-shot reminders retire; recurring ones re-arm for the next occurrence (skipping any
+        occurrences already in the past, so a laptop asleep for two days does not backlog-spam)."""
+        now = time.time()
         with self._lock:
             for reminder in self.reminders:
-                if reminder.reminder_id == reminder_id:
+                if reminder.reminder_id != reminder_id:
+                    continue
+                if reminder.repeat_every > 0:
+                    while reminder.fire_at <= now:
+                        reminder.fire_at += reminder.repeat_every
+                else:
                     reminder.fired = True
             self._save()
 
