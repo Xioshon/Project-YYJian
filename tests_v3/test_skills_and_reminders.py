@@ -120,3 +120,48 @@ def test_reminder_survives_reload():
     path = tempfile.mkdtemp() + "/r.json"
     ReminderStore(path=path).add("telegram", fire_at=9e12, text="生日")
     assert [r.text for r in ReminderStore(path=path).pending("telegram")] == ["生日"]
+
+
+def test_current_time_reports_period():
+    import datetime
+    morning = datetime.datetime(2026, 7, 20, 6, 30).timestamp()
+    note = execute_skill("current_time", {}, _ctx(morning)).note
+    assert "06:30" in note and "清晨" in note
+    night = datetime.datetime(2026, 7, 20, 23, 30).timestamp()
+    assert "深夜" in execute_skill("current_time", {}, _ctx(night)).note
+
+
+def test_list_tasks_reads_runtime_snapshot(monkeypatch):
+    import skill_engine as se
+    monkeypatch.setattr(se, "RUNTIME_INTROSPECT", lambda: {
+        "active": {"objective": "數 py 檔案", "status": "running"},
+        "queued": ["查天氣", "寫周報"],
+    })
+    note = execute_skill("list_tasks", {}, _ctx()).note
+    assert "數 py 檔案" in note and "查天氣" in note
+
+
+def test_task_queue_enqueues_and_drains(tmp_path):
+    from yueyue_v3.models import GoalContract, RequestedOutput, StepContract, WorkflowStatus
+    from yueyue_v3.providers import ProviderResponse, ScriptedProvider
+    from yueyue_v3.runtime import YueYueRuntimeV3
+
+    (tmp_path / "workspace" / "brain").mkdir(parents=True)
+    (tmp_path / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
+    (tmp_path / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
+    provider = ScriptedProvider([ProviderResponse("好", "", []) for _ in range(8)])
+    rt = YueYueRuntimeV3(tmp_path, provider, state_dir=tmp_path / "v3")
+
+    # busy workflow -> incoming task queues
+    goal = GoalContract("數檔案", [RequestedOutput("n", "d", True, "value", [])], ["c"])
+    wf = rt.workflow_engine.create(goal, [StepContract("s1", "s", "observe", "d", ["list_files"])])
+    wf.status = WorkflowStatus.AWAITING_PERMISSION
+    import copy
+    with rt.events.writer_scope():
+        state = copy.deepcopy(rt.state)
+        state.workflow = wf
+        rt._replace_state(state, "test.seed", "t0")
+    from yueyue_v3.models import TurnEnvelope, TurnMode
+    reply = rt.process_turn(TurnEnvelope("owner", "幫我查一下天氣預報", TurnMode.TASK))
+    assert rt.state.task_queue == ["幫我查一下天氣預報"]
+    assert reply

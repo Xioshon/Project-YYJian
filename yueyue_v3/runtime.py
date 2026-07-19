@@ -100,6 +100,17 @@ class YueYueRuntimeV3:
         )
         self.context.memory = self.memory
         self._turns_since_distill = 0
+        # list_tasks skill introspection hook (module-level to avoid a runtime<->skills cycle).
+        import skill_engine as _skill_engine
+
+        def _introspect() -> dict:
+            wf = self.state.workflow
+            active = None
+            if wf and wf.status not in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED}:
+                active = {"objective": wf.goal.objective, "status": wf.status.value}
+            return {"active": active, "queued": list(self.state.task_queue)}
+
+        _skill_engine.RUNTIME_INTROSPECT = _introspect
         self.interactive_mode = False
         self.max_iterations = 18
         set_event_sink = getattr(self.provider, "set_event_sink", None)
@@ -141,7 +152,32 @@ class YueYueRuntimeV3:
 
     def process_turn(self, turn: TurnEnvelope, tool_callback: Callable | None = None) -> str:
         with self.events.writer_scope():
-            return self._process_turn(turn, tool_callback)
+            reply = self._process_turn(turn, tool_callback)
+            # Task-queue drain (owner concept 2026-07-20): when the active workflow just finished
+            # and tasks are queued, start the next one in the SAME turn and append its outcome -
+            # the owner batch-fires requests and they complete one after another, no re-prompting.
+            drained = 0
+            while (
+                self.state.task_queue
+                and drained < 2
+                and (
+                    self.state.workflow is None
+                    or self.state.workflow.status in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED}
+                )
+            ):
+                state = copy.deepcopy(self.state)
+                next_objective = state.task_queue.pop(0)
+                self._replace_state(state, "task_queue.pop", turn.turn_id)
+                follow = TurnEnvelope(turn.chat_id, next_objective, TurnMode.TASK, turn.message_id)
+                follow_reply = self._start_task(follow, tool_callback)
+                reply = f"{reply}\n\n{follow_reply}"
+                drained += 1
+                if self.state.workflow and self.state.workflow.status not in {
+                    WorkflowStatus.COMPLETED,
+                    WorkflowStatus.CANCELLED,
+                }:
+                    break  # next task needs permission/attention - stop draining
+            return reply
 
     def _workflow_is_stale(self, workflow: WorkflowState | None) -> bool:
         """An incomplete workflow (awaiting permission, blocked, or mid-run) that hasn't been
@@ -201,6 +237,21 @@ class YueYueRuntimeV3:
 
         if turn.mode in {TurnMode.CHAT, TurnMode.SOCIAL}:
             return self._chat_turn(turn)
+
+        # A new task while one is still active (running/awaiting) queues instead of vanishing.
+        if (
+            self.state.workflow
+            and self.state.workflow.status not in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED}
+        ):
+            state = copy.deepcopy(self.state)
+            state.task_queue.append(turn.text[:500])
+            self._replace_state(state, "task_queue.push", turn.turn_id)
+            return self._compose_owner_voice(
+                "task_queued",
+                {"queued": turn.text[:120], "queue_length": len(self.state.task_queue),
+                 "current": self.state.workflow.goal.objective[:120]},
+                "好，這件先記下了，手上這個做完就接著弄～",
+            )
 
         return self._start_task(turn, tool_callback)
 
@@ -1739,10 +1790,16 @@ def _chat_reply_violates_social_policy(reply: str, owner_text: str = "") -> bool
         return True
     if len(value) > 180:
         return True
-    for marker in CHAT_META_LEAKAGE_MARKERS:
-        marker_value = marker.casefold()
-        if marker_value in lowered and marker_value not in owner_lowered:
-            return True
+    # Capability questions (你會做什麼/能幫我什麼) legitimately need ability words like 提醒/任務 -
+    # live 2026-07-20 the honest answer got rejected as meta-leak and the owner saw the fallback.
+    asking_abilities = any(
+        marker in owner_lowered for marker in ("會做什麼", "会做什么", "會些什麼", "能做什麼", "能做什么", "能幫我什麼", "能帮我什么", "會什麼", "会什么")
+    )
+    if not asking_abilities:
+        for marker in CHAT_META_LEAKAGE_MARKERS:
+            marker_value = marker.casefold()
+            if marker_value in lowered and marker_value not in owner_lowered:
+                return True
     if any(marker.casefold() in lowered for marker in SOCIAL_OVERPRODUCTION_MARKERS):
         return True
     if any(marker.casefold() in lowered for marker in SOCIAL_GENERIC_COMFORT_MARKERS):
@@ -1843,7 +1900,7 @@ def _clean_reply(text: str) -> str:
 
 
 def _may_replace_state(kind: str) -> bool:
-    return str(kind or "").startswith(("workflow.", "permission.", "tool.result"))
+    return str(kind or "").startswith(("workflow.", "permission.", "tool.result", "task_queue.", "test."))
 
 
 def _contains_internal_terms(text: str) -> bool:

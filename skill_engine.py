@@ -356,6 +356,49 @@ def _draw_lots(args: dict, ctx: SkillContext) -> SkillResult:
     return SkillResult(f"抽到一支{stick}")
 
 
+# ------------------------------------------------------------------ time / tasks
+
+# Set by the runtime at construction: a zero-arg callable returning the live task snapshot
+# (active workflow objective/status + queued objectives). Kept as a hook so this module stays
+# import-clean of the runtime (no circular dependency).
+RUNTIME_INTROSPECT = None
+
+_PERIODS = ((8, "清晨"), (11, "早上"), (13, "中午"), (18, "下午"), (19, "傍晚"), (23, "晚上"), (25, "深夜"))
+
+
+def _current_time(args: dict, ctx: SkillContext) -> SkillResult:
+    now = _dt.datetime.fromtimestamp(ctx.now)
+    hour = now.hour if now.hour >= 5 else 24  # 0-4 點歸入深夜
+    period = next(label for bound, label in _PERIODS if hour < bound)
+    weekday = "一二三四五六日"[now.weekday()]
+    return SkillResult(f"現在是 {now.strftime('%Y-%m-%d %H:%M')}，星期{weekday}，{period}")
+
+
+def _list_tasks(args: dict, ctx: SkillContext) -> SkillResult:
+    parts: list[str] = []
+    snapshot = {}
+    if callable(RUNTIME_INTROSPECT):
+        try:
+            snapshot = RUNTIME_INTROSPECT() or {}
+        except Exception:
+            snapshot = {}
+    active = snapshot.get("active")
+    if active:
+        parts.append(f"正在做：「{active['objective'][:80]}」（{active['status']}）")
+    queued = snapshot.get("queued") or []
+    if queued:
+        parts.append("排隊中：" + "；".join(f"「{q[:50]}」" for q in queued[:5]))
+    pending = DEFAULT_REMINDER_STORE.pending(ctx.chat_id)
+    if pending:
+        parts.append(f"待提醒 {len(pending)} 個（最近：「{pending[0].text[:40]}」{_fmt_when(pending[0].fire_at, ctx.now)}）")
+    open_todos = [t for t in TODOS.all() if not t.get("done")]
+    if open_todos:
+        parts.append(f"未完成待辦 {len(open_todos)} 條")
+    if not parts:
+        return SkillResult("目前沒有進行中或排隊的任務，也沒有待提醒")
+    return SkillResult("；".join(parts))
+
+
 # ------------------------------------------------------------------ web / weather (network, graceful)
 
 def _web_search(args: dict, ctx: SkillContext) -> SkillResult:
@@ -436,6 +479,12 @@ SKILLS: list[Skill] = [
           _p({"owner_move": {"type": "string", "enum": ["石頭", "剪刀", "布"]}}), _rock_paper_scissors),
     Skill("draw_lots", "抽籤：從候選裡抽一個，或抽運勢籤。",
           _p({"options": {"type": "array", "items": {"type": "string"}}}), _draw_lots),
+    Skill("current_time",
+          "主人問現在幾點/今天幾號星期幾/現在是早上還是晚上等任何跟當下時間有關的問題。",
+          _p({}), _current_time),
+    Skill("list_tasks",
+          "主人想知道月月現在手上有什麼任務在做、排隊中的任務、待提醒或待辦的總覽。",
+          _p({}), _list_tasks),
     Skill("web_search",
           "查網上的即時/事實資訊：新聞、價格、賽果、天氣以外的任何「現在/最新」問題，"
           "或月月不確定、答錯會誤導主人的事實。閒聊觀點不需要。",

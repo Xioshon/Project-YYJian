@@ -194,6 +194,9 @@ class RuntimeState:
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     workflow: WorkflowState | None = None
     permission: PermissionState = field(default_factory=PermissionState)
+    # Owner concept 2026-07-20: tasks arriving while one is running QUEUE instead of being lost;
+    # the queue auto-drains after completion and is queryable via the list_tasks skill.
+    task_queue: list[str] = field(default_factory=list)
     processed_event_ids: list[str] = field(default_factory=list)
     render_keys: list[str] = field(default_factory=list)
     updated_at: float = field(default_factory=time.time)
@@ -237,6 +240,7 @@ def runtime_state_from_dict(raw: dict[str, Any] | None) -> RuntimeState:
         session_id=str(raw.get("session_id") or uuid.uuid4().hex),
         workflow=workflow,
         permission=permission,
+        task_queue=[str(item) for item in raw.get("task_queue") or []][:20],
         processed_event_ids=[str(item) for item in raw.get("processed_event_ids") or []][-2000:],
         render_keys=[str(item) for item in raw.get("render_keys") or []][-1000:],
         updated_at=float(raw.get("updated_at") or time.time()),
