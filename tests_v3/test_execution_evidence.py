@@ -226,3 +226,79 @@ def test_text_binding_never_binds_a_facts_json_blob():
     wf.evidence.append(EE("step_1", "read_file", "ok", "hello-yueyue-42", {"text": "hello-yueyue-42"}))
     decision = engine.verify(wf)
     assert wf.outputs.get("content") == "hello-yueyue-42"
+
+
+def test_file_act_step_gets_no_screenshot_verification():
+    # Regression 2026-07-20: every act step had capture_screen appended, so a file-write task
+    # screenshotted the desktop and stalled. Only genuine desktop/UI acts get screen verification.
+    from yueyue_v3.planning import GoalPlannerV3
+
+    domain = ["write_file", "read_file", "execute_python", "get_screen_ui", "capture_screen"]
+    planner = GoalPlannerV3(provider=None, tool_names=lambda: domain)
+    raw = {
+        "objective": "在下載夾建 Hello.txt 寫入內容",
+        "requested_outputs": [{"name": "content", "description": "file content", "evidence_kind": "text"}],
+        "success_criteria": ["file exists with content"],
+        "steps": [
+            {"name": "write", "kind": "act", "done_condition": "written", "allowed_tools": ["write_file"]},
+            {"name": "read back", "kind": "observe", "done_condition": "confirmed", "allowed_tools": ["read_file"]},
+        ],
+    }
+    planned = planner._parse(raw, raw["objective"], domain)
+    write_step = planned.steps[0]
+    assert "capture_screen" not in write_step.allowed_tools
+    assert "get_screen_ui" not in write_step.allowed_tools
+
+
+def test_desktop_act_step_keeps_screenshot_verification():
+    from yueyue_v3.planning import GoalPlannerV3
+
+    domain = ["click_ui_element", "get_screen_ui", "capture_screen"]
+    planner = GoalPlannerV3(provider=None, tool_names=lambda: domain)
+    raw = {
+        "objective": "點一下暫停按鈕",
+        "requested_outputs": [{"name": "state", "description": "screen", "evidence_kind": "screen_state"}],
+        "success_criteria": ["paused"],
+        "steps": [
+            {"name": "click pause", "kind": "act", "done_condition": "clicked",
+             "allowed_tools": ["click_ui_element"], "required_facts": ["paused"]},
+            {"name": "confirm", "kind": "observe", "done_condition": "seen", "allowed_tools": ["get_screen_ui"]},
+        ],
+    }
+    planned = planner._parse(raw, raw["objective"], domain)
+    assert "capture_screen" in planned.steps[0].allowed_tools
+
+
+def test_multi_task_split_enqueues_independent_tasks(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUEYUE_TASK_SPLIT", "1")
+    from yueyue_v3.models import TurnEnvelope, TurnMode
+    from yueyue_v3.providers import ProviderResponse, ScriptedProvider
+    from yueyue_v3.runtime import YueYueRuntimeV3
+
+    (tmp_path / "workspace" / "brain").mkdir(parents=True)
+    (tmp_path / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
+    (tmp_path / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
+    provider = ScriptedProvider([ProviderResponse('["建立 Hello.txt", "建立自我介紹.txt"]', "", [])])
+    rt = YueYueRuntimeV3(tmp_path, provider, state_dir=tmp_path / "v3")
+
+    turn = TurnEnvelope("owner", "幫我建 Hello.txt，再建自我介紹.txt", TurnMode.TASK)
+    first = rt._maybe_split_tasks(turn)
+    assert first == "建立 Hello.txt"
+    assert rt.state.task_queue == ["建立自我介紹.txt"]
+
+
+def test_single_task_is_not_split(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUEYUE_TASK_SPLIT", "1")
+    from yueyue_v3.models import TurnEnvelope, TurnMode
+    from yueyue_v3.providers import ProviderResponse, ScriptedProvider
+    from yueyue_v3.runtime import YueYueRuntimeV3
+
+    (tmp_path / "workspace" / "brain").mkdir(parents=True)
+    (tmp_path / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
+    (tmp_path / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
+    # sequential steps of ONE task -> model returns single-element array -> no split
+    provider = ScriptedProvider([ProviderResponse('["建立檔案並寫入 step1 再追加 step2"]', "", [])])
+    rt = YueYueRuntimeV3(tmp_path, provider, state_dir=tmp_path / "v3")
+    turn = TurnEnvelope("owner", "建立檔案寫入 step1，然後追加 step2", TurnMode.TASK)
+    assert rt._maybe_split_tasks(turn) == turn.text
+    assert rt.state.task_queue == []

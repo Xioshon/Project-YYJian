@@ -407,7 +407,7 @@ def _looks_like_observe_only_query(text: str) -> bool:
     weak_observe_markers = ["是否", "是不是", "現在", "现在", "狀態", "状态", "有沒有", "有没有", "看看"]
     screen_context_markers = [
         "螢幕", "屏幕", "萤幕", "畫面", "画面", "電腦", "电脑", "截圖", "截图", "截屏",
-        "視窗", "窗口", "程式", "程序", "軟件", "软件", "軟體", "任務", "任务",
+        "視窗", "窗口", "程式", "程序", "軟件", "软件", "軟體",
         "播放", "進度", "进度", "桌面",
     ]
     has_strong = any(marker in text for marker in strong_observe_markers)

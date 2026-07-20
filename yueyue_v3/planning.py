@@ -258,7 +258,12 @@ class GoalPlannerV3:
                     tools = backfill
                     kind = "observe"
                     required_facts = []
-            if kind == "act":
+            # Post-action screenshot verification belongs ONLY to genuine desktop/UI actions
+            # (click/type/hotkey). Appending capture_screen to EVERY act step made a plain
+            # file-write task screenshot the desktop and then stall on "No state change observed"
+            # (live 2026-07-20: 「幫我新增 Hello.txt」 took a screenshot instead of writing).
+            # File/command acts verify by reading the file back or the command's own output.
+            if kind == "act" and set(tools) & DESKTOP_TOOLS:
                 tools = list(
                     dict.fromkeys(tools + [name for name in ("get_screen_ui", "capture_screen") if name in allowed])
                 )

@@ -399,6 +399,24 @@ def _list_tasks(args: dict, ctx: SkillContext) -> SkillResult:
     return SkillResult("；".join(parts))
 
 
+# ------------------------------------------------------------------ memory
+
+# Set by the runtime: callable(text, source) -> None that writes a fact to long-term memory.
+MEMORY_WRITE = None
+
+
+def _remember_this(args: dict, ctx: SkillContext) -> SkillResult:
+    fact = str(args.get("fact") or "").strip()
+    if not fact:
+        return SkillResult("要記住的內容是空的", ok=False)
+    if callable(MEMORY_WRITE):
+        try:
+            MEMORY_WRITE(fact, str(args.get("source") or fact))
+        except Exception:
+            return SkillResult("記憶暫時寫不進去", ok=False)
+    return SkillResult(f"記住了：{fact[:100]}，以後不會忘")
+
+
 # ------------------------------------------------------------------ web / weather (network, graceful)
 
 def _web_search(args: dict, ctx: SkillContext) -> SkillResult:
@@ -451,7 +469,8 @@ SKILLS: list[Skill] = [
     Skill("note_list", "主人想看或搜自己的備忘（我記過什麼/找找關於X的備忘）。",
           _p({"query": {"type": "string", "description": "可選的搜索詞"}}), _note_list),
     Skill("todo_add", "主人要加一條待辦事項。", _p({"text": {"type": "string"}}, ["text"]), _todo_add),
-    Skill("todo_list", "主人想看未完成的待辦。", _p({}), _todo_list),
+    Skill("todo_list", "只列純待辦清單。主人明確說「我的待辦清單」才用；問「現在有什麼待辦/事情/安排」"
+          "這種總覽用 list_tasks（那個含提醒和進行中任務）。", _p({}), _todo_list),
     Skill("todo_done", "主人說某件待辦完成了。which 可以是序號或內容關鍵詞。",
           _p({"which": {"type": "string"}}, ["which"]), _todo_done),
     Skill("expense_log", "主人記一筆花費（午餐60/買了杯咖啡45塊）。",
@@ -479,11 +498,17 @@ SKILLS: list[Skill] = [
           _p({"owner_move": {"type": "string", "enum": ["石頭", "剪刀", "布"]}}), _rock_paper_scissors),
     Skill("draw_lots", "抽籤：從候選裡抽一個，或抽運勢籤。",
           _p({"options": {"type": "array", "items": {"type": "string"}}}), _draw_lots),
+    Skill("remember_this",
+          "主人明確要月月『記住』某件事實/偏好/約定，讓以後都記得（我喜歡X/記住我的Y/別忘了我是Z）。"
+          "純閒聊不用。",
+          _p({"fact": {"type": "string", "description": "要長期記住的一句話"},
+              "source": {"type": "string", "description": "主人的原話片段"}}, ["fact"]), _remember_this),
     Skill("current_time",
           "主人問現在幾點/今天幾號星期幾/現在是早上還是晚上等任何跟當下時間有關的問題。",
           _p({}), _current_time),
     Skill("list_tasks",
-          "主人想知道月月現在手上有什麼任務在做、排隊中的任務、待提醒或待辦的總覽。",
+          "主人想總覽現在所有待處理的事：進行中/排隊的任務、待提醒/鬧鐘/計時、未完成待辦。"
+          "「現在有什麼任務/待辦/事情要做/安排/提醒」這類總覽問題都用這個。",
           _p({}), _list_tasks),
     Skill("web_search",
           "查網上的即時/事實資訊：新聞、價格、賽果、天氣以外的任何「現在/最新」問題，"

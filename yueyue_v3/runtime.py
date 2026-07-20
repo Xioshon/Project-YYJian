@@ -111,6 +111,13 @@ class YueYueRuntimeV3:
             return {"active": active, "queued": list(self.state.task_queue)}
 
         _skill_engine.RUNTIME_INTROSPECT = _introspect
+
+        def _memory_write(fact: str, source: str) -> None:
+            from .memory import MemoryEntry
+
+            self.memory.add(MemoryEntry("fact", str(fact)[:200], time.strftime("%Y-%m-%d"), source=str(source)[:160]))
+
+        _skill_engine.MEMORY_WRITE = _memory_write
         self.interactive_mode = False
         self.max_iterations = 18
         set_event_sink = getattr(self.provider, "set_event_sink", None)
@@ -253,7 +260,56 @@ class YueYueRuntimeV3:
                 "好，這件先記下了，手上這個做完就接著弄～",
             )
 
+        # One message may pack several INDEPENDENT tasks ("建A檔案，再建B檔案") - split them so
+        # each gets its own goal contract; the first runs now, the rest queue and auto-drain.
+        # A single task's sequential steps ("建檔再寫入") is NOT split. Opt-in YUEYUE_TASK_SPLIT=1.
+        objective = self._maybe_split_tasks(turn)
+        if objective != turn.text:
+            turn = TurnEnvelope(turn.chat_id, objective, TurnMode.TASK, turn.message_id)
         return self._start_task(turn, tool_callback)
+
+    def _maybe_split_tasks(self, turn: TurnEnvelope) -> str:
+        """Return the FIRST objective to run now; enqueue any additional independent tasks. Returns
+        turn.text unchanged for a single task. A cheap conjunction prefilter gates the model call."""
+        if env_value("YUEYUE_TASK_SPLIT") != "1":
+            return turn.text
+        text = turn.text
+        # Cheap conjunction prefilter - only a plausibly-multi message pays for the split call.
+        # Loose is fine: the model does the real judgment and returns a single element for one task.
+        if not any(m in text for m in ("然後", "然后", "再", "還有", "还有", "順便", "顺便",
+                                       "接著", "接着", "以及", "；", ";", "另外", "同時", "同时")):
+            return turn.text
+        parts = self._split_objectives(text)
+        if len(parts) <= 1:
+            return turn.text
+        state = copy.deepcopy(self.state)
+        state.task_queue = [*state.task_queue, *(p[:500] for p in parts[1:])]
+        self._replace_state(state, "task_queue.split", turn.turn_id)
+        self._emit("task.split", turn.turn_id, {"count": len(parts), "parts": parts[:6]})
+        return parts[0]
+
+    def _split_objectives(self, text: str) -> list[str]:
+        prompt = (
+            "把主人這句話拆成幾件『互不相關、可以各自獨立完成』的任務。"
+            "同一件事的多個步驟（例如：建立檔案然後寫入內容、打開網頁再點按鈕）算『一件』，不要拆。"
+            "只有像『數一下檔案，順便查個天氣』或『建 A 檔，再建 B 檔』這種真正無關的才拆。"
+            '只回 JSON 陣列，每個元素是一句完整、可獨立執行的任務描述（保留主人原本的意思）。'
+            "只有一件事就回單元素陣列。\n主人說：" + text
+        )
+        try:
+            response = self.provider.chat(
+                [{"role": "user", "content": prompt}], [], model=_chat_voice_model()
+            )
+            import json as _json
+
+            match = re.search(r"\[.*\]", str(getattr(response, "content", "") or ""), re.S)
+            if not match:
+                return [text]
+            parts = _json.loads(match.group(0))
+            cleaned = [str(p).strip() for p in parts if isinstance(p, (str, int, float)) and str(p).strip()]
+            return cleaned[:5] if len(cleaned) >= 2 else [text]
+        except Exception:
+            return [text]
 
     _OPENER_FORBIDDEN = (
         "系統", "系统", "初始化", "ai", "模型", "workflow", "工作流", "記憶", "记忆", "清空",
@@ -1793,7 +1849,11 @@ def _chat_reply_violates_social_policy(reply: str, owner_text: str = "") -> bool
     # Capability questions (你會做什麼/能幫我什麼) legitimately need ability words like 提醒/任務 -
     # live 2026-07-20 the honest answer got rejected as meta-leak and the owner saw the fallback.
     asking_abilities = any(
-        marker in owner_lowered for marker in ("會做什麼", "会做什么", "會些什麼", "能做什麼", "能做什么", "能幫我什麼", "能帮我什么", "會什麼", "会什么")
+        marker in owner_lowered for marker in (
+            "會做什麼", "会做什么", "會些什麼", "能做什麼", "能做什么", "能幫我什麼", "能帮我什么",
+            "會什麼", "会什么", "會玩", "会玩", "有什麼遊戲", "有什么游戏", "什麼遊戲", "什么游戏",
+            "能玩", "會幫", "会帮", "有什麼技能", "有什么技能", "有什麼功能", "有什么功能",
+        )
     )
     if not asking_abilities:
         for marker in CHAT_META_LEAKAGE_MARKERS:

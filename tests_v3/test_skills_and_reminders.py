@@ -165,3 +165,17 @@ def test_task_queue_enqueues_and_drains(tmp_path):
     reply = rt.process_turn(TurnEnvelope("owner", "幫我查一下天氣預報", TurnMode.TASK))
     assert rt.state.task_queue == ["幫我查一下天氣預報"]
     assert reply
+
+
+def test_remember_this_writes_to_memory(monkeypatch):
+    import skill_engine as se
+    written = []
+    monkeypatch.setattr(se, "MEMORY_WRITE", lambda fact, source: written.append((fact, source)))
+    out = execute_skill("remember_this", {"fact": "主人喜歡吃辣", "source": "我超愛吃辣"}, _ctx())
+    assert out.ok and "記住了" in out.note
+    assert written == [("主人喜歡吃辣", "我超愛吃辣")]
+
+
+def test_remember_this_empty_fact_fails():
+    out = execute_skill("remember_this", {"fact": ""}, _ctx())
+    assert not out.ok
