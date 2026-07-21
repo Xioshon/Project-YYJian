@@ -408,7 +408,7 @@ class YueYueRuntimeV3:
         ]
         if pending:
             lines.append(f"- 這一步在等主人同意才能做：{pending.tool_name}")
-            lines.append("- 回答完主人的問題後，自然地提醒他這件事還等著他說「可以」。")
+            lines.append("- 回答完主人的問題後，自然地提醒他這件事還等著他說「可以」。別用「點頭」這個生硬說法。")
         if self.state.task_queue:
             lines.append(f"- 另外還有 {len(self.state.task_queue)} 件排隊中：" + "；".join(
                 f"「{q[:40]}」" for q in self.state.task_queue[:3]))
@@ -926,7 +926,7 @@ class YueYueRuntimeV3:
                             "step": step.name if step else "",
                             "objective": workflow.goal.objective,
                         },
-                        "這一步需要你點頭，我才能繼續。你回「可以」，我就接著剛才的任務做。",
+                        "這一步得你答應我才動手。你說聲「可以」，月月就接著做。",
                     )
 
                 result = self._execute_tool(name, arguments, tool_callback)
@@ -1126,7 +1126,7 @@ class YueYueRuntimeV3:
 
     def _compose_plan_reply(self, workflow: WorkflowState) -> str:
         preview = "；".join(step.name for step in workflow.steps[:3])
-        fallback = f"我會先{preview}。這串操作需要你點頭；回「可以」我就繼續，而且只在真的拿到結果後才收尾。"
+        fallback = f"我會先{preview}。這串操作要你答應才行；說聲「可以」月月就繼續，而且只在真的拿到結果後才收尾。"
         return self._compose_owner_voice(
             "permission_plan",
             {"objective": workflow.goal.objective, "steps": [step.name for step in workflow.steps]},
@@ -1188,7 +1188,11 @@ class YueYueRuntimeV3:
             "never claim an action or file that is not in the facts. "
             "If the event name contains 'permission', you are ASKING the owner for permission before acting - "
             "phrase it as a request that genuinely needs their yes (explain what you want to do and why, using "
-            "the facts), and never say you will do it, are doing it, or have done it.\n"
+            "the facts), and never say you will do it, are doing it, or have done it. "
+            "Word it naturally, like asking a friend ('要我現在動手嗎？'/'你說可以我就做') - do NOT use the "
+            "stiff idiom 點頭/點個頭. "
+            "If the event is a failure, report only what the facts say failed; never invent a missing "
+            "detail or ask the owner for information the facts do not say is missing.\n"
             + json.dumps({"event": event, "facts": facts}, ensure_ascii=False)
         )
         # One retry with a concrete critique before surrendering to the canned fallback: the

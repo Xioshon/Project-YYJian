@@ -244,9 +244,9 @@ def _environment_note(root: Path) -> str:
         f"- 專案根目錄：{Path(root)}",
         f"- 工作區：{Path(root) / 'workspace'}",
         "主人說「下載路徑/桌面/文件夾」時就是上面這些，直接用絕對路徑動手，別再反問。",
-        "工具邊界（很重要，選錯會白白浪費主人一次授權）：write_file / read_file 只能存取工作區"
-        f"（{Path(root) / 'workspace'}）之內的路徑；要在工作區以外（下載夾、桌面、家目錄等）建立或"
-        "修改檔案，必須用 execute_command 或 execute_python，一個指令一次做完，不要先試 write_file。",
+        "寫檔案就用 write_file，路徑給絕對路徑（下載夾、桌面、家目錄都可以，工作區內也可以）——"
+        "它直接寫入，不會被 shell 引號或重導向搞砸。**不要**用 echo/> 這類指令去產生文字檔"
+        "（實測會出現 \"'>' is not recognized\" 而失敗）。execute_command 是用來執行程式的，不是拿來寫檔的。",
     ]
     return "\n".join(lines)
 

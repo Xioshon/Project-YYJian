@@ -891,10 +891,45 @@ def real_react_to_message(emoji: str, chat_id: str = "", message_id: int | str =
         return _error("Reaction request failed.", str(exc))
 
 
+def is_protected_system_path(path: str) -> bool:
+    """Paths no assistant should ever write into, even with the owner's approval."""
+    resolved = os.path.abspath(path or "").casefold()
+    roots = [
+        os.environ.get("SYSTEMROOT", r"C:\Windows"),
+        os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+        os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+        os.environ.get("PROGRAMDATA", r"C:\ProgramData"),
+        "/etc",
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/System",
+        "/Library",
+    ]
+    for root in roots:
+        if not root:
+            continue
+        root_abs = os.path.abspath(root).casefold()
+        try:
+            if os.path.commonpath([root_abs, resolved]) == root_abs:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def real_write_file(filename: str, content: str) -> ToolResult:
+    """Write a file. Workspace-relative paths stay sandboxed; an ABSOLUTE path outside the
+    workspace is allowed because this tool is already permission-gated (the owner approves each
+    write), and forcing shell redirects for e.g. the Downloads folder was the actual failure mode:
+    the model had to hand-quote `echo ... > "C:\\...\\Hello.txt"` and cmd rejected it with
+    "'>' is not recognized" (live 2026-07-21/22). Direct writes have no quoting to get wrong.
+    True system directories stay off-limits regardless of approval."""
     filepath = resolve_path(filename)
-    if not is_workspace_path(filepath):
-        return _error("write_file can only write inside workspace.")
+    if is_protected_system_path(filepath):
+        return _error("write_file refuses to touch system directories.")
+    if not is_workspace_path(filepath) and not os.path.isabs(filename or ""):
+        return _error("write_file needs an absolute path to write outside the workspace.")
     try:
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as file:

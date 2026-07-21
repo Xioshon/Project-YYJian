@@ -61,6 +61,13 @@ _CANTONESE_BIGRAMS = (
     # removed - they false-positive on ordinary Mandarin (進入面試/成就咁高), and this list is
     # deliberately high-precision. Only the unambiguous ones stay.
     "咁多", "既檔案", "係咁",
+    # Third wave 2026-07-22, from a task reply: 「驗證既時候」「可能係檔案」「幫到你」. Two
+    # Cantonese grammar shapes the single-char set cannot catch, because 既/係 are legitimate
+    # Mandarin characters (既然/關係): 既 as the possessive 嘅 (X既Y) and 係 as the copula.
+    # Verified NOT to fire on 關係/係數/既然/既定.
+    "既時候", "既問題", "既嘢", "既地方", "既人",
+    "可能係", "或者係", "就係", "唔係", "係唔係", "應該係",
+    "幫到你", "搞到", "睇下", "試下", "問下",
 )
 
 # Taiwan-flavored particles rejected only in the sentence/line-final position (possibly

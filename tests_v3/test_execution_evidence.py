@@ -95,7 +95,10 @@ def test_generic_status_binding_is_pattern_based():
 
     for generic in ["Command completed.", "File list completed.", "File written.", "Search completed."]:
         assert _non_generic(generic) == ""
-    for real in ["Python 3.14.3", "hello-yueyue-42", "19", "Recorded derived result: n=5"]:
+    # Updated 2026-07-22: report_result's internal wording is also not an owner-facing answer -
+    # the owner saw 「結果是 Recorded derived result: ...」. The named fact carries the real value.
+    assert _non_generic("Recorded derived result: n=5") == ""
+    for real in ["Python 3.14.3", "hello-yueyue-42", "19"]:
         assert _non_generic(real) == real
 
 
@@ -345,3 +348,58 @@ def test_repeated_identical_call_counts_as_no_progress():
     b = f"execute_command:{_json.dumps({'command': 'echo hi'}, sort_keys=True)[:400]}"
     c = f"execute_command:{_json.dumps({'command': 'echo bye'}, sort_keys=True)[:400]}"
     assert a == b and a != c
+
+
+def test_write_file_reaches_absolute_paths_but_never_system_dirs(tmp_path):
+    # Live 2026-07-21/22: forcing shell redirects for the Downloads folder failed with
+    # "'>' is not recognized". write_file is permission-gated, so an absolute path outside the
+    # workspace is allowed - direct writes have no shell quoting to get wrong.
+    import os
+
+    from core_tools import is_protected_system_path, real_write_file
+
+    target = tmp_path / "sub" / "Hello.txt"
+    result = real_write_file(str(target), "Hello World!")
+    assert result.status == "ok"
+    assert target.read_text(encoding="utf-8") == "Hello World!"
+
+    system_target = os.path.join(os.environ.get("SYSTEMROOT", r"C:\Windows"), "evil.txt")
+    assert is_protected_system_path(system_target)
+    assert real_write_file(system_target, "x").status == "error"
+    assert not is_protected_system_path(str(tmp_path / "ok.txt"))
+
+
+def test_permission_wording_avoids_the_stiff_idiom():
+    # Owner 2026-07-22: 「點頭」 reads oddly. Owner-FACING canned lines must not use it (the two
+    # remaining source hits are the instructions telling the model to avoid it, which is correct).
+    import pathlib
+
+    source = pathlib.Path(__file__).resolve().parents[1] / "yueyue_v3" / "runtime.py"
+    offenders = [
+        line.strip()
+        for line in source.read_text(encoding="utf-8").splitlines()
+        if "點頭" in line and not any(hint in line for hint in ("別用", "NOT use", "idiom"))
+    ]
+    assert not offenders, f"owner-facing canned lines still say 點頭: {offenders}"
+
+
+def test_report_result_value_binds_without_internal_wording():
+    # Live 2026-07-22: the owner saw 「結果是 Recorded derived result: Hello.txt 最終內容=...」.
+    # The exactly-named fact must win over report_result's internal summary.
+    from yueyue_v3.models import ExecutionEvidence as EE
+    from yueyue_v3.models import GoalContract, RequestedOutput, StepContract
+    from yueyue_v3.workflow import WorkflowEngine, _non_generic
+
+    assert _non_generic("Recorded derived result: x=1") == ""
+
+    engine = WorkflowEngine()
+    goal = GoalContract("建檔", [RequestedOutput("final_content", "d", True, "text", [])], ["c"])
+    wf = engine.create(goal, [StepContract("step_1", "s", "observe", "d", ["read_file"])])
+    engine.add_evidence(wf, EE(
+        "step_1", "report_result", "ok",
+        "Recorded derived result: final_content=Hello World!",
+        {"final_content": "Hello World!"},
+    ))
+    engine.verify(wf)
+    assert wf.outputs.get("final_content") == "Hello World!"
+    assert "Recorded" not in str(wf.outputs.get("final_content"))

@@ -165,3 +165,15 @@ def test_quick_ack_pools_are_varied_and_register_clean() -> None:
             assert voice_register_violation(line) == "", f"{mode}: {line}"
     seen = {quick_ack_for(InteractionMode.TOOL_TASK) for _ in range(40)}
     assert len(seen) >= 2, "the ack must actually vary"
+
+
+def test_cantonese_grammar_shapes_from_task_reply() -> None:
+    """Live 2026-07-22 task reply: 「驗證既時候…可能係檔案…幫到你」. 既 as the possessive 嘅 and
+    係 as the copula are the two shapes the single-char set cannot catch (既然/關係 are ordinary
+    Mandarin), so they are gated as high-precision bigrams instead."""
+    assert voice_register_violation("驗證既時候讀取失敗").startswith("cantonese_phrase:")
+    assert voice_register_violation("可能係檔案的問題").startswith("cantonese_phrase:")
+    assert voice_register_violation("有其他可以幫到你").startswith("cantonese_phrase:")
+    # Ordinary written Chinese using the same characters must stay clean.
+    for clean in ("關係很好", "係數是二", "既然如此就這樣", "既定方針", "這個問題不大", "應該是這樣"):
+        assert voice_register_violation(clean) == "", clean

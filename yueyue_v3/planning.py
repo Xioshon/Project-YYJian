@@ -62,8 +62,10 @@ def _environment_facts() -> str:
         "\nKnown environment (do NOT plan a step just to discover these - they are given): "
         f"home={home}; downloads={home / 'Downloads'}; desktop={home / 'Desktop'}; "
         f"documents={home / 'Documents'}; project_root={root}; workspace={_Path(root) / 'workspace'}. "
-        "write_file/read_file only reach inside workspace; to create or edit a file ANYWHERE else "
-        "(downloads, desktop, home) plan execute_command/execute_python doing it in ONE step. "
+        "To create or overwrite ANY file (inside the workspace or at an absolute path like the "
+        "downloads folder or desktop) plan write_file with the absolute path - it is direct and "
+        "cannot be broken by shell quoting. Do NOT plan echo/redirect shell commands to write "
+        "files. execute_command is for running programs, not for authoring text files. "
         "requested_outputs must be the owner's actual deliverable (the created file's content), "
         "never an intermediate like a path you were told."
     )

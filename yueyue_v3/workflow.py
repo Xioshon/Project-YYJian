@@ -382,7 +382,11 @@ class WorkflowEngine:
                     if item.status != "ok":
                         continue
                     text_value = (
-                        str(item.facts.get("text") or "").strip()
+                        # The exactly-named fact wins: report_result stores {output_name: value},
+                        # and taking its summary instead leaked the internal
+                        # "Recorded derived result: ..." wording into the owner's reply.
+                        str(item.facts.get(output.name) or "").strip()
+                        or str(item.facts.get("text") or "").strip()
                         or str(item.facts.get("stdout") or "").strip()
                         or _non_generic(item.summary.strip())
                     )
@@ -437,11 +441,15 @@ _GENERIC_STATUS_RE = re.compile(
     re.IGNORECASE,
 )
 _GENERIC_STATUS_WORDS = {"done", "done.", "ok", "ok.", "success", "success."}
+# Internal tool phrasings that must never surface as the owner-facing answer.
+_INTERNAL_RESULT_PREFIXES = ("recorded derived result",)
 
 
 def _non_generic(text: str) -> str:
     stripped = text.strip()
     if stripped.casefold() in _GENERIC_STATUS_WORDS or _GENERIC_STATUS_RE.match(stripped):
+        return ""
+    if stripped.casefold().startswith(_INTERNAL_RESULT_PREFIXES):
         return ""
     return text
 
