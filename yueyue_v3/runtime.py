@@ -370,6 +370,13 @@ class YueYueRuntimeV3:
             except Exception:
                 tools = []
         messages = self.context.compile_turn(turn)
+        # A chat turn arriving while a task waits for approval MUST know that fact, or the model
+        # invents an answer and contradicts itself (live 2026-07-20: said "沒有等待中的任務" one
+        # minute after asking for permission, then "啊我看錯了"). Deterministic ground truth beats
+        # hoping the model guesses right.
+        pending_note = self._pending_task_note()
+        if pending_note:
+            messages.append({"role": "system", "content": pending_note})
         try:
             response = self.provider.chat(messages, tools, model=_chat_voice_model())
             if tools and getattr(response, "tool_calls", None):
@@ -387,6 +394,25 @@ class YueYueRuntimeV3:
         self.context.remember(turn, reply)
         self._emit("turn.replied", turn.turn_id, {"mode": turn.mode.value, "reply": reply[:500]})
         return reply
+
+    def _pending_task_note(self) -> str:
+        """Ground truth about the currently-awaiting task, injected into chat turns so YueYue can
+        never contradict her own permission request."""
+        workflow = self.state.workflow
+        if not workflow or workflow.status in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED}:
+            return ""
+        pending = self.state.permission.pending_action
+        lines = [
+            "### 目前狀態（事實，不可否認）",
+            f"- 有一個任務進行中：「{workflow.goal.objective[:120]}」（狀態 {workflow.status.value}）",
+        ]
+        if pending:
+            lines.append(f"- 這一步在等主人同意才能做：{pending.tool_name}")
+            lines.append("- 回答完主人的問題後，自然地提醒他這件事還等著他說「可以」。")
+        if self.state.task_queue:
+            lines.append(f"- 另外還有 {len(self.state.task_queue)} 件排隊中：" + "；".join(
+                f"「{q[:40]}」" for q in self.state.task_queue[:3]))
+        return "\n".join(lines)
 
     def _run_chat_skills(self, turn: TurnEnvelope, messages: list[dict[str, Any]], response: Any) -> str:
         """Execute the model's chosen skill calls, then let it weave the results into its own

@@ -73,7 +73,13 @@ class PermissionController:
                     state.allowed_tools = [pending.tool_name]
                 state.expires_at = time.time() + 3600
             else:
-                state.scope = "single"
+                # HIGH_RISK (execute_command/execute_python/delete/download): the approval covers
+                # THIS tool for the CURRENT task, not one single call. Live 2026-07-20: creating
+                # one file in Downloads asked for 可以 three times (path check, then python, then
+                # command) and still didn't finish - re-asking per call adds friction, not safety,
+                # once the owner has approved this tool for this goal. Still tightly bounded:
+                # only the same tool, only this workflow, and a short 10-minute expiry.
+                state.scope = "task"
                 state.allowed_tools = [pending.tool_name]
                 state.expires_at = time.time() + 600
             state.granted_at = time.time()
@@ -92,6 +98,9 @@ class PermissionController:
             return False
         if action.tool_name in HIGH_RISK_TOOLS and state.bundle != f"single:{action.tool_name}":
             return False
+        # scope "task" keeps the grant alive for further calls of the SAME high-risk tool within
+        # this workflow (cleared when the workflow ends or the 10-minute expiry passes); "single"
+        # is consumed on first use.
         if state.scope == "single":
             self.clear(state)
         return True

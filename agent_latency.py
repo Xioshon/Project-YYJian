@@ -234,11 +234,13 @@ SCREEN_OBSERVE_MARKERS.extend([
     "桌面状态",
     "桌面狀態",
 ])
+# Canonical Traditional forms - this update block previously re-introduced Simplified 处/画 that
+# the owner saw on every task ("我先处理一下"), because it overwrites the clean list above.
 QUICK_ACKS.update({
     InteractionMode.VISION_TASK: "我先看一下～",
-    InteractionMode.TOOL_TASK: "我先处理一下～",
+    InteractionMode.TOOL_TASK: "我先處理一下～",
     InteractionMode.SOCIAL_STICKER: "收到～",
-    InteractionMode.SCREEN_OBSERVE: "我看一下画面～",
+    InteractionMode.SCREEN_OBSERVE: "我看一下畫面～",
 })
 
 # Canonical Unicode-safe routing markers. These override the older mojibake

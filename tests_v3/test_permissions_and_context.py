@@ -83,8 +83,12 @@ def test_write_file_approval_covers_the_workflow():
     assert controller.permits(state, second)  # same workflow, no re-ask
 
 
-def test_execute_command_still_needs_per_call_approval():
-    # The file-bundle loosening must NOT leak to high-risk tools.
+def test_high_risk_grant_is_task_scoped_and_expires():
+    # Updated 2026-07-20: a high-risk approval covers the SAME tool for the current task (owner
+    # hit 可以 three times for one file creation). Bounds that must still hold: the grant expires,
+    # and it never covers a different tool (see test_high_risk_grant_does_not_leak_to_a_different_tool).
+    import time
+
     from yueyue_v3.models import ActionEnvelope, PermissionState
     from yueyue_v3.permissions import PermissionController
 
@@ -93,5 +97,69 @@ def test_execute_command_still_needs_per_call_approval():
     action = ActionEnvelope("execute_command", {"command": "dir"}, "step_1", "high")
     controller.request(state, action)
     assert controller.apply_reply(state, "可以") == "single"
-    assert controller.permits(state, action)  # consumes the single grant
-    assert not controller.permits(state, action)  # second call must re-ask
+    assert controller.permits(state, action)
+    assert controller.permits(state, action)  # same tool, same task - no re-ask
+    state.expires_at = time.time() - 1  # once expired, approval is required again
+    assert not controller.permits(state, action)
+
+
+def test_high_risk_grant_covers_same_tool_within_the_task():
+    # Live 2026-07-20: one file-creation asked 可以 three times (path check -> python -> command)
+    # and still didn't finish. Approving a high-risk tool now covers that tool for THIS task.
+    from yueyue_v3.models import ActionEnvelope, PermissionState
+    from yueyue_v3.permissions import PermissionController
+
+    controller = PermissionController()
+    state = PermissionState()
+    first = ActionEnvelope("execute_command", {"command": "mkdir x"}, "step_1", "high")
+    controller.request(state, first)
+    assert controller.apply_reply(state, "可以") == "single"
+    assert controller.permits(state, first)
+    second = ActionEnvelope("execute_command", {"command": "echo hi > x/a.txt"}, "step_2", "high")
+    assert controller.permits(state, second), "same tool, same task -> no re-ask"
+
+
+def test_high_risk_grant_does_not_leak_to_a_different_tool():
+    from yueyue_v3.models import ActionEnvelope, PermissionState
+    from yueyue_v3.permissions import PermissionController
+
+    controller = PermissionController()
+    state = PermissionState()
+    approved = ActionEnvelope("execute_command", {"command": "dir"}, "step_1", "high")
+    controller.request(state, approved)
+    controller.apply_reply(state, "可以")
+    other = ActionEnvelope("delete_file", {"filename": "a.txt"}, "step_2", "high")
+    assert not controller.permits(state, other), "a different high-risk tool still needs approval"
+
+
+def test_pending_task_note_states_the_truth(tmp_path):
+    # The chat turn must be told a task is awaiting approval, or the model invents an answer.
+    from yueyue_v3.models import (
+        ActionEnvelope,
+        GoalContract,
+        RequestedOutput,
+        StepContract,
+        WorkflowStatus,
+    )
+    from yueyue_v3.providers import ProviderResponse, ScriptedProvider
+    from yueyue_v3.runtime import YueYueRuntimeV3
+
+    (tmp_path / "workspace" / "brain").mkdir(parents=True)
+    (tmp_path / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
+    (tmp_path / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
+    rt = YueYueRuntimeV3(tmp_path, ScriptedProvider([ProviderResponse("好", "", [])]), state_dir=tmp_path / "v3")
+    assert rt._pending_task_note() == ""  # nothing pending -> no note
+
+    import copy
+    goal = GoalContract("建立 Hello.txt", [RequestedOutput("c", "d", True, "text", [])], ["c"])
+    wf = rt.workflow_engine.create(goal, [StepContract("s1", "s", "act", "d", ["execute_command"])])
+    wf.status = WorkflowStatus.AWAITING_PERMISSION
+    with rt.events.writer_scope():
+        state = copy.deepcopy(rt.state)
+        state.workflow = wf
+        state.permission.pending_action = ActionEnvelope("execute_command", {}, "s1", "high")
+        state.task_queue = ["建立自我介紹.txt"]
+        rt._replace_state(state, "test.seed", "t0")
+    note = rt._pending_task_note()
+    assert "Hello.txt" in note and "execute_command" in note
+    assert "排隊中" in note and "自我介紹" in note
