@@ -49,6 +49,25 @@ CANONICAL_FACT_KEYS = {
 # wandered into react_to_message (no real message existed) and blocked on the error.
 _SOCIAL_SIDE_TOOLS = {"react_to_message", "search_sticker"}
 
+
+def _environment_facts() -> str:
+    """Known local paths + tool boundaries for the planner. Plan the owner's actual mutation -
+    never a step that merely discovers a path we already know."""
+    import os as _os
+    from pathlib import Path as _Path
+
+    home = _Path(_os.path.expanduser("~"))
+    root = _os.path.abspath(_os.getenv("YUEYUE_ROOT_DIR") or _os.path.dirname(_os.path.dirname(__file__)))
+    return (
+        "\nKnown environment (do NOT plan a step just to discover these - they are given): "
+        f"home={home}; downloads={home / 'Downloads'}; desktop={home / 'Desktop'}; "
+        f"documents={home / 'Documents'}; project_root={root}; workspace={_Path(root) / 'workspace'}. "
+        "write_file/read_file only reach inside workspace; to create or edit a file ANYWHERE else "
+        "(downloads, desktop, home) plan execute_command/execute_python doing it in ONE step. "
+        "requested_outputs must be the owner's actual deliverable (the created file's content), "
+        "never an intermediate like a path you were told."
+    )
+
 # ROADMAP P3: golden plan shapes for the most common task families. Gap-battery evidence: with a
 # bare prompt the SAME task got a good plan one run and a shallow/one-step plan the next
 # (write-append-verify planned as a single step; a count task planned around the answer instead of
@@ -166,6 +185,10 @@ class GoalPlannerV3:
             + ", ".join(allowed_domain)
             + _GOLDEN_PLAN_EXAMPLES
         )
+        # The planner must know the machine's real paths and tool boundaries, or it plans a
+        # path-DISCOVERY goal (live 2026-07-21: requested_output became "downloads_path" and the
+        # file was never created) instead of planning the mutation the owner actually asked for.
+        system += _environment_facts()
         if contract_issues:
             system += (
                 " The previous contract was rejected for these structural reasons: "

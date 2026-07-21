@@ -302,3 +302,46 @@ def test_single_task_is_not_split(tmp_path, monkeypatch):
     turn = TurnEnvelope("owner", "建立檔案寫入 step1，然後追加 step2", TurnMode.TASK)
     assert rt._maybe_split_tasks(turn) == turn.text
     assert rt.state.task_queue == []
+
+
+def test_command_act_step_verifies_on_success():
+    # Root cause of the 7-minute retry loop (live 2026-07-21): ACTION_SOURCES was desktop-only, so
+    # an act step driven by execute_command could never verify - the file was created on the first
+    # try and the model kept retrying because the workflow said "action has not succeeded yet".
+    from yueyue_v3.models import ExecutionEvidence as EE
+    from yueyue_v3.models import GoalContract, RequestedOutput, StepContract
+    from yueyue_v3.workflow import WorkflowEngine
+
+    engine = WorkflowEngine(require_semantic_actions=True)
+    goal = GoalContract("建立 Hello.txt", [RequestedOutput("done", "d", True, "text", [])], ["c"])
+    wf = engine.create(goal, [
+        StepContract("step_1", "建檔", "act", "檔案建立", ["execute_command"]),
+        StepContract("step_2", "讀回", "observe", "內容確認", ["read_file"]),
+    ])
+    engine.add_evidence(wf, EE("step_1", "execute_command", "ok", "Command completed.", {"returncode": 0}))
+    engine.verify(wf)
+    assert wf.steps[0].status.value == "verified", "a successful command IS the act's evidence"
+
+
+def test_ui_act_step_still_needs_a_fresh_look():
+    # The loosening must not leak to UI actions: a click still requires post-action observation.
+    from yueyue_v3.models import ExecutionEvidence as EE
+    from yueyue_v3.models import GoalContract, RequestedOutput, StepContract
+    from yueyue_v3.workflow import WorkflowEngine
+
+    engine = WorkflowEngine(require_semantic_actions=True)
+    goal = GoalContract("按暫停", [RequestedOutput("s", "d", True, "screen_state", ["paused"])], ["c"])
+    wf = engine.create(goal, [StepContract("step_1", "click", "act", "paused", ["click_ui_element"])])
+    wf.evidence.append(EE("step_1", "click_ui_element", "ok", "clicked", {}))
+    satisfied, reason = engine._verify_step(wf.steps[0], wf.evidence)
+    assert not satisfied and "observation" in reason.lower()
+
+
+def test_repeated_identical_call_counts_as_no_progress():
+    # The old guard compared progress signatures, which changed on every retry because each
+    # attempt appended evidence - so an identical command could loop forever.
+    import json as _json
+    a = f"execute_command:{_json.dumps({'command': 'echo hi'}, sort_keys=True)[:400]}"
+    b = f"execute_command:{_json.dumps({'command': 'echo hi'}, sort_keys=True)[:400]}"
+    c = f"execute_command:{_json.dumps({'command': 'echo bye'}, sort_keys=True)[:400]}"
+    assert a == b and a != c

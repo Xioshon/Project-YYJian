@@ -2,6 +2,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import random
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -148,6 +149,24 @@ TOOL_INTENT_WEAK_MARKERS = [
     # 搜尋/搜索 as its own standalone markers, which is exactly the drift being removed).
     "搜尋",
     "搜索",
+    # File-mutation verbs were missing from every marker list, so 「幫我在下載路徑新增一個
+    # Hello.txt」 keyword-classified as CHAT and the reply was 「月月沒辦法在你電腦上新建文件」
+    # (live 2026-07-21; only the grey-zone LLM router was rescuing it). Weak, so they still need
+    # the 幫我 / named-target co-occurrence gate - 「我新增了一個習慣」 stays chat.
+    "新增",
+    "新建",
+    "建立",
+    "創建",
+    "创建",
+    "寫入",
+    "写入",
+    "刪除",
+    "删除",
+    "複製",
+    "复制",
+    "移動",
+    "移动",
+    "重命名",
 ]
 
 SCREEN_OBSERVE_MARKERS = [
@@ -236,12 +255,19 @@ SCREEN_OBSERVE_MARKERS.extend([
 ])
 # Canonical Traditional forms - this update block previously re-introduced Simplified 处/画 that
 # the owner saw on every task ("我先处理一下"), because it overwrites the clean list above.
-QUICK_ACKS.update({
-    InteractionMode.VISION_TASK: "我先看一下～",
-    InteractionMode.TOOL_TASK: "我先處理一下～",
-    InteractionMode.SOCIAL_STICKER: "收到～",
-    InteractionMode.SCREEN_OBSERVE: "我看一下畫面～",
-})
+# Owner 2026-07-21: 「我先處理一下」sounds like a service desk - wanted 「讓我先想一下下」-style
+# warmth, and ideally not one fixed string. Instant feedback rules out a model call here (it must
+# land before any processing), so each mode keeps a small pool picked at random: same zero latency,
+# no repeated-catchphrase feel.
+QUICK_ACK_POOLS = {
+    # Every line must pass voice_contract (no 喔/喲/耶 endings) - the gate caught 「等我一下下喔」.
+    InteractionMode.VISION_TASK: ["讓月月看看～", "嗯…月月瞧一眼", "來，讓我看看～"],
+    InteractionMode.TOOL_TASK: ["讓月月先想一下下～", "嗯…等我一下下", "好，月月來弄～"],
+    InteractionMode.SOCIAL_STICKER: ["收到～", "嗯哼～", "好啦好啦～"],
+    InteractionMode.SCREEN_OBSERVE: ["讓月月瞄一眼畫面～", "嗯…我看看畫面", "來，看一下～"],
+}
+QUICK_ACKS.update({mode: pool[0] for mode, pool in QUICK_ACK_POOLS.items()})
+
 
 # Canonical Unicode-safe routing markers. These override the older mojibake
 # lists above for normal runtime classification.
@@ -472,7 +498,10 @@ def response_policy_for(mode: InteractionMode) -> ResponsePolicy:
 
 
 def quick_ack_for(mode: InteractionMode) -> str:
-    return QUICK_ACKS.get(mode, "")
+    """A varied, in-persona instant acknowledgement. Random pick from the mode's pool so the
+    owner never hears the same catchphrase every task; no model call, so zero added latency."""
+    pool = QUICK_ACK_POOLS.get(mode)
+    return random.choice(pool) if pool else QUICK_ACKS.get(mode, "")
 
 
 def media_type_for(path: str) -> str:

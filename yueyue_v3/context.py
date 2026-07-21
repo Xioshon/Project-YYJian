@@ -183,6 +183,9 @@ class ContextCompiler:
             guidance = _md_skill_guidance(self.root, turn.text)
             if guidance:
                 messages.append({"role": "system", "content": guidance})
+            # Known environment paths: without these the model had to ask 「你的下載路徑在哪？」 or
+            # burn an approval running a command just to find it (live 2026-07-21).
+            messages.append({"role": "system", "content": _environment_note(self.root)})
             step = workflow.current_step()
             task = {
                 "objective": workflow.goal.objective,
@@ -222,6 +225,30 @@ class ContextCompiler:
             return json.dumps(raw, ensure_ascii=False)[:2500]
         except (OSError, ValueError, UnicodeError):
             return "{}"
+
+
+def _environment_note(root: Path) -> str:
+    """Concrete local paths the owner refers to casually ("我的下載路徑", "桌面"). Supplying them
+    removes a whole clarifying round-trip - and an approval spent just to discover the path."""
+    import os as _os
+    import platform as _platform
+
+    home = Path(_os.path.expanduser("~"))
+    lines = [
+        "### 這台機器（可直接用，不必再問主人或先跑指令查）",
+        f"- 系統：{_platform.system()} {_platform.release()}",
+        f"- 主人的家目錄：{home}",
+        f"- 下載路徑：{home / 'Downloads'}",
+        f"- 桌面：{home / 'Desktop'}",
+        f"- 文件：{home / 'Documents'}",
+        f"- 專案根目錄：{Path(root)}",
+        f"- 工作區：{Path(root) / 'workspace'}",
+        "主人說「下載路徑/桌面/文件夾」時就是上面這些，直接用絕對路徑動手，別再反問。",
+        "工具邊界（很重要，選錯會白白浪費主人一次授權）：write_file / read_file 只能存取工作區"
+        f"（{Path(root) / 'workspace'}）之內的路徑；要在工作區以外（下載夾、桌面、家目錄等）建立或"
+        "修改檔案，必須用 execute_command 或 execute_python，一個指令一次做完，不要先試 write_file。",
+    ]
+    return "\n".join(lines)
 
 
 _MD_SKILL_CACHE: list[dict[str, Any]] | None = None

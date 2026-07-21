@@ -28,7 +28,19 @@ OBSERVATION_SOURCES = {
     "read_webpage",
     "read_url_context",
 }
-ACTION_SOURCES = {"focus_window", "click_ui_element", "click_screen", "press_hotkey", "type_keyboard"}
+# Tools whose successful execution IS the action of an act step. This was desktop-only, so an act
+# step driven by execute_command/write_file could never satisfy `_verify_step` ("The planned action
+# has not succeeded yet") no matter how many times it succeeded - live 2026-07-21 a Hello.txt was
+# actually created on the first try, then retried for 7 minutes and finally mis-reported as a
+# permission failure. File/command mutations are actions too.
+ACTION_SOURCES = {
+    "focus_window", "click_ui_element", "click_screen", "press_hotkey", "type_keyboard",
+    "execute_command", "execute_python", "execute_async_command",
+    "write_file", "delete_file", "download_file",
+}
+# Desktop/UI actions only - semantic re-verification of a screenshot makes sense for these, but
+# demanding it after a file write would stall a perfectly finished task.
+UI_ACTION_SOURCES = {"focus_window", "click_ui_element", "click_screen", "press_hotkey", "type_keyboard"}
 # Tools that change persistent state the owner asked for. A pending act step using one of these
 # holds the goal open (see verify()); UI-navigation acts are deliberately excluded.
 MUTATION_TOOLS = {
@@ -266,7 +278,11 @@ class WorkflowEngine:
                 item for item in successful[last_action + 1 :] if item.source in OBSERVATION_SOURCES
             ]
             observed_after = bool(post_action_observations)
-            if self.require_semantic_actions and observed_after:
+            # A successful file/command mutation with no follow-up observation IS a completed act
+            # (its own result is the evidence). Only UI actions need a fresh look at the screen.
+            if not observed_after and successful[last_action].source not in UI_ACTION_SOURCES:
+                return True, "The action completed successfully."
+            if self.require_semantic_actions and observed_after and successful[last_action].source in UI_ACTION_SOURCES:
                 semantic = next(
                     (item for item in reversed(successful[last_action + 1 :]) if item.source == "semantic_verifier"),
                     None,

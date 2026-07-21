@@ -772,6 +772,7 @@ class YueYueRuntimeV3:
         no_progress = 0
         last_progress = ""
         last_observation_signature = ""
+        last_call_signature = ""
         for _ in range(self.max_iterations):
             workflow = copy.deepcopy(self.state.workflow)
             if not workflow:
@@ -801,6 +802,19 @@ class YueYueRuntimeV3:
             state.workflow = workflow
             self._replace_state(state, "workflow.verified", turn.turn_id)
             allowed = self.workflow_engine.allowed_tools(workflow)
+
+            # report_result is a universal, side-effect-free escape hatch for submitting a value
+            # the model derived from observations (a count/sum/extracted field), so a
+            # derive-and-report task can complete instead of re-observing into the no-progress
+            # guard. Only offered once at least one observation has succeeded - the model must
+            # observe first, then report a value grounded in that evidence, never invent one.
+            # Injected BEFORE the empty-tools check: a final tools-less "reply" step must be able
+            # to finish the goal, not be declared a dead end (live 2026-07-21: the file WAS created,
+            # the act step verified, then the reply step blocked with "No safe capability").
+            has_observed = any(item.status == "ok" for item in workflow.evidence)
+            if has_observed and ToolCatalogV3.REPORT_RESULT not in allowed:
+                allowed = [*allowed, ToolCatalogV3.REPORT_RESULT]
+
             if not allowed:
                 self.workflow_engine.block(workflow, "No safe capability is available for the current incomplete step.")
                 state = copy.deepcopy(self.state)
@@ -808,15 +822,6 @@ class YueYueRuntimeV3:
                 self.permission_controller.clear(state.permission)
                 self._replace_state(state, "workflow.blocked", turn.turn_id)
                 return self._compose_blocked_reply(workflow)
-
-            # report_result is a universal, side-effect-free escape hatch for submitting a value
-            # the model derived from observations (a count/sum/extracted field), so a
-            # derive-and-report task can complete instead of re-observing into the no-progress
-            # guard. Only offered once at least one observation has succeeded - the model must
-            # observe first, then report a value grounded in that evidence, never invent one.
-            has_observed = any(item.status == "ok" for item in workflow.evidence)
-            if has_observed and ToolCatalogV3.REPORT_RESULT not in allowed:
-                allowed = [*allowed, ToolCatalogV3.REPORT_RESULT]
 
             conversation = self.context.compile_turn(turn, workflow)
             # Render executed-tool evidence into the model's view. Without this, a permission
@@ -952,12 +957,18 @@ class YueYueRuntimeV3:
                     break
                 progress = self.workflow_engine.progress_signature(workflow)
                 observation_signature = evidence.observation_revision if name in OBSERVATION_SOURCES else ""
-                if progress == last_progress or (
+                # Repeating the SAME call with the SAME arguments is never progress, even though
+                # each attempt appends fresh evidence and therefore changes the progress signature.
+                # Without this the loop re-ran one command for 7 minutes (live 2026-07-21).
+                call_signature = f"{name}:{json.dumps(arguments, ensure_ascii=False, sort_keys=True)[:400]}"
+                repeated_call = call_signature == last_call_signature
+                if repeated_call or progress == last_progress or (
                     observation_signature and observation_signature == last_observation_signature
                 ):
                     no_progress += 1
                 else:
                     no_progress = 0
+                last_call_signature = call_signature
                 last_progress = progress
                 if observation_signature:
                     last_observation_signature = observation_signature

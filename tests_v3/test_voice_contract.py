@@ -151,3 +151,17 @@ def test_simplified_leaks_are_repaired_not_rejected() -> None:
     # non-Chinese and already-Traditional text pass through untouched
     assert repair_simplified_script("hello 月月") == "hello 月月"
     assert repair_simplified_script("我先處理一下") == "我先處理一下"
+
+
+def test_quick_ack_pools_are_varied_and_register_clean() -> None:
+    """Owner 2026-07-21: 「我先處理一下」was a service-desk catchphrase repeated on every task.
+    Pools give variety with zero latency - and every line must pass the register gate (the gate
+    caught 「等我一下下喔」 during this very change)."""
+    from agent_latency import QUICK_ACK_POOLS, InteractionMode, quick_ack_for
+
+    for mode, pool in QUICK_ACK_POOLS.items():
+        assert len(pool) >= 2, mode
+        for line in pool:
+            assert voice_register_violation(line) == "", f"{mode}: {line}"
+    seen = {quick_ack_for(InteractionMode.TOOL_TASK) for _ in range(40)}
+    assert len(seen) >= 2, "the ack must actually vary"
