@@ -322,7 +322,15 @@ class GoalPlannerV3:
                 )
             )
         criteria = [str(item)[:400] for item in raw.get("success_criteria") or [] if str(item).strip()]
-        if not outputs or len(steps) < 2 or not criteria:
+        if not outputs or not steps or not criteria:
+            return None
+        # A single-step plan is valid for a pure LOOKUP (observe/reply): the observation IS the
+        # deliverable and report_result submits it - exactly golden example 1 ("count/list from one
+        # observation, do NOT plan extra verification"). The old `len(steps) < 2` guard rejected
+        # every such plan, so a plain 「列出下載夾今天編輯過的檔案」 fell back to the generic 4-step
+        # scaffold and then blocked despite producing the right answer (live 2026-07-23). A lone
+        # MUTATION (act) still needs its own verification step, so that case still falls back.
+        if len(steps) == 1 and steps[0].kind == "act":
             return None
         deferred = [
             str(item).strip()[:500]

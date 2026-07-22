@@ -369,6 +369,11 @@ def classify_interaction(text: str = "", has_media: bool = False, media_kind: st
         return InteractionMode.SOCIAL_STICKER
     if _looks_like_observe_only_query(normalized):
         return InteractionMode.SCREEN_OBSERVE
+    # A filesystem request (list/find/check files in a named folder or path) is a real task -
+    # settle it here so a 「看一下」/「查一下」 doesn't later fall through to CHAT and get answered
+    # with an invented file list or a false 「月月看不了你的檔案」.
+    if _looks_like_filesystem_task(normalized):
+        return InteractionMode.TOOL_TASK
     if is_sticker_send_request(text):
         return InteractionMode.SOCIAL_STICKER
     if any(marker.casefold() in normalized for marker in COMPUTER_ACTION_MARKERS):
@@ -420,7 +425,36 @@ def classification_is_grey(text: str, mode: InteractionMode, has_media: bool = F
     return mode == InteractionMode.TOOL_TASK
 
 
+def _looks_like_filesystem_task(text: str) -> bool:
+    """A request about files/folders ON DISK - list, find, check, open a path - is a filesystem
+    TASK (list_files / search_in_files / read_file), never a screen observation.
+
+    Live 2026-07-23: 「幫我在下載路徑看一下我昨天編輯過的文件名」 hit the 「看一下」 observe
+    trigger and screenshotted whatever app was open instead of listing the Downloads folder. A
+    filesystem LOCATION word (資料夾/路徑/目錄/downloads) is the reliable signal - it is almost
+    never present in a genuine "look at my screen" request, and 「檔案/文件」 alone is too
+    ambiguous (could mean the file visible on screen), so a bare file noun does not qualify.
+    """
+    location_words = (
+        "資料夾", "文件夹", "文件夾", "目錄", "目录", "路徑", "路径", "folder", "directory",
+        "下載路徑", "下载路径", "下載夾", "下载夹", "downloads", "下載資料夾", "下载资料夹",
+    )
+    if any(word in text for word in location_words):
+        return True
+    # "編輯過的檔案 / 修改過的文件" is an unambiguous on-disk file-listing intent even with no
+    # location word - it's how the owner asks a FOLLOW-UP ("那今天的呢" → 「今天編輯過的檔案」).
+    # Without this those follow-ups fell to CHAT and got 「月月做不到」 about work she'd just done.
+    edited_file_intent = any(
+        v in text for v in ("編輯過", "编辑过", "修改過", "修改过", "改過的", "改过的", "編輯的", "编辑的")
+    ) and any(n in text for n in ("檔案", "文件", "檔", "file"))
+    return edited_file_intent
+
+
 def _looks_like_observe_only_query(text: str) -> bool:
+    # A filesystem request (list the Downloads folder, find a file on disk) is a task, not a
+    # screen observation - never let a 「看一下」 in such a request trigger a screenshot.
+    if _looks_like_filesystem_task(text):
+        return False
     # These verbs already imply an active "go check something" request, so they are
     # safe to trigger observe-mode on their own.
     strong_observe_markers = [

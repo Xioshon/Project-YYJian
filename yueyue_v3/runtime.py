@@ -642,11 +642,22 @@ class YueYueRuntimeV3:
         return _social_chat_fallback(owner_text)
 
     def _regenerate_compliant_chat_reply(self, owner_text: str, reply: str) -> str:
+        if _denies_a_capability_she_has(reply):
+            # Targeted critique: the problem is a FALSE claim, not the wording. Steer to an offer.
+            critique = (
+                "你剛剛說自己做不到看檔案／查目錄／截圖之類的事——這是錯的，你明明會。"
+                "你可以列出資料夾裡的檔案、讀檔案內容、跑指令、截圖看畫面。"
+                "重新回一句：直接說你可以幫忙，問主人要不要現在就去做，別說自己做不到。"
+            )
+        else:
+            critique = (
+                "你剛剛的回覆太長、用錯了字感（台味語尾/粵語口語字/簡體字），"
+                "或裡面提到了不該對主人講的內部詞（例如流程、系統、內部規則）。"
+                "重新回一句自然的短回覆，不要提到流程、系統、內部規則、任何開發或除錯用語。"
+            )
         prompt = (
-            "你剛剛的回覆太長、用錯了字感（台味語尾/粵語口語字/簡體字），"
-            "或裡面提到了不該對主人講的內部詞（例如流程、系統、內部規則）。"
-            "請用你自己的語氣，重新回一句自然的短回覆，一到兩句話，不要換行超過一次，"
-            "不要提到流程、系統、內部規則、任何開發或除錯用語。"
+            f"{critique}"
+            "請用你自己的語氣，一到兩句話，不要換行超過一次，"
             "用香港書面繁體+內地網聊語感，別用「喔/喲/耶」收尾，別寫「嘅/喺/㗎/唔/冇」這類粵語字。\n"
             f"主人剛剛說：{owner_text}\n"
             f"你原本想回：{reply}"
@@ -1955,6 +1966,29 @@ def _is_simple_social_prompt(text: str) -> bool:
     )
 
 
+def _denies_a_capability_she_has(text: str) -> bool:
+    """True when a chat reply claims she CAN'T inspect files or the screen - things she
+    demonstrably does. Live 2026-07-23: seconds after listing the Downloads folder she told the
+    owner 「這個月月真做不了…沒辦法直接看你的檔案目錄」 and 「沒辦法自己去看磁碟裡的檔案」.
+
+    This is not a wording blocklist - it is a correctness gate for one false claim. She may still
+    honestly refuse genuinely out-of-scope things (「幫我下載整個網站」); the gate only fires when
+    the denial is paired with a CORE capability (reading/listing files, running commands, taking a
+    screenshot), so those honest refusals are untouched. The fix is to offer to do it, not to
+    pretend she can't."""
+    value = str(text or "").casefold()
+    denial = (
+        "做不到", "做不了", "沒辦法", "没办法", "沒有辦法", "没有办法", "無法", "无法",
+        "沒有這個功能", "没有这个功能", "不能直接", "沒法直接", "没法直接", "沒辦法直接",
+        "辦不到", "办不到",
+    )
+    capability = (
+        "檔案", "文件", "目錄", "目录", "資料夾", "文件夹", "磁碟", "磁盘", "硬碟", "硬盘",
+        "截圖", "截图", "螢幕", "屏幕", "畫面", "画面", "指令", "命令", "檔案目錄", "檔名",
+    )
+    return any(d in value for d in denial) and any(c in value for c in capability)
+
+
 def _has_roleplay_action_line(text: str) -> bool:
     for line in [item.strip() for item in str(text or "").splitlines() if item.strip()]:
         lowered = line.casefold()
@@ -2056,6 +2090,11 @@ def _chat_reply_violates_social_policy(
         return True
     if _has_roleplay_action_line(value):
         return True
+    # Never let her tell the owner she can't inspect files/screen - she can. Regenerate into an
+    # offer to actually do it. Grounded task-report replies are exempt (they legitimately relay a
+    # real "not found" result, which is not a capability denial).
+    if not grounded and _denies_a_capability_she_has(value):
+        return True
     if value.count("\uff08") + value.count("(") > 1:
         return True
     if value.count("\u5c0d\u4e0d\u8d77") + value.count("\u5bf9\u4e0d\u8d77") > 1:
@@ -2100,6 +2139,13 @@ def _social_chat_fallback(owner_text: str) -> str:
         for marker in ("有點累", "有点累", "好累", "很累", "累死", "累了", "累啦")
     ):
         return "辛苦了。。。先歇一會，其他的月月幫你記著"
+    # File/folder/screen question that reached the fallback: offer to do it, never deny. This is
+    # the last-resort net behind the capability-denial gate - it must not itself read as 「做不到」.
+    if any(
+        w in normalized
+        for w in ("檔案", "文件", "資料夾", "文件夹", "目錄", "目录", "路徑", "路径", "螢幕", "屏幕", "畫面", "画面")
+    ):
+        return "這個月月可以幫你看的～要現在就去查嗎？"
     # Universal default: must read naturally after ANY owner message (praise, statement,
     # question). "Spaced out, say it again" is honest, cute, and never a non-sequitur.
     return "誒，等等，月月剛剛走神了。。。你再說一次嘛"

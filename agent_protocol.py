@@ -202,5 +202,12 @@ def _looks_like_single_approval(text: str) -> bool:
         r"^(继续|继续吧|接着|接着来|跑吧|做吧|执行吧|按吧|按下去|点吧|去吧)$",
         r"(你|月月)?(继续|接着|跑|做|执行|按|点)(吧|下去|一下|好了)?$",
         r"(可以了|允许了|同意了|授权了|放行吧|继续做|继续执行)",
+        # Bare affirmations. Only reachable when a permission is already pending (see
+        # classify_approval's has_pending guard), so a plain 「對」/「是」/「沒錯」 answering
+        # 「要現在動手嗎？」 is a yes. Live 2026-07-23: 「對」 answering a permission ask fell
+        # through to chat ("好嘛～那月月記下了哦"), losing the approval. Anchored ^...$ with a
+        # tight trailing-particle set so topic-shifts and questions do NOT match: 「對了」(了),
+        # 「不對」(不), 「是嗎」(嗎/吗), 「是不是」, 「對不對」 all correctly stay non-approval.
+        r"^(對|对|是|沒錯|没错|冇錯|冇错|无误|無誤)+[的啊呀喔哦嘛哈~～]*$",
     ]
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in approval_patterns)

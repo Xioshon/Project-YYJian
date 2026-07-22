@@ -625,3 +625,103 @@ def test_chat_contract_never_teaches_her_to_deny_her_abilities():
     compiler = ContextCompiler(root, ShortContextStore(root + "/ctx.json"))
     contract = compiler.system_prompt(TurnMode.CHAT)
     assert "沒有這個功能" in contract and "本來就會做這些事" in contract
+
+
+def test_bare_affirmations_are_approval_only_when_pending():
+    # Live 2026-07-23: 「對」 answering 「要現在動手嗎？」 fell through to chat and lost the approval.
+    from agent_protocol import classify_approval
+
+    for yes in ("對", "对", "是", "是的", "沒錯", "对啊", "對呀", "無誤"):
+        assert classify_approval(yes, has_pending=True) == "single", yes
+    # topic-shifts, negations and questions must NOT read as approval
+    for no in ("對了", "不對", "是嗎", "是不是", "對不對", "那今天的呢", "是你的自我介紹，不是我的"):
+        assert classify_approval(no, has_pending=True) != "single", no
+    # never approval without a pending action
+    assert classify_approval("對", has_pending=False) == "none"
+
+
+def test_code_exec_approval_covers_the_class_but_not_destructive_tools():
+    # Live 2026-07-23: a list-files task approved execute_command then re-asked when it switched to
+    # execute_python. One approval now covers the code-exec class for the task; delete/download stay
+    # explicit.
+    from yueyue_v3.models import ActionEnvelope, PermissionState
+    from yueyue_v3.permissions import PermissionController
+
+    controller = PermissionController()
+    state = PermissionState()
+    controller.request(state, ActionEnvelope("execute_command", {"command": "dir"}, "s1", "high"))
+    assert controller.apply_reply(state, "可以") == "single"
+    assert controller.permits(state, ActionEnvelope("execute_python", {}, "s2", "high"))
+    assert controller.permits(state, ActionEnvelope("execute_async_command", {}, "s3", "high"))
+    # a code-exec grant must NOT silently cover deleting or downloading
+    assert not controller.permits(state, ActionEnvelope("delete_file", {"filename": "a"}, "s4", "high"))
+    assert not controller.permits(state, ActionEnvelope("download_file", {"url": "x"}, "s5", "high"))
+    # approving delete stays single-tool and does not leak to code execution
+    fresh = PermissionState()
+    controller.request(fresh, ActionEnvelope("delete_file", {"filename": "a"}, "s", "high"))
+    controller.apply_reply(fresh, "對")
+    assert controller.permits(fresh, ActionEnvelope("delete_file", {"filename": "b"}, "s2", "high"))
+    assert not controller.permits(fresh, ActionEnvelope("execute_python", {}, "s3", "high"))
+
+
+def test_filesystem_request_routes_to_task_not_screen_observe():
+    # Live 2026-07-23: 「幫我在下載路徑看一下昨天編輯過的文件名」 hit the 「看一下」 observe trigger
+    # and screenshotted the open app instead of listing the Downloads folder.
+    from agent_latency import InteractionMode, classify_interaction
+
+    for fs in (
+        "可以幫我在下載路徑看一下我昨天編輯過的文件名給我看嗎",
+        "幫我在下載路徑查看我昨天編輯過的文件名給我",
+        "幫我看一下資料夾裡有哪些檔案",
+        "今天編輯過的檔案",
+    ):
+        assert classify_interaction(fs) == InteractionMode.TOOL_TASK, fs
+    # a genuine screen request still observes the screen
+    for scr in ("看一下我的螢幕現在顯示什麼", "幫我看下畫面上是什麼"):
+        assert classify_interaction(scr) == InteractionMode.SCREEN_OBSERVE, scr
+
+
+def test_chat_never_denies_a_file_or_screen_capability_she_has():
+    # Live 2026-07-23: seconds after listing the Downloads folder she said 「沒辦法直接看你的檔案
+    # 目錄」. The gate catches the false claim; honest out-of-scope refusals stay allowed.
+    from yueyue_v3.runtime import _chat_reply_violates_social_policy, _denies_a_capability_she_has
+
+    assert _denies_a_capability_she_has("這個月月真做不了呢……沒有辦法直接看你的檔案目錄")
+    assert _denies_a_capability_she_has("沒辦法自己去看磁碟裡的檔案有沒有被改過")
+    assert not _denies_a_capability_she_has("這個月月真做不了…範圍太大了啦")  # honest refusal
+    assert _chat_reply_violates_social_policy("沒辦法直接看你的檔案目錄欸", "今天編輯過的檔案")
+    # a grounded task report of a real 'not found' is not a capability denial
+    assert not _chat_reply_violates_social_policy(
+        "查過了，下載資料夾那邊沒有找到昨天編輯過的檔案呢", "那今天的呢", grounded=True
+    )
+
+
+def test_single_step_lookup_plan_is_accepted_not_forced_to_fallback():
+    # Live 2026-07-23: 「列出下載夾今天編輯過的檔案」 is genuinely ONE observe step, but the old
+    # `len(steps) < 2` guard rejected it, so it fell back to the generic 4-step scaffold and then
+    # blocked despite producing the right answer. A lone lookup is valid; a lone mutation is not.
+    from yueyue_v3.planning import GoalPlannerV3
+
+    planner = GoalPlannerV3(object(), lambda: ["execute_command", "list_files", "read_file", "write_file"])
+    lookup = {
+        "objective": "列出下載夾今天編輯過的檔案",
+        "requested_outputs": [{"name": "files", "description": "清單", "evidence_kind": "text"}],
+        "success_criteria": ["列出今日修改的檔案"],
+        "steps": [
+            {"name": "list", "kind": "observe", "done_condition": "listed", "allowed_tools": ["execute_command"]}
+        ],
+    }
+    plan = planner._parse(lookup, "列出下載夾今天編輯過的檔案", ["execute_command", "list_files", "read_file"])
+    assert plan is not None, "a single observe step is a valid lookup plan"
+    assert len(plan.steps) == 1 and plan.steps[0].kind == "observe"
+
+    # a lone MUTATION still needs its own verification step -> reject so replan/fallback adds one
+    mutation = {
+        "objective": "建立檔案",
+        "requested_outputs": [{"name": "content", "description": "內容", "evidence_kind": "text"}],
+        "success_criteria": ["檔案存在"],
+        "steps": [
+            {"name": "write", "kind": "act", "done_condition": "written", "allowed_tools": ["write_file"]}
+        ],
+    }
+    assert planner._parse(mutation, "建立檔案", ["write_file", "read_file"]) is None
