@@ -179,3 +179,37 @@ def test_remember_this_writes_to_memory(monkeypatch):
 def test_remember_this_empty_fact_fails():
     out = execute_skill("remember_this", {"fact": ""}, _ctx())
     assert not out.ok
+
+
+def test_blocked_workflow_is_terminal_everywhere(tmp_path):
+    # Live 2026-07-22: a vetoed-but-finished task haunted every 「現在有什麼任務」 answer.
+    # BLOCKED must read as terminal: no pending note, no introspect active, queue drains past it.
+    import copy
+
+    from yueyue_v3.models import GoalContract, RequestedOutput, StepContract, TurnEnvelope, TurnMode, WorkflowStatus
+    from yueyue_v3.providers import ProviderResponse, ScriptedProvider
+    from yueyue_v3.runtime import YueYueRuntimeV3
+
+    (tmp_path / "workspace" / "brain").mkdir(parents=True)
+    (tmp_path / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
+    (tmp_path / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
+    provider = ScriptedProvider([ProviderResponse("好", "", []) for _ in range(6)])
+    rt = YueYueRuntimeV3(tmp_path, provider, state_dir=tmp_path / "v3")
+
+    goal = GoalContract("建立 Hello.txt", [RequestedOutput("c", "d", True, "text", [])], ["c"])
+    wf = rt.workflow_engine.create(goal, [StepContract("s1", "s", "act", "d", ["execute_command"])])
+    wf.status = WorkflowStatus.BLOCKED
+    with rt.events.writer_scope():
+        state = copy.deepcopy(rt.state)
+        state.workflow = wf
+        rt._replace_state(state, "test.seed", "t0")
+
+    assert rt._pending_task_note() == ""
+    import skill_engine as se
+    snap = se.RUNTIME_INTROSPECT()
+    assert snap["active"] is None
+    # a NEW task while blocked starts fresh instead of queueing behind the corpse
+    with rt.events.writer_scope():
+        reply = rt._process_turn(TurnEnvelope("owner", "幫我建立另一個檔案 test2.txt", TurnMode.TASK))
+    assert rt.state.task_queue == []
+    assert reply

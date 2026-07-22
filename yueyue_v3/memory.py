@@ -59,7 +59,7 @@ class SiliconFlowEmbedder:
             import httpx
             from openai import OpenAI
 
-            with httpx.Client(timeout=8.0) as http_client:
+            with httpx.Client(timeout=4.0) as http_client:
                 client = OpenAI(
                     api_key=self.api_key, base_url="https://api.siliconflow.cn/v1", http_client=http_client
                 )

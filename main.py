@@ -306,7 +306,10 @@ _REPLY_PACING_LATE_NIGHT_HOURS = frozenset(range(0, 6))
 _REPLY_PACING_RAPID_TURN_WINDOW_SECONDS = 600
 _REPLY_PACING_RAPID_TURN_COUNT = 4
 _REPLY_PACING_PROBABILITY_ENV = "YUEYUE_REPLY_PACING_PROBABILITY"
-_DEFAULT_REPLY_PACING_PROBABILITY = 0.15
+# Owner 2026-07-22: pacing delays (8-40s, late-night/rapid-turn triggered) made chat feel
+# stuck - he tests at 5am and hit the late-night branch every time. Off by default;
+# re-enable via YUEYUE_REPLY_PACING_PROBABILITY if wanted.
+_DEFAULT_REPLY_PACING_PROBABILITY = 0.0
 _REPLY_PACING_DELAY_RANGE_SECONDS = (8.0, 40.0)
 
 

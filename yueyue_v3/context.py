@@ -87,15 +87,19 @@ class ContextCompiler:
         # Optional long-term memory store (ROADMAP P2), attached by the runtime. None = no recall.
         self.memory = None
 
-    def system_prompt(self, mode: TurnMode) -> str:
+    def system_prompt(self, mode: TurnMode, include_samples: bool | None = None) -> str:
         personality = self._read("workspace/brain/personality.md", 6500)
         rules = self._read("workspace/brain/rules.md", 3200)
         profile = self._read_profile()
-        samples = (
-            self._read("workspace/brain/personality_samples.md", 4200)
-            if mode in {TurnMode.CHAT, TurnMode.SOCIAL}
-            else ""
-        )
+        # Persona samples ship to chat/social always, and to any OWNER-FACING generation that
+        # opts in (include_samples=True: permission asks, result replies, opener, reminders).
+        # Root cause found 2026-07-22: task-voice had ZERO samples, so task lines dropped into
+        # generic-assistant register AND drifted into spoken Cantonese - the samples ARE the
+        # register demonstration. The DeepSeek execution loop stays sample-free (it writes tool
+        # calls, not owner lines), so this costs nothing where tokens are expensive.
+        if include_samples is None:
+            include_samples = mode in {TurnMode.CHAT, TurnMode.SOCIAL}
+        samples = self._read("workspace/brain/personality_samples.md", 4200) if include_samples else ""
         mode_rules = {
             # Deliberately lean and positive: the samples above show HOW she talks, and the
             # output-side gate (runtime._chat_reply_violates_social_policy) already enforces the
@@ -152,7 +156,9 @@ class ContextCompiler:
                 try:
                     from .memory import render_memory_note
 
-                    recalled = self.memory.retrieve(turn.text)
+                    # Trivial acknowledgements (嗯/哈哈/好) carry no retrieval signal - skip the
+                    # embedding round-trip so short chat stays snappy.
+                    recalled = self.memory.retrieve(turn.text) if len(turn.text.strip()) >= 4 else []
                     if not recalled and _is_conversation_opener(turn.text):
                         import datetime
 

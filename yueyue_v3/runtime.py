@@ -106,7 +106,9 @@ class YueYueRuntimeV3:
         def _introspect() -> dict:
             wf = self.state.workflow
             active = None
-            if wf and wf.status not in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED}:
+            if wf and wf.status not in {
+                WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED, WorkflowStatus.BLOCKED,
+            }:
                 active = {"objective": wf.goal.objective, "status": wf.status.value}
             return {"active": active, "queued": list(self.state.task_queue)}
 
@@ -166,10 +168,11 @@ class YueYueRuntimeV3:
             drained = 0
             while (
                 self.state.task_queue
-                and drained < 2
+                and drained < 3
                 and (
                     self.state.workflow is None
-                    or self.state.workflow.status in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED}
+                    or self.state.workflow.status
+                    in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED, WorkflowStatus.BLOCKED}
                 )
             ):
                 state = copy.deepcopy(self.state)
@@ -193,9 +196,9 @@ class YueYueRuntimeV3:
         if not workflow or workflow.status in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED}:
             return False
         try:
-            minutes = float(env_value("YUEYUE_WORKFLOW_STALE_MINUTES") or 30)
+            minutes = float(env_value("YUEYUE_WORKFLOW_STALE_MINUTES") or 10)
         except ValueError:
-            minutes = 30.0
+            minutes = 10.0
         minutes = max(1.0, minutes)
         return (time.time() - float(workflow.updated_at or 0.0)) > minutes * 60
 
@@ -248,7 +251,8 @@ class YueYueRuntimeV3:
         # A new task while one is still active (running/awaiting) queues instead of vanishing.
         if (
             self.state.workflow
-            and self.state.workflow.status not in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED}
+            and self.state.workflow.status
+            not in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED, WorkflowStatus.BLOCKED}
         ):
             state = copy.deepcopy(self.state)
             state.task_queue.append(turn.text[:500])
@@ -277,7 +281,8 @@ class YueYueRuntimeV3:
         # Cheap conjunction prefilter - only a plausibly-multi message pays for the split call.
         # Loose is fine: the model does the real judgment and returns a single element for one task.
         if not any(m in text for m in ("然後", "然后", "再", "還有", "还有", "順便", "顺便",
-                                       "接著", "接着", "以及", "；", ";", "另外", "同時", "同时")):
+                                       "接著", "接着", "以及", "；", ";", "另外", "同時", "同时",
+                                       "和", "、", "，", ",", "及", "並", "并", "也")):
             return turn.text
         parts = self._split_objectives(text)
         if len(parts) <= 1:
@@ -399,7 +404,12 @@ class YueYueRuntimeV3:
         """Ground truth about the currently-awaiting task, injected into chat turns so YueYue can
         never contradict her own permission request."""
         workflow = self.state.workflow
-        if not workflow or workflow.status in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED}:
+        # BLOCKED is terminal for owner-facing purposes: a task we already gave up on must never
+        # be reported as "in progress" (live 2026-07-22: a vetoed-but-finished task haunted every
+        # 「現在有什麼任務」answer until the 30-minute stale timer).
+        if not workflow or workflow.status in {
+            WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED, WorkflowStatus.BLOCKED,
+        }:
             return ""
         pending = self.state.permission.pending_action
         lines = [
@@ -476,12 +486,22 @@ class YueYueRuntimeV3:
         if type(self.provider).__name__ != "SiliconFlowProvider":
             return ""
         try:
+            # The veto must see the EXECUTION EVIDENCE, not just the bound outputs - judging
+            # outputs alone vetoed a task whose file was verifiably created (live 2026-07-22).
+            evidence_tail = [
+                {"tool": item.source, "status": item.status, "summary": str(item.summary)[:200]}
+                for item in workflow.evidence[-5:]
+            ]
             prompt = (
-                "任務目標與提取到的結果如下。結果是否真的回答了目標要的東西？"
-                "只回 YES，或 NO: 一句原因（結果空泛/答非所問/缺了目標要求的部分才算 NO；"
-                "格式醜但內容對就是 YES）。\n"
+                "任務目標、提取結果、以及真實執行證據如下。只有在結果和證據都明顯無法支持"
+                "「目標已完成」時才回 NO。證據顯示動作成功（例如檔案已寫入/指令已執行成功）就是 YES；"
+                "格式醜但內容對是 YES；拿不準也是 YES。回 YES，或 NO: 一句原因。\n"
                 + json.dumps(
-                    {"objective": workflow.goal.objective, "outputs": workflow.outputs},
+                    {
+                        "objective": workflow.goal.objective,
+                        "outputs": workflow.outputs,
+                        "evidence": evidence_tail,
+                    },
                     ensure_ascii=False,
                 )
             )
@@ -1203,7 +1223,7 @@ class YueYueRuntimeV3:
         for _ in range(2):
             try:
                 messages = [
-                    {"role": "system", "content": self.context.system_prompt(TurnMode.TASK)},
+                    {"role": "system", "content": self.context.system_prompt(TurnMode.TASK, include_samples=True)},
                     {"role": "user", "content": prompt + critique},
                 ]
                 # Owner-voice lines are persona speech, not planning - they follow the chat
