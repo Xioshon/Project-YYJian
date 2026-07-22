@@ -113,10 +113,22 @@ class ContextCompiler:
                 "短、口語、軟軟的、被動接住主人的話；調皮是偶爾藏在細節裡的小彩蛋，不主動嗆人；"
                 "關心可以直接給。預設一句話就夠，別長篇。\n"
                 + VOICE_REGISTER_ZH
-                + "\n聊天時不會真的動用工具，所以絕不要說「我去看一下」「我先開一下」這種其實做不到的承諾——"
-                "想幫忙就直接講你知道的，或請主人把它當任務叫你做，別假裝已經在做。\n"
-                "你對過去對話的唯一記憶就是上面那幾句短期上下文。主人問到不在裡面的舊事，就老實說不記得了"
-                "（俏皮地說「這我忘了，提醒我一下？」也行），絕不要編造沒發生過的對話或引用。\n"
+                # Phrased so she never denies her own abilities. The old wording ("聊天時不會真的
+                # 動用工具") got over-generalised into 「月月這邊沒有建檔案的功能」 right after she had
+                # created two files (live 2026-07-22) - the limit is THIS message, not her skills.
+                + "\n這一則是閒聊，你手上沒有在跑工具，所以別說「我去看一下」「我先開一下」這種當下做不到的話。"
+                "但你本來就會做這些事——建檔案、查東西、操作電腦都會——主人開口交代你就做得到，"
+                "所以絕對不要說自己「沒有這個功能」「做不到」。想幫忙就直接講你知道的，"
+                "或請主人把它當任務交代給你。\n"
+                # The "say you don't remember" rule used to be unqualified, and it OVERRODE the
+                # 目前狀態 fact block: seconds after finishing a file she answered 「剛剛那個做完了
+                # 嗎」 with 「月月不記得剛才做什麼了呢」 (live 2026-07-22). Task turns never enter
+                # short-term context, so that note is the only place those facts live - it has to
+                # outrank the forgetting rule, not lose to it.
+                "你的記憶來源有兩個：上面那幾句短期上下文，以及系統給你的「目前狀態」事實。"
+                "「目前狀態」裡寫的事你就是知道，要照著答，不可以說不記得。\n"
+                "兩邊都沒有的舊事才老實說不記得（俏皮地說「這我忘了，提醒我一下？」也行），"
+                "絕不要編造沒發生過的對話或引用。\n"
                 "除非主人先用這些詞，否則不要提系統、流程、debug、專案狀態這類開發用語。"
             ),
             TurnMode.SOCIAL: (
@@ -178,7 +190,13 @@ class ContextCompiler:
                     _sanitize_context_text(item.text, role=item.role, allow_project_meta=allow_project_meta), 360
                 )
                 if text:
-                    messages.append({"role": item.role, "content": text})
+                    # Never forward an unexpected role verbatim: providers reject anything outside
+                    # system/user/assistant/tool with a 400, and because the bad row stays in the
+                    # store that would break EVERY chat reply until the context file was cleared.
+                    role = item.role if item.role in {"user", "assistant", "system"} else (
+                        "assistant" if item.role in {"yueyue", "bot"} else "user"
+                    )
+                    messages.append({"role": role, "content": text})
             if turn.mode == TurnMode.SOCIAL and social_note:
                 messages.append({"role": "system", "content": _compact(social_note, 800)})
         elif turn.mode in {TurnMode.TASK, TurnMode.VISION} and workflow:
@@ -370,6 +388,16 @@ _TRADITIONAL_ONLY_CHARS = frozenset(_TRADITIONAL_CHARS_ORDERED)
 _TRADITIONAL_TO_SIMPLIFIED_TABLE = str.maketrans(_TRADITIONAL_CHARS_ORDERED, _SIMPLIFIED_CHARS_ORDERED)
 _SIMPLIFIED_TO_TRADITIONAL_TABLE = str.maketrans(_SIMPLIFIED_CHARS_ORDERED, _TRADITIONAL_CHARS_ORDERED)
 
+# Optional full Simplified->Traditional mapping. Imported lazily-but-once; None when unavailable.
+try:  # pragma: no cover - trivial import guard
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")  # zhconv imports the deprecated pkg_resources
+        from zhconv import convert as _zh_convert
+except Exception:  # pragma: no cover
+    _zh_convert = None
+
 
 def _detect_chinese_script(text: str) -> str:
     """Return 'simplified', 'traditional', or '' (no signal) for the owner's current wording.
@@ -432,7 +460,19 @@ def to_traditional_script(reply: str) -> str:
     The chat models intermittently drop Simplified characters into an otherwise-Traditional
     reply (「我先处理一下」). Rejecting those replies burned a regeneration attempt and often
     ended in a canned fallback - the owner's top pet hate - when the leak is mechanically
-    fixable with the same character table the mirroring path already trusts."""
+    fixable.
+
+    Uses zhconv's full standard mapping when available. The in-repo character table is a
+    hand-picked tripwire of ~428 chars and it missed everyday ones - 「還是剛才那两件…不敢乱動…
+    加進來吗」 reached the owner intact on 2026-07-22 - and growing that list by hand is exactly
+    the whack-a-mole this project keeps rejecting. zh-hant (not zh-tw) is deliberate: it converts
+    the SCRIPT without swapping in Taiwan vocabulary, so 信息/屏幕 stay as the owner writes them.
+    Falls back to the local table if the package is absent, so this stays a soft dependency."""
+    if _zh_convert is not None:
+        try:
+            return _zh_convert(reply, "zh-hant")
+        except Exception:
+            pass
     return reply.translate(_SIMPLIFIED_TO_TRADITIONAL_TABLE)
 
 

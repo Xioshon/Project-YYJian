@@ -117,7 +117,20 @@ class YueYueRuntimeV3:
                 WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED, WorkflowStatus.BLOCKED,
             }:
                 active = {"objective": wf.goal.objective, "status": wf.status.value}
-            return {"active": active, "queued": list(self.state.task_queue)}
+            # A just-finished task exists NOWHERE else the chat turn can see it: task turns are
+            # never written to short-term context, so 「剛剛那個做完了嗎」 had nothing to answer
+            # from. Carrying it as tool DATA (rather than a system instruction the model can
+            # talk itself out of) is what actually reaches the reply.
+            last_done = (
+                wf.goal.objective
+                if wf and wf.status == WorkflowStatus.COMPLETED
+                else ""
+            )
+            return {
+                "active": active,
+                "queued": list(self.state.task_queue),
+                "last_completed": last_done,
+            }
 
         _skill_engine.RUNTIME_INTROSPECT = _introspect
 
@@ -410,11 +423,29 @@ class YueYueRuntimeV3:
                     f"- 沒有正在執行的任務，但有 {len(self.state.task_queue)} 件排隊中："
                     + "；".join(f"「{q[:40]}」" for q in self.state.task_queue[:3])
                 )
-            return (
-                "### 目前狀態（事實，不可否認）\n"
-                "- 現在沒有任何任務在跑，也沒有排隊的。之前交代的都處理完了。\n"
-                "- 主人問起就照這個講，不要憑印象說某件事還沒做。"
-            )
+            # Blunt and answer-shaped on purpose. A softer version ("之前交代的都處理完了") still
+            # lost to stale short-term context: right after finishing two files she told the owner
+            # 「還是剛才那两件呀，你還沒說可以」(live 2026-07-22). The note must read as the answer
+            # itself, not as background the model can weigh against what it remembers.
+            # Two DIFFERENT questions get two separate facts. An earlier version bolted an
+            # absolutist 「唯一正確的答案就是現在沒有任務」 onto the same block, and the model then
+            # applied it to 「剛剛那個做完了嗎」 too, answering 「月月不知道有什麼任務」 about a file
+            # it had just written. Each line now says which question it answers.
+            lines = [
+                "### 目前狀態（事實，不可否認）",
+                "- 現在沒有任何任務在等待、在跑或排隊。主人問「有什麼任務」就照這句答。",
+            ]
+            # Task turns never enter short-term chat context (remember() only records CHAT/SOCIAL),
+            # so this line is the ONLY place a just-finished task exists for a follow-up question.
+            if workflow and workflow.status == WorkflowStatus.COMPLETED:
+                lines.append(
+                    f"- 剛剛才做完「{workflow.goal.objective[:120]}」，是你自己做的，已經完成了。"
+                    "主人問起「剛剛那個」「做完了嗎」就是指這件事——回答做完了，"
+                    "絕對不要說不記得、不知道，也不要說它還沒做。"
+                )
+            else:
+                lines.append("- 別憑印象說某件事還沒做。")
+            return "\n".join(lines)
         pending = self.state.permission.pending_action
         lines = [
             "### 目前狀態（事實，不可否認）",

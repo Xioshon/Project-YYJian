@@ -550,3 +550,78 @@ def test_pending_task_note_never_teaches_the_disliked_idiom(tmp_path):
     source = inspect.getsource(runtime.YueYueRuntimeV3._pending_task_note)
     code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
     assert "點頭" not in code, "a negation naming the idiom is what kept reintroducing it"
+
+
+def test_non_ui_action_completes_even_when_an_observation_follows():
+    # Live 2026-07-22: reading the written file back made the act step HARDER to verify than not
+    # looking - with an observation present it fell through to fuzzy-matching the plan's
+    # descriptive done_condition against the file's actual text, which never matches. The
+    # workflow then spun on report_result and blocked on a file that was written correctly.
+    from yueyue_v3.models import ExecutionEvidence as EE
+    from yueyue_v3.models import StepStatus
+    from yueyue_v3.workflow import WorkflowEngine
+
+    engine = WorkflowEngine()
+    goal = GoalContract("建立自我介紹檔", [RequestedOutput("content", "最終內容", True, "text", [])], ["c"])
+    wf = engine.create(
+        goal, [StepContract("step_1", "寫入", "act", "檔案已建立且內容正確", ["write_file", "read_file"])]
+    )
+    engine.add_evidence(wf, EE("step_1", "write_file", "ok", "File written.", {}))
+    engine.add_evidence(
+        wf, EE("step_1", "read_file", "ok", "嗨嗨～這裡是月月見", {"text": "嗨嗨～這裡是月月見"})
+    )
+    decision = engine.verify(wf)
+    assert wf.steps[0].status == StepStatus.VERIFIED, "a successful write is its own evidence"
+    assert decision.goal_satisfied, "content is bound and no mutation is pending"
+
+
+def test_ui_action_still_requires_a_fresh_look_at_the_screen():
+    # The relaxation above must NOT extend to clicks - a click can "succeed" while the interface
+    # does something else entirely, which is the whole reason UI actions are verified visually.
+    from yueyue_v3.models import ExecutionEvidence as EE
+    from yueyue_v3.models import StepStatus
+    from yueyue_v3.workflow import WorkflowEngine
+
+    engine = WorkflowEngine()
+    goal = GoalContract("按下播放", [RequestedOutput("state", "畫面狀態", True, "screen_state", [])], ["c"])
+    wf = engine.create(goal, [StepContract("step_1", "點擊", "act", "播放器開始播放", ["click_ui_element"])])
+    engine.add_evidence(wf, EE("step_1", "click_ui_element", "ok", "Clicked.", {}))
+    engine.verify(wf)
+    assert wf.steps[0].status != StepStatus.VERIFIED
+
+
+def test_full_script_conversion_catches_everyday_simplified():
+    # The in-repo table is a ~428-char tripwire and missed 两/乱/吗 - a mixed-script reply reached
+    # the owner intact (2026-07-22). Growing that list by hand is the whack-a-mole this project
+    # keeps rejecting, so the full standard mapping is used when available.
+    from yueyue_v3.context import to_traditional_script
+
+    assert to_traditional_script("那两件") == "那兩件"
+    assert to_traditional_script("不敢乱動") == "不敢亂動"
+    assert to_traditional_script("要加進來吗") == "要加進來嗎"
+    # zh-hant converts the SCRIPT only - the owner's own vocabulary must survive untouched
+    assert to_traditional_script("屏幕上的信息") == "屏幕上的信息"
+    assert to_traditional_script("軟件和網絡") == "軟件和網絡"
+
+
+def test_cantonese_gate_catches_the_particles_that_leaked():
+    from voice_contract import voice_register_violation
+
+    for leaked in ("後來主人沒說可以動手喎", "月月有啲嬲", "唔好喐"):
+        assert voice_register_violation(leaked, allow_simplified=False), leaked
+    # written Traditional the owner actually uses must stay clean
+    for fine in ("後來主人沒說可以動手", "月月有點生氣", "屏幕上的信息"):
+        assert not voice_register_violation(fine, allow_simplified=False), fine
+
+
+def test_chat_contract_never_teaches_her_to_deny_her_abilities():
+    # Live 2026-07-22: right after creating two files she told the owner 「月月這邊沒有建檔案的
+    # 功能」. The chat contract limits THIS message, not her skills - it must say so.
+    import tempfile
+
+    from yueyue_v3.context import ContextCompiler, ShortContextStore, TurnMode
+
+    root = tempfile.mkdtemp()
+    compiler = ContextCompiler(root, ShortContextStore(root + "/ctx.json"))
+    contract = compiler.system_prompt(TurnMode.CHAT)
+    assert "沒有這個功能" in contract and "本來就會做這些事" in contract

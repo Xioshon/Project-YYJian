@@ -278,9 +278,17 @@ class WorkflowEngine:
                 item for item in successful[last_action + 1 :] if item.source in OBSERVATION_SOURCES
             ]
             observed_after = bool(post_action_observations)
-            # A successful file/command mutation with no follow-up observation IS a completed act
-            # (its own result is the evidence). Only UI actions need a fresh look at the screen.
-            if not observed_after and successful[last_action].source not in UI_ACTION_SOURCES:
+            # A successful file/command mutation IS a completed act - its own result is the
+            # evidence. Only UI actions need a fresh look at the screen, because a click can
+            # "succeed" while the interface does something else entirely.
+            #
+            # This deliberately does NOT depend on whether an observation followed. It used to
+            # (`not observed_after and ...`), which meant reading the file back made the step
+            # HARDER to verify than not looking at all: with an observation present the step fell
+            # through to fuzzy-matching the plan's descriptive done_condition ("檔案已建立且內容
+            # 正確") against the file's actual text, which never matches, so the workflow spun and
+            # blocked on a file that had been written correctly (live 2026-07-22).
+            if successful[last_action].source not in UI_ACTION_SOURCES:
                 return True, "The action completed successfully."
             if self.require_semantic_actions and observed_after and successful[last_action].source in UI_ACTION_SOURCES:
                 semantic = next(

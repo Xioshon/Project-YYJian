@@ -216,3 +216,30 @@ def test_blocked_workflow_is_terminal_everywhere(tmp_path):
         reply = rt._process_turn(TurnEnvelope("owner", "幫我建立另一個檔案 test2.txt", TurnMode.TASK))
     assert rt.state.task_queue == []
     assert reply
+
+
+def test_idle_note_carries_the_last_finished_task(tmp_path):
+    # Task turns are never written to short-term chat context, so 「剛剛那個做完了嗎」 had nothing
+    # to answer from and she said 「月月不記得剛剛有什麼任務」 about work just completed.
+    import copy
+
+    from yueyue_v3.models import GoalContract, RequestedOutput, StepContract, WorkflowStatus
+    from yueyue_v3.providers import ProviderResponse, ScriptedProvider
+    from yueyue_v3.runtime import YueYueRuntimeV3
+
+    (tmp_path / "workspace" / "brain").mkdir(parents=True)
+    (tmp_path / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
+    (tmp_path / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
+    rt = YueYueRuntimeV3(tmp_path, ScriptedProvider([ProviderResponse("好", "", [])]), state_dir=tmp_path / "v3")
+
+    goal = GoalContract("在下載路徑建 SpeedTest.txt", [RequestedOutput("c", "d", True, "text", [])], ["c"])
+    wf = rt.workflow_engine.create(goal, [StepContract("s1", "s", "act", "d", ["write_file"])])
+    wf.status = WorkflowStatus.COMPLETED
+    with rt.events.writer_scope():
+        state = copy.deepcopy(rt.state)
+        state.workflow = wf
+        rt._replace_state(state, "test.seed", "t0")
+
+    note = rt._pending_task_note()
+    assert "沒有任何任務" in note
+    assert "SpeedTest.txt" in note and "剛剛才做完" in note and "不要說不記得" in note

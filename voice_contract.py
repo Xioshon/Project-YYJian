@@ -46,7 +46,9 @@ VOICE_REGISTER_EN = (
 # Every char here is essentially zero-usage in written Mandarin. Deliberately excludes chars
 # that look Cantonese but have legitimate written uses: 喇(喇叭), 掂(掂量), 郁(濃郁), 咁/幾/邊/
 # 點/呢 (Mandarin particles or common chars) - those ambiguous ones are handled by bigrams below.
-_CANTONESE_ONLY_CHARS = "嘅喺㗎咗嘢咩嗰嚟俾冇睇諗餸嗌攞噉佢乜撳畀嘥攰冚嚡唔"
+# 2026-07-22: 喎嚿嬲喐 were simply missing from the category - all are zero-usage in written
+# Mandarin like the rest. 「後來主人沒說可以動手喎」 reached the owner.
+_CANTONESE_ONLY_CHARS = "嘅喺㗎咗嘢咩嗰嚟俾冇睇諗餸嗌攞噉佢乜撳畀嘥攰冚嚡唔喎嚿嬲喐"
 
 # Cantonese phrases whose individual characters are ambiguous (呢 is a Mandarin sentence
 # particle, 幾/邊/點/咁 are common Mandarin chars) but whose bigram is unambiguously spoken

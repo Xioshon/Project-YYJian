@@ -43,7 +43,10 @@ def test_chat_context_requires_capability_honesty_and_concise_defaults(runtime_r
     # overloaded the model); the intent - concise default + no faked-capability promises - is
     # preserved, so assert the current phrasing carries it.
     assert "預設一句話就夠" in prompt
-    assert "做不到的承諾" in prompt
+    # Reworded 2026-07-22: the old "聊天時不會真的動用工具" got over-generalised into 「月月這邊
+    # 沒有建檔案的功能」. The rule now scopes the limit to THIS message and affirms her abilities.
+    assert "當下做不到的話" in prompt
+    assert "本來就會做這些事" in prompt
 
 
 def test_owner_simplified_script_is_detected_and_mirrored_deterministically() -> None:
@@ -151,7 +154,7 @@ def test_pending_task_note_states_the_truth(tmp_path):
     # Nothing pending is itself a FACT and must be stated - injecting nothing let the model fill
     # the gap from stale context and claim finished work was 「還沒動手」 (live 2026-07-22).
     idle = rt._pending_task_note()
-    assert "沒有任何任務" in idle and "排隊" in idle
+    assert "沒有任何任務" in idle and "排隊" in idle and "別憑印象" in idle
 
     import copy
     goal = GoalContract("建立 Hello.txt", [RequestedOutput("c", "d", True, "text", [])], ["c"])

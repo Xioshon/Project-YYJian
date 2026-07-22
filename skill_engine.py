@@ -402,8 +402,13 @@ def _list_tasks(args: dict, ctx: SkillContext) -> SkillResult:
     open_todos = [t for t in TODOS.all() if not t.get("done")]
     if open_todos:
         parts.append(f"未完成待辦 {len(open_todos)} 條")
+    done = str(snapshot.get("last_completed") or "").strip()
     if not parts:
+        if done:
+            return SkillResult(f"沒有進行中或排隊的任務。最近剛做完的是：「{done[:100]}」，已完成")
         return SkillResult("目前沒有進行中或排隊的任務，也沒有待提醒")
+    if done:
+        parts.append(f"（最近剛做完：「{done[:100]}」）")
     return SkillResult("；".join(parts))
 
 
@@ -515,8 +520,9 @@ SKILLS: list[Skill] = [
           "主人問現在幾點/今天幾號星期幾/現在是早上還是晚上等任何跟當下時間有關的問題。",
           _p({}), _current_time),
     Skill("list_tasks",
-          "主人想總覽現在所有待處理的事：進行中/排隊的任務、待提醒/鬧鐘/計時、未完成待辦。"
-          "「現在有什麼任務/待辦/事情要做/安排/提醒」這類總覽問題都用這個。",
+          "主人問起任務狀態時用這個：進行中/排隊的任務、待提醒/鬧鐘/計時、未完成待辦，"
+          "以及最近剛做完的那件事。「現在有什麼任務/待辦/安排/提醒」「剛剛那個做完了嗎」"
+          "「你剛才做了什麼」這類都算——你自己記不住剛做完的任務，一定要查過再答。",
           _p({}), _list_tasks),
     Skill("web_search",
           "查網上的即時/事實資訊：新聞、價格、賽果、天氣以外的任何「現在/最新」問題，"

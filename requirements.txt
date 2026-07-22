@@ -10,3 +10,5 @@ pywin32>=306
 pywinauto>=0.6.9,<1
 requests>=2.32,<3
 yt-dlp>=2025.1
+# Full Simplified->Traditional script mapping (zh-hant: script only, no Taiwan vocabulary).
+zhconv>=1.4,<2
