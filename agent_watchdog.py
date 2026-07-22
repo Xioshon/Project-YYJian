@@ -164,10 +164,11 @@ class GatewayWatchdog:
                 age_seconds=age,
                 dump_path=str(dump_path or ""),
             )
-            self._alert_owner(
-                f"喵，我有一則訊息處理卡住超過 {age // 60} 分鐘了，還在嘗試。"
-                f"如果一直沒動靜，我會自己重啟恢復。（診斷已存檔）"
-            )
+            # In HER voice, and about HIS request - not a runtime incident report. Live 2026-07-22
+            # the owner got 「我有一則訊息處理卡住超過 3 分鐘了…（診斷已存檔）」 mid-task, which reads
+            # like a crash log wearing a cat emoji. The diagnostics still go to the trace above;
+            # the owner only needs to know she is still on it.
+            self._alert_owner("這個比想像中久一點，月月還在弄，你先忙別的～")
 
         if stuck_exit:
             turn = stuck_exit[0]

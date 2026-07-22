@@ -13,7 +13,12 @@ from typing import Any
 from agent_protocol import classify_approval, extract_primary_message
 from core_tools import AgentTool, ToolResult, env_value
 from skill_engine import SkillContext, execute_skill, skill_tools
-from voice_contract import VOICE_REGISTER_EN, owner_text_is_simplified, voice_register_violation
+from voice_contract import (
+    VOICE_REGISTER_EN,
+    owner_text_is_simplified,
+    repair_taiwan_particles,
+    voice_register_violation,
+)
 
 from .context import (
     ContextCompiler,
@@ -382,16 +387,21 @@ class YueYueRuntimeV3:
         pending_note = self._pending_task_note()
         if pending_note:
             messages.append({"role": "system", "content": pending_note})
+        # A reply is GROUNDED when it reports something real the owner asked for: a skill result,
+        # or the deterministic pending-task note. Those answers get the roomier gate.
+        grounded = False
         try:
             response = self.provider.chat(messages, tools, model=_chat_voice_model())
             if tools and getattr(response, "tool_calls", None):
                 reply = self._run_chat_skills(turn, messages, response)
+                grounded = True
             else:
                 reply = _clean_reply(response.content) or "我在呢，主人。"
+                grounded = bool(pending_note)
         except Exception:
             reply = "我這邊剛剛斷了一下，不過還在。你再說一次就好。"
         if turn.mode in {TurnMode.CHAT, TurnMode.SOCIAL}:
-            reply = self._apply_social_chat_reply_policy(turn.text, reply)
+            reply = self._apply_social_chat_reply_policy(turn.text, reply, grounded=grounded)
             reply = _drop_trailing_full_stop(reply)
             reply = self._deduplicate_emoji_against_recent(turn.chat_id, reply)
             if owner_script_is_simplified_with_history(turn.text, self.context.short_context, turn.chat_id):
@@ -562,26 +572,29 @@ class YueYueRuntimeV3:
         reply = re.sub(r"[ \t]{2,}", " ", reply).strip()
         return reply
 
-    def _apply_social_chat_reply_policy(self, owner_text: str, reply: str) -> str:
+    def _apply_social_chat_reply_policy(
+        self, owner_text: str, reply: str, grounded: bool = False
+    ) -> str:
         # Simplified leaks are mechanically repairable - fix them BEFORE gating instead of
         # burning a regeneration (and possibly the canned fallback) on them. If the owner is
         # typing Simplified, the mirroring step after this converts the reply back anyway.
         reply = to_traditional_script(reply)
-        if not _chat_reply_violates_social_policy(reply, owner_text):
+        reply = repair_taiwan_particles(reply)
+        if not _chat_reply_violates_social_policy(reply, owner_text, grounded):
             return reply
         # Most violations are a pure length overrun (the model's own reaction was on-topic, just a
         # line or two too long) rather than banned/leaked content. Prefer trimming the model's real
         # answer over discarding it for a generic canned line the owner did not actually ask about -
         # canned fallback text is a last resort, not the default outcome of going one line over.
-        for max_lines in (2, 1):
+        for max_lines in ((3, 2) if grounded else (2, 1)):
             truncated = _truncate_chat_reply(reply, max_lines)
-            if truncated and not _chat_reply_violates_social_policy(truncated, owner_text):
+            if truncated and not _chat_reply_violates_social_policy(truncated, owner_text, grounded):
                 return truncated
         # Truncation alone didn't fix it (e.g. the violation is banned/leaked wording, not just
         # length) - ask the model to rewrite its own reply within the constraint instead of
         # silently replacing its real answer with a scripted line.
         regenerated = self._regenerate_compliant_chat_reply(owner_text, reply)
-        if regenerated and not _chat_reply_violates_social_policy(regenerated, owner_text):
+        if regenerated and not _chat_reply_violates_social_policy(regenerated, owner_text, grounded):
             return regenerated
         # Trace the surrender so live fallbacks are diagnosable (what did the model try to say?).
         self._emit(
@@ -1882,7 +1895,14 @@ def _estimated_telegram_bubbles(text: str) -> list[str]:
     return parts
 
 
-def _chat_reply_violates_social_policy(reply: str, owner_text: str = "") -> bool:
+def _chat_reply_violates_social_policy(
+    reply: str, owner_text: str = "", grounded: bool = False
+) -> bool:
+    """grounded=True means this reply is REPORTING a real skill/runtime result the owner directly
+    asked for (task list, reminders, search hit). Those answers are allowed to be a line longer and
+    to use capability words, because the leak rules exist to stop UNPROMPTED meta chatter - not to
+    censor an answer the owner requested. Live 2026-07-22: 「現在有什麼任務」 got its honest answer
+    guillotined mid-list one time and replaced by a canned line the next."""
     value = str(reply or "")
     lowered = value.casefold()
     owner_lowered = str(owner_text or "").casefold()
@@ -1893,9 +1913,9 @@ def _chat_reply_violates_social_policy(reply: str, owner_text: str = "") -> bool
     # for a genuinely heavier moment. This used to be a loose safety net (>4), which let most
     # casual messages drift back to 3-4 line monologues whenever the wording didn't happen to
     # match one of the specific _is_simple_social_prompt trigger phrases below.
-    if len(lines) > 2:
+    if len(lines) > (3 if grounded else 2):
         return True
-    if _is_simple_social_prompt(owner_text) and (len(lines) > 2 or len(value) > 100):
+    if _is_simple_social_prompt(owner_text) and not grounded and (len(lines) > 2 or len(value) > 100):
         return True
     if _is_test_context_note(owner_text) and (
         len(lines) > 2
@@ -1903,9 +1923,9 @@ def _chat_reply_violates_social_policy(reply: str, owner_text: str = "") -> bool
         or any(marker.casefold() in lowered for marker in TEST_CONTEXT_REPLY_MARKERS)
     ):
         return True
-    if any(len(line) > 64 for line in lines):
+    if any(len(line) > (110 if grounded else 64) for line in lines):
         return True
-    if len(value) > 180:
+    if len(value) > (400 if grounded else 180):
         return True
     # Capability questions (你會做什麼/能幫我什麼) legitimately need ability words like 提醒/任務 -
     # live 2026-07-20 the honest answer got rejected as meta-leak and the owner saw the fallback.
@@ -1916,7 +1936,7 @@ def _chat_reply_violates_social_policy(reply: str, owner_text: str = "") -> bool
             "能玩", "會幫", "会帮", "有什麼技能", "有什么技能", "有什麼功能", "有什么功能",
         )
     )
-    if not asking_abilities:
+    if not asking_abilities and not grounded:
         for marker in CHAT_META_LEAKAGE_MARKERS:
             marker_value = marker.casefold()
             if marker_value in lowered and marker_value not in owner_lowered:

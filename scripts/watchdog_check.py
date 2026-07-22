@@ -78,7 +78,10 @@ def check_turn_warn_fires_once(tmp_dir: str) -> None:
     watchdog.beat("tg_get_updates")
     incidents = watchdog.check_once()
     assert incidents == ["turn_stuck_warn"], incidents
-    assert len(alerts) == 1 and "卡住" in alerts[0]
+    # Owner 2026-07-22: the stall alert must be IN VOICE, not a crash log. Forensics still go to
+    # the trace/dump; the owner only needs to hear that she is still working on his request.
+    assert len(alerts) == 1 and "月月" in alerts[0]
+    assert not any(word in alerts[0] for word in ("診斷", "重啟", "訊息處理")), alerts[0]
     watchdog.beat("tg_get_updates")
     assert watchdog.check_once() == [], "warn must not repeat for the same turn"
     watchdog.end_turn(token)

@@ -403,3 +403,50 @@ def test_report_result_value_binds_without_internal_wording():
     engine.verify(wf)
     assert wf.outputs.get("final_content") == "Hello World!"
     assert "Recorded" not in str(wf.outputs.get("final_content"))
+
+
+def test_grounded_task_answer_survives_the_social_gate():
+    # Live 2026-07-22: 「現在有什麼任務」 got its honest answer guillotined to just 「有兩個任務喔：」
+    # one turn, then replaced by the 「走神」 canned line the next. A reply REPORTING a real
+    # runtime fact the owner directly asked for must survive intact.
+    from yueyue_v3.runtime import _chat_reply_violates_social_policy
+
+    listing = (
+        "有兩件\n"
+        "一件在等你說可以：建 Hello.txt\n"
+        "還有一件排著：建 月月見自我介紹.txt"
+    )
+    assert _chat_reply_violates_social_policy(listing, "現在有什麼任務") is True
+    assert _chat_reply_violates_social_policy(listing, "現在有什麼任務", grounded=True) is False
+    # ungrounded smalltalk keeps the tight ceiling - grounding is not a blanket bypass
+    rambling = "今天天氣真好呀\n月月剛剛在曬太陽\n主人要不要一起\n然後再去散步"
+    assert _chat_reply_violates_social_policy(rambling, "在幹嘛", grounded=True) is True
+
+
+def test_taiwan_particle_is_repaired_not_rejected():
+    # The particle is a mechanical slip, not a wrong answer - repairing it beats burning a
+    # regeneration and landing on the canned fallback (which is what the owner actually saw).
+    from voice_contract import repair_taiwan_particles, voice_register_violation
+
+    assert voice_register_violation("目前沒有正在進行的任務喔", allow_simplified=False)
+    repaired = repair_taiwan_particles("目前沒有正在進行的任務喔")
+    assert repaired == "目前沒有正在進行的任務"
+    assert not voice_register_violation(repaired, allow_simplified=False)
+    assert repair_taiwan_particles("是耶，月月也這麼覺得") == "是誒，月月也這麼覺得"
+    # mid-word occurrences must survive untouched
+    assert repair_taiwan_particles("聖誕跟耶誕是同一個") == "聖誕跟耶誕是同一個"
+
+
+def test_watchdog_stall_alert_is_in_voice_not_a_crash_log():
+    import inspect
+
+    import agent_watchdog
+
+    # Only CODE lines matter - comments explaining the old wording are documentation, not output.
+    code = "\n".join(
+        line
+        for line in inspect.getsource(agent_watchdog).splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    for leak in ("診斷已存檔", "訊息處理卡住", "自己重啟恢復"):
+        assert leak not in code, f"raw diagnostic wording still owner-facing: {leak}"

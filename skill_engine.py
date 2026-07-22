@@ -384,7 +384,15 @@ def _list_tasks(args: dict, ctx: SkillContext) -> SkillResult:
             snapshot = {}
     active = snapshot.get("active")
     if active:
-        parts.append(f"正在做：「{active['objective'][:80]}」（{active['status']}）")
+        # Human-readable status: the raw enum (awaiting_permission/running) forced the model to
+        # invent its own phrasing, which is how 「點頭」 kept resurfacing after the owner disliked it.
+        status = {
+            "awaiting_permission": "在等你說可以",
+            "running": "正在做",
+            "planning": "還在想步驟",
+            "blocked": "卡住了",
+        }.get(str(active["status"]), str(active["status"]))
+        parts.append(f"「{active['objective'][:80]}」（{status}）")
     queued = snapshot.get("queued") or []
     if queued:
         parts.append("排隊中：" + "；".join(f"「{q[:50]}」" for q in queued[:5]))

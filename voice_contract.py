@@ -129,6 +129,23 @@ def voice_register_violation(text: str, allow_simplified: bool = False) -> str:
     return ""
 
 
+def repair_taiwan_particles(text: str) -> str:
+    """Deterministic Taiwan-final-particle repair for output-side use, BEFORE gating.
+
+    Same philosophy as repair_simplified_script: a stray 喔/喲/耶 in final position is a purely
+    mechanical register slip, not a wrong ANSWER. Rejecting it burned a regeneration and (live
+    2026-07-22) dumped the owner into the 「走神」 canned line when he had simply asked what tasks
+    were pending - the honest reply was correct and only the particle was off-register. Uses the
+    SAME regex the gate uses, so there is no second list to keep in sync: 喔/喲 just drop (the
+    sentence reads identically without them), 耶 becomes 誒 which is in-register.
+    """
+    value = str(text or "")
+    if not value:
+        return value
+    value = _TAIWAN_FINAL_PARTICLE_RE.sub(lambda m: "誒" if m.group(0) == "耶" else "", value)
+    return re.sub(r"[ 	]{2,}", " ", value)
+
+
 def repair_simplified_script(text: str) -> str:
     """Deterministic Simplified→Traditional repair for output-side use, BEFORE gating.
 
