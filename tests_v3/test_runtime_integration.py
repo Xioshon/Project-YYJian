@@ -94,7 +94,10 @@ def test_permission_reply_resumes_original_workflow_until_goal_is_verified(runti
     runtime.tools = FakeTools()
 
     first = runtime.chat("幫我查看五小時剩餘用量", response_policy=type("Policy", (), {"route": "tool_task"})())
-    assert "點頭" in first["content"]
+    # The model's own permission wording reaches the owner - but 「點頭」 is rewritten on the way
+    # out (owner flagged it twice; see voice_contract.repair_nod_idiom).
+    assert "說可以" in first["content"]
+    assert "點頭" not in first["content"]
     assert runtime.tools.calls == ["get_screen_ui"]
 
     final = runtime.chat("嗯，繼續吧")

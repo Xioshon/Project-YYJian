@@ -739,9 +739,17 @@ def real_analyze_media(file_path: str, prompt: str = "Describe this image.") -> 
 
 
 def real_read_file(filename: str) -> ToolResult:
+    """Read a text file. Mirrors real_write_file's reach: an ABSOLUTE path outside the workspace
+    is readable, because refusing it left the agent unable to confirm a file it had just been
+    approved to write (live 2026-07-22: write to Downloads succeeded, then the plan's read-back
+    step failed twice with "can only read files inside workspace" before giving up). Reading is
+    strictly less dangerous than the write that was already permitted; protected system paths stay
+    off-limits either way."""
     filepath = resolve_path(filename)
-    if not is_workspace_path(filepath):
+    if not is_workspace_path(filepath) and not os.path.isabs(filename):
         return _error("read_file can only read files inside workspace.")
+    if is_protected_system_path(filepath):
+        return _error("That path is a protected system location; I will not read it.")
     if not os.path.exists(filepath):
         return _error(f"File not found: {filepath}")
     try:

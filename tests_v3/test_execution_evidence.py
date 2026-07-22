@@ -272,39 +272,68 @@ def test_desktop_act_step_keeps_screenshot_verification():
     assert "capture_screen" in planned.steps[0].allowed_tools
 
 
-def test_multi_task_split_enqueues_independent_tasks(tmp_path, monkeypatch):
+def test_planner_returns_deferred_objectives_for_a_multi_task_message(tmp_path, monkeypatch):
+    # Splitting is FOLDED INTO PLANNING (2026-07-22): a separate splitter model call cost ~15s on
+    # every task turn. The planner already reads the whole message, so it reports the leftovers.
     monkeypatch.setenv("YUEYUE_TASK_SPLIT", "1")
     from yueyue_v3.models import TurnEnvelope, TurnMode
+    from yueyue_v3.planning import PlannedWorkflow
     from yueyue_v3.providers import ProviderResponse, ScriptedProvider
     from yueyue_v3.runtime import YueYueRuntimeV3
 
     (tmp_path / "workspace" / "brain").mkdir(parents=True)
     (tmp_path / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
     (tmp_path / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
-    provider = ScriptedProvider([ProviderResponse('["建立 Hello.txt", "建立自我介紹.txt"]', "", [])])
-    rt = YueYueRuntimeV3(tmp_path, provider, state_dir=tmp_path / "v3")
+    rt = YueYueRuntimeV3(tmp_path, ScriptedProvider([ProviderResponse("好", "", [])]), state_dir=tmp_path / "v3")
 
     turn = TurnEnvelope("owner", "幫我建 Hello.txt，再建自我介紹.txt", TurnMode.TASK)
-    first = rt._maybe_split_tasks(turn)
-    assert first == "建立 Hello.txt"
+    planned = PlannedWorkflow(GoalContract("建立 Hello.txt", [], []), [], ["建立自我介紹.txt"])
+    with rt.events.writer_scope():
+        rt._enqueue_deferred_objectives(turn, planned)
+    assert rt.state.task_queue == ["建立自我介紹.txt"]
+
+    # a single task reports no siblings -> nothing queued
+    with rt.events.writer_scope():
+        rt._enqueue_deferred_objectives(turn, PlannedWorkflow(GoalContract("x", [], []), [], []))
     assert rt.state.task_queue == ["建立自我介紹.txt"]
 
 
-def test_single_task_is_not_split(tmp_path, monkeypatch):
-    monkeypatch.setenv("YUEYUE_TASK_SPLIT", "1")
-    from yueyue_v3.models import TurnEnvelope, TurnMode
-    from yueyue_v3.providers import ProviderResponse, ScriptedProvider
-    from yueyue_v3.runtime import YueYueRuntimeV3
+def test_planner_narrows_the_goal_when_it_defers_siblings():
+    # The plan covers only the first task, so the goal text must too - otherwise verification
+    # would demand evidence for siblings that were queued for later.
+    from yueyue_v3.planning import GoalPlannerV3
 
-    (tmp_path / "workspace" / "brain").mkdir(parents=True)
-    (tmp_path / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
-    (tmp_path / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
-    # sequential steps of ONE task -> model returns single-element array -> no split
-    provider = ScriptedProvider([ProviderResponse('["建立檔案並寫入 step1 再追加 step2"]', "", [])])
-    rt = YueYueRuntimeV3(tmp_path, provider, state_dir=tmp_path / "v3")
-    turn = TurnEnvelope("owner", "建立檔案寫入 step1，然後追加 step2", TurnMode.TASK)
-    assert rt._maybe_split_tasks(turn) == turn.text
-    assert rt.state.task_queue == []
+    planner = GoalPlannerV3(object(), lambda: ["write_file", "read_file"])
+    raw = {
+        "objective": "建立 Hello.txt",
+        "requested_outputs": [{"name": "content", "description": "檔案內容", "evidence_kind": "text"}],
+        "success_criteria": ["檔案存在"],
+        "steps": [
+            {
+                "name": "write",
+                "kind": "act",
+                "done_condition": "written",
+                "allowed_tools": ["write_file", "read_file"],
+            },
+            {
+                "name": "confirm",
+                "kind": "observe",
+                "done_condition": "read back",
+                "allowed_tools": ["read_file"],
+                "required_sources": ["read_file"],
+            },
+        ],
+        "deferred_objectives": ["建立自我介紹.txt"],
+    }
+    plan = planner._parse(raw, "幫我建 Hello.txt，再建自我介紹.txt", ["write_file", "read_file"])
+    assert plan is not None
+    assert plan.deferred_objectives == ["建立自我介紹.txt"]
+    assert plan.goal.objective == "建立 Hello.txt"
+
+    # no siblings -> the owner's VERBATIM wording is kept (a model rewrite would drift the goal)
+    raw_single = {**raw, "deferred_objectives": []}
+    single = planner._parse(raw_single, "幫我建 Hello.txt", ["write_file", "read_file"])
+    assert single is not None and single.goal.objective == "幫我建 Hello.txt"
 
 
 def test_command_act_step_verifies_on_success():
@@ -450,3 +479,74 @@ def test_watchdog_stall_alert_is_in_voice_not_a_crash_log():
     )
     for leak in ("診斷已存檔", "訊息處理卡住", "自己重啟恢復"):
         assert leak not in code, f"raw diagnostic wording still owner-facing: {leak}"
+
+
+def test_written_file_is_read_back_without_a_model_round_trip(tmp_path):
+    # 2026-07-22 timing: a permission-gated write to Downloads cost ~41s AFTER approval, almost
+    # all of it a task-model round-trip deciding to call read_file. Which bytes are on disk is a
+    # filesystem question - reading it here yields the same evidence and satisfies the act step's
+    # post-action observation, so the goal completes with no further model call.
+    from yueyue_v3.models import GoalContract, RequestedOutput, StepContract
+    from yueyue_v3.runtime import _readback_written_file
+    from yueyue_v3.tools import V3ToolResult
+    from yueyue_v3.workflow import WorkflowEngine
+
+    target = tmp_path / "Hello.txt"
+    target.write_text("Hello World!", encoding="utf-8")
+    engine = WorkflowEngine()
+    goal = GoalContract("建立 Hello.txt", [RequestedOutput("content", "最終內容", True, "text", [])], ["c"])
+    wf = engine.create(
+        goal,
+        [
+            StepContract("step_1", "寫入", "act", "written", ["write_file"]),
+            StepContract("step_2", "確認", "observe", "read", ["read_file"], required_sources=["read_file"]),
+        ],
+    )
+    ok = V3ToolResult("ok", "File written.")
+    evidence = _readback_written_file(wf, "write_file", {"filename": str(target)}, ok)
+    assert evidence is not None
+    # must land on the ACT step - that is the step awaiting a post-action observation
+    assert evidence.step_id == "step_1"
+    assert evidence.source == "read_file"
+    assert evidence.facts.get("text") == "Hello World!"
+
+    # a failed write, a non-write tool, and a vanished file all decline to fabricate evidence
+    assert _readback_written_file(wf, "write_file", {"filename": str(target)}, V3ToolResult("error", "no")) is None
+    assert _readback_written_file(wf, "execute_command", {"filename": str(target)}, ok) is None
+    assert _readback_written_file(wf, "write_file", {"filename": str(tmp_path / "ghost.txt")}, ok) is None
+
+
+def test_read_file_reaches_absolute_paths_it_was_allowed_to_write(tmp_path):
+    # Asymmetry found 2026-07-22: write_file could create C:\Users\...\Downloads\Hello.txt but
+    # read_file refused to read it back ("can only read files inside workspace"), so the plan's
+    # confirm step failed twice and the task blocked on a file that existed.
+    from core_tools import real_read_file
+
+    target = tmp_path / "outside.txt"
+    target.write_text("hi", encoding="utf-8")
+    result = real_read_file(str(target))
+    assert result.status == "ok", result.summary
+    assert "hi" in str(result.data)
+
+
+def test_nod_idiom_is_rewritten_to_the_owners_phrasing():
+    # The owner flagged 「點頭」 twice. It is natural Chinese, so prompt instructions never held -
+    # and naming it inside a "don't say X" line made models emit it MORE (that line was the
+    # pending-task note's own wording). Rewrite the finished sentence instead.
+    from voice_contract import repair_nod_idiom
+
+    assert repair_nod_idiom("一件在等你點頭：建 Hello.txt") == "一件等你說可以：建 Hello.txt"
+    assert repair_nod_idiom("兩件都在等著你點頭～") == "兩件都等你說可以～"
+    assert repair_nod_idiom("這一步需要你點頭") == "這一步需要你說可以"
+    unchanged = "月月剛剛在曬太陽"
+    assert repair_nod_idiom(unchanged) == unchanged
+
+
+def test_pending_task_note_never_teaches_the_disliked_idiom(tmp_path):
+    import inspect
+
+    import yueyue_v3.runtime as runtime
+
+    source = inspect.getsource(runtime.YueYueRuntimeV3._pending_task_note)
+    code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+    assert "點頭" not in code, "a negation naming the idiom is what kept reintroducing it"

@@ -148,7 +148,10 @@ def test_pending_task_note_states_the_truth(tmp_path):
     (tmp_path / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
     (tmp_path / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
     rt = YueYueRuntimeV3(tmp_path, ScriptedProvider([ProviderResponse("好", "", [])]), state_dir=tmp_path / "v3")
-    assert rt._pending_task_note() == ""  # nothing pending -> no note
+    # Nothing pending is itself a FACT and must be stated - injecting nothing let the model fill
+    # the gap from stale context and claim finished work was 「還沒動手」 (live 2026-07-22).
+    idle = rt._pending_task_note()
+    assert "沒有任何任務" in idle and "排隊" in idle
 
     import copy
     goal = GoalContract("建立 Hello.txt", [RequestedOutput("c", "d", True, "text", [])], ["c"])

@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 from agent_protocol import STICKER_MARKER_LABEL
-from telegram_input import repair_mojibake
 from sticker_assets import (
-    load_recent_stickers,
     find_sticker_asset,
-    prune_invalid_recent_stickers,
+    load_recent_stickers,
     pick_sticker,
+    prune_invalid_recent_stickers,
 )
+from telegram_input import repair_mojibake
 
 
 def is_sticker_resend(owner_prompt: str, compiled_prompt: str = "") -> bool:

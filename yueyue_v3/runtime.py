@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import re
 import time
 from collections.abc import Callable
@@ -16,6 +17,7 @@ from skill_engine import SkillContext, execute_skill, skill_tools
 from voice_contract import (
     VOICE_REGISTER_EN,
     owner_text_is_simplified,
+    repair_nod_idiom,
     repair_taiwan_particles,
     voice_register_violation,
 )
@@ -51,7 +53,7 @@ from .planning import GoalPlannerV3
 from .providers import ProviderFailure
 from .storage import AtomicJsonStore, JsonlEventStore
 from .tools import ToolCatalogV3
-from .workflow import OBSERVATION_SOURCES, WorkflowEngine
+from .workflow import ACTION_SOURCES, OBSERVATION_SOURCES, WorkflowEngine
 
 # Common emoji blocks (emoticons, symbols/pictographs, transport, supplemental, extended,
 # dingbats, misc symbols). Used to keep a single emoji from becoming a per-line tic.
@@ -269,57 +271,25 @@ class YueYueRuntimeV3:
                 "好，這件先記下了，手上這個做完就接著弄～",
             )
 
-        # One message may pack several INDEPENDENT tasks ("建A檔案，再建B檔案") - split them so
-        # each gets its own goal contract; the first runs now, the rest queue and auto-drain.
-        # A single task's sequential steps ("建檔再寫入") is NOT split. Opt-in YUEYUE_TASK_SPLIT=1.
-        objective = self._maybe_split_tasks(turn)
-        if objective != turn.text:
-            turn = TurnEnvelope(turn.chat_id, objective, TurnMode.TASK, turn.message_id)
         return self._start_task(turn, tool_callback)
 
-    def _maybe_split_tasks(self, turn: TurnEnvelope) -> str:
-        """Return the FIRST objective to run now; enqueue any additional independent tasks. Returns
-        turn.text unchanged for a single task. A cheap conjunction prefilter gates the model call."""
+    def _enqueue_deferred_objectives(self, turn: TurnEnvelope, planned: Any) -> None:
+        """Queue the INDEPENDENT sibling tasks the planner found in the same message.
+
+        Folded into planning 2026-07-22: this used to be a separate model call before every task
+        turn (~15s each, paid whether or not the message held one task), and widening its
+        conjunction prefilter made it fire on almost every sentence. The planner already reads the
+        whole message to build the goal, so asking it for the leftovers costs nothing. Opt-in via
+        YUEYUE_TASK_SPLIT=1; the queue drains one task at a time."""
         if env_value("YUEYUE_TASK_SPLIT") != "1":
-            return turn.text
-        text = turn.text
-        # Cheap conjunction prefilter - only a plausibly-multi message pays for the split call.
-        # Loose is fine: the model does the real judgment and returns a single element for one task.
-        if not any(m in text for m in ("然後", "然后", "再", "還有", "还有", "順便", "顺便",
-                                       "接著", "接着", "以及", "；", ";", "另外", "同時", "同时",
-                                       "和", "、", "，", ",", "及", "並", "并", "也")):
-            return turn.text
-        parts = self._split_objectives(text)
-        if len(parts) <= 1:
-            return turn.text
+            return
+        extra = [str(item).strip()[:500] for item in getattr(planned, "deferred_objectives", []) if str(item).strip()]
+        if not extra:
+            return
         state = copy.deepcopy(self.state)
-        state.task_queue = [*state.task_queue, *(p[:500] for p in parts[1:])]
+        state.task_queue = [*state.task_queue, *extra]
         self._replace_state(state, "task_queue.split", turn.turn_id)
-        self._emit("task.split", turn.turn_id, {"count": len(parts), "parts": parts[:6]})
-        return parts[0]
-
-    def _split_objectives(self, text: str) -> list[str]:
-        prompt = (
-            "把主人這句話拆成幾件『互不相關、可以各自獨立完成』的任務。"
-            "同一件事的多個步驟（例如：建立檔案然後寫入內容、打開網頁再點按鈕）算『一件』，不要拆。"
-            "只有像『數一下檔案，順便查個天氣』或『建 A 檔，再建 B 檔』這種真正無關的才拆。"
-            '只回 JSON 陣列，每個元素是一句完整、可獨立執行的任務描述（保留主人原本的意思）。'
-            "只有一件事就回單元素陣列。\n主人說：" + text
-        )
-        try:
-            response = self.provider.chat(
-                [{"role": "user", "content": prompt}], [], model=_chat_voice_model()
-            )
-            import json as _json
-
-            match = re.search(r"\[.*\]", str(getattr(response, "content", "") or ""), re.S)
-            if not match:
-                return [text]
-            parts = _json.loads(match.group(0))
-            cleaned = [str(p).strip() for p in parts if isinstance(p, (str, int, float)) and str(p).strip()]
-            return cleaned[:5] if len(cleaned) >= 2 else [text]
-        except Exception:
-            return [text]
+        self._emit("task.split", turn.turn_id, {"count": len(extra) + 1, "deferred": extra[:6]})
 
     _OPENER_FORBIDDEN = (
         "系統", "系统", "初始化", "ai", "模型", "workflow", "工作流", "記憶", "记忆", "清空",
@@ -397,7 +367,10 @@ class YueYueRuntimeV3:
                 grounded = True
             else:
                 reply = _clean_reply(response.content) or "我在呢，主人。"
-                grounded = bool(pending_note)
+                # Grounded means the reply REPORTS real task state - not merely that a note was
+                # injected. The idle note ("nothing running") is always present, so keying off the
+                # note itself would hand every chat turn a relaxed gate.
+                grounded = self._has_live_task_state()
         except Exception:
             reply = "我這邊剛剛斷了一下，不過還在。你再說一次就好。"
         if turn.mode in {TurnMode.CHAT, TurnMode.SOCIAL}:
@@ -410,6 +383,14 @@ class YueYueRuntimeV3:
         self._emit("turn.replied", turn.turn_id, {"mode": turn.mode.value, "reply": reply[:500]})
         return reply
 
+    def _has_live_task_state(self) -> bool:
+        """True when there is an actual task to report (running/awaiting, or queued)."""
+        workflow = self.state.workflow
+        live = bool(workflow) and workflow.status not in {
+            WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED, WorkflowStatus.BLOCKED,
+        }
+        return live or bool(self.state.task_queue)
+
     def _pending_task_note(self) -> str:
         """Ground truth about the currently-awaiting task, injected into chat turns so YueYue can
         never contradict her own permission request."""
@@ -420,7 +401,20 @@ class YueYueRuntimeV3:
         if not workflow or workflow.status in {
             WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED, WorkflowStatus.BLOCKED,
         }:
-            return ""
+            # Say so EXPLICITLY rather than injecting nothing. With no ground truth the model
+            # filled the gap from stale short-term context and told the owner two finished files
+            # were 「還沒動手」 (live 2026-07-22). Absence of a task is itself a fact worth stating.
+            if self.state.task_queue:
+                return (
+                    "### 目前狀態（事實，不可否認）\n"
+                    f"- 沒有正在執行的任務，但有 {len(self.state.task_queue)} 件排隊中："
+                    + "；".join(f"「{q[:40]}」" for q in self.state.task_queue[:3])
+                )
+            return (
+                "### 目前狀態（事實，不可否認）\n"
+                "- 現在沒有任何任務在跑，也沒有排隊的。之前交代的都處理完了。\n"
+                "- 主人問起就照這個講，不要憑印象說某件事還沒做。"
+            )
         pending = self.state.permission.pending_action
         lines = [
             "### 目前狀態（事實，不可否認）",
@@ -428,7 +422,10 @@ class YueYueRuntimeV3:
         ]
         if pending:
             lines.append(f"- 這一步在等主人同意才能做：{pending.tool_name}")
-            lines.append("- 回答完主人的問題後，自然地提醒他這件事還等著他說「可以」。別用「點頭」這個生硬說法。")
+            # Phrased POSITIVELY on purpose. The previous wording spelled out the disliked word in
+            # a "don't say X" instruction, which is precisely how it kept reappearing - naming a
+            # token in a negation makes a model more likely to emit it, not less.
+            lines.append("- 回答完主人的問題後，自然地提醒他這件事還等著他說一聲「可以」。")
         if self.state.task_queue:
             lines.append(f"- 另外還有 {len(self.state.task_queue)} 件排隊中：" + "；".join(
                 f"「{q[:40]}」" for q in self.state.task_queue[:3]))
@@ -494,6 +491,15 @@ class YueYueRuntimeV3:
         # Never consume a scripted test provider's queued responses (the .env opt-in leaks into
         # tests via env_value); the check is only meaningful against the real provider anyway.
         if type(self.provider).__name__ != "SiliconFlowProvider":
+            return ""
+        # The veto exists to catch 答非所問 TEXT answers - a claimed result that does not address
+        # the question. When the goal was satisfied by a real mutation that succeeded (write_file,
+        # a command, a click), the evidence IS the answer and there is nothing for a language
+        # judgement to add: it only added ~7s per task and produced the false veto that blocked a
+        # file the owner could see on disk (2026-07-22). Skip it for action-backed completions.
+        if any(
+            item.status == "ok" and item.source in ACTION_SOURCES for item in workflow.evidence
+        ):
             return ""
         try:
             # The veto must see the EXECUTION EVIDENCE, not just the bound outputs - judging
@@ -579,7 +585,7 @@ class YueYueRuntimeV3:
         # burning a regeneration (and possibly the canned fallback) on them. If the owner is
         # typing Simplified, the mirroring step after this converts the reply back anyway.
         reply = to_traditional_script(reply)
-        reply = repair_taiwan_particles(reply)
+        reply = repair_nod_idiom(repair_taiwan_particles(reply))
         if not _chat_reply_violates_social_policy(reply, owner_text, grounded):
             return reply
         # Most violations are a pure length overrun (the model's own reaction was on-topic, just a
@@ -733,6 +739,7 @@ class YueYueRuntimeV3:
                 {"owner_request": turn.text},
                 "我沒能把這個任務整理成可靠步驟，所以先不亂動。你稍後再讓我試一次。",
             )
+        self._enqueue_deferred_objectives(turn, planned)
         workflow = self.workflow_engine.create(planned.goal, planned.steps)
         state = copy.deepcopy(self.state)
         state.workflow = workflow
@@ -778,6 +785,14 @@ class YueYueRuntimeV3:
                 workflow, pending_action.tool_name, result, pending_action.arguments
             )
             self.workflow_engine.add_evidence(workflow, evidence)
+            # Same deterministic read-back as the in-loop path. This is where an APPROVED write
+            # actually runs, so without it every permission-gated write still paid a task-model
+            # round-trip just to confirm bytes already sitting on disk.
+            readback = _readback_written_file(
+                workflow, pending_action.tool_name, pending_action.arguments, result
+            )
+            if readback:
+                self.workflow_engine.add_evidence(workflow, readback)
             self.workflow_engine.verify(workflow)
             replayed_state = copy.deepcopy(self.state)
             replayed_state.workflow = workflow
@@ -965,6 +980,13 @@ class YueYueRuntimeV3:
                 result = self._execute_tool(name, arguments, tool_callback)
                 evidence = _evidence_from_result(workflow, name, result, arguments)
                 self.workflow_engine.add_evidence(workflow, evidence)
+                # Read a just-written file straight back off disk. The plan's confirm step is
+                # real and must stay ("no fake success"), but WHICH bytes are on disk is a
+                # filesystem question, not a judgement call - routing it through another task-model
+                # round-trip cost ~17s per write and taught nothing. Same evidence, no model call.
+                readback = _readback_written_file(workflow, name, arguments, result)
+                if readback:
+                    self.workflow_engine.add_evidence(workflow, readback)
                 semantic_evidence = self._semantic_verify_action(workflow)
                 if semantic_evidence:
                     self.workflow_engine.add_evidence(workflow, semantic_evidence)
@@ -1243,6 +1265,10 @@ class YueYueRuntimeV3:
                 # voice model so the register/tone stays consistent across chat and task turns.
                 response = self.provider.chat(messages, [], model=_chat_voice_model())
                 candidate = to_traditional_script(_clean_reply(response.content))
+                # Same deterministic repairs the chat path applies before ITS gate: a stray Taiwan
+                # particle or the owner-disliked 「等你點頭」 idiom is a mechanical slip, not a wrong
+                # answer, and rejecting it here would burn a retry or drop to a canned fallback.
+                candidate = repair_nod_idiom(repair_taiwan_particles(candidate))
                 if not candidate:
                     critique = "\nYour previous attempt was empty. Write the reply."
                     continue
@@ -1383,6 +1409,48 @@ def _report_value_grounded(arguments: dict[str, Any], workflow: WorkflowState) -
             continue
         return False, f"value {str(entry.get('value'))[:80]!r} does not appear in any tool result"
     return True, ""
+
+
+def _readback_written_file(
+    workflow: WorkflowState, tool: str, arguments: dict[str, Any], result: Any
+) -> ExecutionEvidence | None:
+    """After a successful write_file, read the file back from disk as read_file evidence.
+
+    The plan legitimately pairs a write with a confirm step, and that confirmation must be real -
+    but it is a filesystem fact, so asking the task model to decide to call read_file just added a
+    ~17s round-trip per write (2026-07-22 timing). Reading it here produces the SAME evidence the
+    model's read_file call would have produced. Returns None on any doubt, so the model still gets
+    its turn rather than the workflow completing on a guess.
+    """
+    if tool != "write_file" or getattr(result, "status", "") != "ok":
+        return None
+    args = arguments or {}
+    path = str(args.get("filename") or args.get("path") or "").strip()
+    if not path:
+        return None
+    try:
+        target = Path(path)
+        if not target.is_absolute():
+            # Workspace-relative writes resolve against the sandbox root, same as the tool does.
+            target = Path(os.path.abspath(os.getenv("YUEYUE_ROOT_DIR") or ".")) / "workspace" / path
+        if not target.is_file():
+            return None
+        content = target.read_text(encoding="utf-8", errors="replace")[:4000]
+    except OSError:
+        return None
+    # File it under the ACT step: an act step sits in AWAITING_OBSERVATION until an observation
+    # lands on that same step, and this read IS that observation. The workflow then verifies the
+    # write, binds the content as the output, and finds no mutation pending - so the goal
+    # completes without another task-model round-trip. (Filing it under the plan's later confirm
+    # step instead leaves the write awaiting observation forever and the workflow blocks.)
+    step = workflow.current_step()
+    return ExecutionEvidence(
+        step.step_id if step else "",
+        "read_file",
+        "ok",
+        content,
+        {"path": str(target), "text": content, "content": content},
+    )
 
 
 def _evidence_from_result(

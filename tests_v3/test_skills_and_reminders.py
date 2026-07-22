@@ -204,7 +204,10 @@ def test_blocked_workflow_is_terminal_everywhere(tmp_path):
         state.workflow = wf
         rt._replace_state(state, "test.seed", "t0")
 
-    assert rt._pending_task_note() == ""
+    # blocked reads as terminal: the note must say "nothing running", never "in progress"
+    note = rt._pending_task_note()
+    assert "沒有任何任務" in note
+    assert "進行中" not in note
     import skill_engine as se
     snap = se.RUNTIME_INTROSPECT()
     assert snap["active"] is None

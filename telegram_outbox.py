@@ -7,7 +7,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parent
 OUTBOX_FILE = ROOT / "workspace" / "project_cache" / "telegram_outbox.jsonl"
 

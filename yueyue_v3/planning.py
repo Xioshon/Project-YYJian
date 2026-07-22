@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from core_tools import AgentTool, ToolResult, env_value
@@ -96,6 +96,10 @@ _GOLDEN_PLAN_EXAMPLES = (
 class PlannedWorkflow:
     goal: GoalContract
     steps: list[StepContract]
+    # Additional INDEPENDENT tasks found in the same message, to be queued and run one by one.
+    # Folded into planning (2026-07-22) because a separate splitter model call cost ~15s on EVERY
+    # task turn - the planner already reads the whole message, so this field is free.
+    deferred_objectives: list[str] = field(default_factory=list)
 
 
 class GoalPlannerV3:
@@ -164,6 +168,15 @@ class GoalPlannerV3:
                             "required": ["name", "kind", "done_condition", "allowed_tools"],
                         },
                     },
+                    "deferred_objectives": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Additional INDEPENDENT tasks the user packed into the same message, "
+                            "each a complete standalone instruction. Sequential steps of ONE task "
+                            "do not belong here. Empty for a single-task message."
+                        ),
+                    },
                 },
                 "required": ["objective", "requested_outputs", "success_criteria", "steps"],
             },
@@ -171,6 +184,9 @@ class GoalPlannerV3:
         )
         system = (
             "Create one submit_goal_contract call. Plan from the concrete outcome, not keywords. "
+            "If the message packs several INDEPENDENT tasks (建 A 檔，再建 B 檔 / 數檔案，順便查天氣), "
+            "plan ONLY the first and list the rest verbatim in deferred_objectives so they run one by one. "
+            "Sequential steps of a single task (建檔然後寫入) are NOT independent - keep them as steps. "
             "Separate observation and action steps. Every observation step must declare required_sources and a "
             "completion_mode. Use all_sources when each listed source is required, any_source when one sufficient "
             "observation is enough, facts when required_facts prove completion, and semantic only for genuinely "
@@ -308,13 +324,23 @@ class GoalPlannerV3:
         criteria = [str(item)[:400] for item in raw.get("success_criteria") or [] if str(item).strip()]
         if not outputs or len(steps) < 2 or not criteria:
             return None
+        deferred = [
+            str(item).strip()[:500]
+            for item in (raw.get("deferred_objectives") or [])
+            if isinstance(item, (str, int, float)) and str(item).strip()
+        ]
+        # Normally the goal keeps the owner's VERBATIM words (a model-rewritten objective drifts).
+        # The one exception is a split message: the plan covers only the first task, so the goal
+        # must say so too - otherwise verification would demand evidence for the siblings that
+        # were queued for later and never complete.
+        stated = str(raw.get("objective") or "").strip()
         goal = GoalContract(
-            str(objective)[:700],
+            (stated or str(objective))[:700] if deferred else str(objective)[:700],
             outputs[:8],
             criteria[:10],
             str(raw.get("risk_level") or "low"),
         )
-        return PlannedWorkflow(goal, steps[:10])
+        return PlannedWorkflow(goal, steps[:10], deferred[:4])
 
     def _fallback(self, objective: str, allowed_domain: list[str]) -> PlannedWorkflow:
         desktop = _desktop_task(objective)

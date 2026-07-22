@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 import unicodedata
 
-
 PROMPT_SHAPED_MARKERS = [
     "你是月月",
     "使用者原句",

@@ -517,7 +517,9 @@ def _generated_greeting_prompt(owner_prompt: str, recent: list[str]) -> list[dic
         "用繁體中文。一句話，28字以內，不換行。\n"
         f"{VOICE_REGISTER_ZH}\n"
         "語氣短、口語、俏皮、微傲嬌，有一點黏但不要曖昧。\n"
-        "不要像客服或助理，不要提幫忙做事、點頭、繼續、日期時間、貼圖。\n"
+        # Positive framing on purpose: an earlier version spelled out the disliked words here, and
+        # naming a token inside a prohibition makes a model MORE likely to emit it.
+        "只是打個招呼，不是接活——別扯到辦事、日期時間或貼圖。\n"
         "不要提第三次、複讀機、舊測試、舊問候。\n"
         "不要用「就這」「原來只是在叫月月」「敷衍」這類冷場句。"
     )

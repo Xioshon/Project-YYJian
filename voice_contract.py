@@ -146,6 +146,22 @@ def repair_taiwan_particles(text: str) -> str:
     return re.sub(r"[ 	]{2,}", " ", value)
 
 
+# The owner named this one idiom twice as reading oddly (2026-07-22). 「等你點頭」 is perfectly
+# natural Chinese, so no prompt instruction reliably suppresses it - and spelling it out inside a
+# "don't say X" line made models emit it MORE. Rewriting the finished sentence is deterministic,
+# costs nothing, and stays one owner-named idiom rather than a growing style blocklist.
+_NOD_IDIOM_RE = re.compile(r"(?:在)?等(?:著|着)?(?:你|主人|您)(?:的)?點頭")
+
+
+def repair_nod_idiom(text: str) -> str:
+    """Rewrite 「等你點頭」-style approval phrasing into the owner's preferred 「等你說可以」."""
+    value = str(text or "")
+    if "點頭" not in value:
+        return value
+    value = _NOD_IDIOM_RE.sub("等你說可以", value)
+    return value.replace("點頭", "說可以")
+
+
 def repair_simplified_script(text: str) -> str:
     """Deterministic Simplified→Traditional repair for output-side use, BEFORE gating.
 
