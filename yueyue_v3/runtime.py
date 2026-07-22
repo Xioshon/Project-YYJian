@@ -247,8 +247,23 @@ class YueYueRuntimeV3:
             workflow and workflow.status == WorkflowStatus.AWAITING_PERMISSION
         )
         approval = classify_approval(turn.text, has_pending=has_pending)
+        forced = None
+        if has_pending and approval == "none":
+            # The fast keyword parser was unsure. Rather than silently drop the reply into chat
+            # (live 2026-07-23: 「對」 lost an approval; a word list can never enumerate every way
+            # an owner says yes/no/"change it"), let the MODEL judge intent in context. This is the
+            # "understanding = model, safety = code" split: the model only reads what the owner
+            # MEANS; the permission grant itself stays rule-based below.
+            judged = self._judge_permission_reply(turn)
+            if judged == "approve":
+                approval, forced = "single", "single"
+            elif judged == "decline":
+                approval, forced = "deny", "deny"
+            elif judged == "amend":
+                return self._handle_permission_amendment(turn, tool_callback)
+            # "unrelated" -> leave approval "none"; the turn is handled as a normal chat/task below.
         if has_pending and approval != "none":
-            return self._handle_permission_reply(turn, approval, tool_callback)
+            return self._handle_permission_reply(turn, approval, tool_callback, forced_decision=forced)
 
         if (
             workflow
@@ -791,7 +806,65 @@ class YueYueRuntimeV3:
         self._replace_state(state, "workflow.started", turn.turn_id)
         return self._run_workflow(turn, tool_callback)
 
-    def _handle_permission_reply(self, turn: TurnEnvelope, approval: str, tool_callback: Callable | None) -> str:
+    def _judge_permission_reply(self, turn: TurnEnvelope) -> str:
+        """Model-judged intent for a reply the fast approval parser could not classify, while a
+        permission is pending. Returns approve / decline / amend / unrelated. On any error or
+        ambiguity it returns 'unrelated' - the safe default is NEVER to auto-execute on a guess.
+
+        Phase 1 of the move from keyword-routing to model-understanding: the owner approves,
+        declines, or changes their mind in unlimited phrasings ('行吧你弄', '嗯但改叫a.txt',
+        '先別'), and only the model can read those reliably. Cheap: one short chat-model call,
+        fired only on the ambiguous minority of turns (obvious 可以/不要 keep the zero-latency
+        fast path)."""
+        workflow = self.state.workflow
+        pending = self.state.permission.pending_action
+        objective = workflow.goal.objective if workflow else ""
+        pending_desc = pending.tool_name if pending else ""
+        prompt = (
+            "主人剛剛收到一個「要不要現在動手」的確認，正在等他回覆。\n"
+            f"等他確認的事：{objective[:200]}\n"
+            f"（底層動作：{pending_desc}）\n"
+            f"主人這句回覆是：「{turn.text[:300]}」\n\n"
+            "判斷主人的意思，只回一個英文詞：\n"
+            "approve = 純粹同意，照原本說的去做（例如「可以」「對」「行吧」「嗯你弄」「當然」「去吧」）\n"
+            "amend = 願意做，但要調整細節——改檔名、改路徑、改內容、改對象、加條件。"
+            "只要句子裡有『改成／改叫／換成／不是X是Y／放到別處／內容要…』這種調整，就是 amend，不是 decline。"
+            "（例如「改叫 a.txt」「是你的自我介紹不是我的」「放桌面不是下載夾」「內容再短一點」）\n"
+            "decline = 現在整件事都不要做了（例如「先別」「算了」「不用了」「等等再說」）\n"
+            "unrelated = 在講別的、或問別的問題，跟這個確認無關\n"
+            "分辨重點：主人是在『喊停』(decline) 還是在『調整後繼續』(amend)？有具體調整就是 amend。\n"
+            "只回那一個英文詞，不要解釋。"
+        )
+        try:
+            response = self.provider.chat(
+                [{"role": "user", "content": prompt}], [], model=_chat_voice_model()
+            )
+            answer = str(getattr(response, "content", "") or "").strip().casefold()
+        except Exception:
+            return "unrelated"
+        for verdict in ("approve", "decline", "amend", "unrelated"):
+            if verdict in answer:
+                return verdict
+        return "unrelated"
+
+    def _handle_permission_amendment(self, turn: TurnEnvelope, tool_callback: Callable | None) -> str:
+        """The owner is changing the request WHILE a permission is pending (「是你的自我介紹不是
+        我的」/「改放桌面」). Cancel the stale plan and re-plan from the original objective plus the
+        amendment, so the correction is folded in rather than lost to a chat detour (live
+        2026-07-23: that clarification derailed the whole create-file task)."""
+        workflow = self.state.workflow
+        original = workflow.goal.objective if workflow else ""
+        state = copy.deepcopy(self.state)
+        state.workflow = None
+        state.permission = PermissionState()
+        self._replace_state(state, "workflow.amended", turn.turn_id)
+        combined = f"{original}（主人補充/更正：{turn.text[:200]}）" if original else turn.text
+        amended = TurnEnvelope(turn.chat_id, combined, TurnMode.TASK, turn.message_id)
+        return self._start_task(amended, tool_callback)
+
+    def _handle_permission_reply(
+        self, turn: TurnEnvelope, approval: str, tool_callback: Callable | None, forced_decision: str | None = None
+    ) -> str:
         state = copy.deepcopy(self.state)
         if approval == "deny":
             denied_action = state.permission.pending_action
@@ -805,7 +878,9 @@ class YueYueRuntimeV3:
                 "好，這一步不做了。我不會再繼續點。",
             )
         pending_action = copy.deepcopy(state.permission.pending_action)
-        decision = self.permission_controller.apply_reply(state.permission, turn.text)
+        decision = self.permission_controller.apply_reply(
+            state.permission, turn.text, forced_decision=forced_decision
+        )
         if decision == "none":
             return self._compose_owner_voice(
                 "no_pending_permission", {}, "我沒有找到正在等你確認的動作。你直接說要我做什麼就好。"
@@ -1283,9 +1358,11 @@ class YueYueRuntimeV3:
             "If the facts include execution_account or screenshot/artifact locations, briefly account for what was "
             "actually done and where any files ended up, in plain owner language (e.g. 我截了圖看過、檔案存在哪) - "
             "never claim an action or file that is not in the facts. "
-            "If the event name contains 'permission', you are ASKING the owner for permission before acting - "
-            "phrase it as a request that genuinely needs their yes (explain what you want to do and why, using "
-            "the facts), and never say you will do it, are doing it, or have done it. "
+            "If the event is a permission REQUEST (permission_requested / permission_plan), you are ASKING the "
+            "owner for permission before acting - phrase it as a request that genuinely needs their yes (explain "
+            "what you want to do and why, using the facts), and never say you will do it, are doing it, or have "
+            "done it. If the event is permission_denied, the owner just told you NOT to do it - simply accept it "
+            "warmly (「好，那先不做」), do NOT talk about permissions being insufficient or offer to retry. "
             "Word it naturally, like asking a friend ('要我現在動手嗎？'/'你說可以我就做') - do NOT use the "
             "stiff idiom 點頭/點個頭. "
             "If the event is a failure, report only what the facts say failed; never invent a missing "

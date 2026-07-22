@@ -725,3 +725,32 @@ def test_single_step_lookup_plan_is_accepted_not_forced_to_fallback():
         ],
     }
     assert planner._parse(mutation, "建立檔案", ["write_file", "read_file"]) is None
+
+
+def test_ascii_approval_markers_do_not_match_inside_filenames():
+    # Live 2026-07-23: 「改成叫 AmendYou.txt」 contained 'n' (deny) and 'y' (approve) as substrings,
+    # so the parser cancelled a filename amendment before the model judge could run. ASCII markers
+    # must match only as the exact whole reply.
+    from agent_protocol import classify_approval
+
+    for filename_reply in ("改成叫 AmendYou.txt", "幫我建 NovelNo.txt", "叫 anyfile.py", "存成 notes.md"):
+        assert classify_approval(filename_reply, has_pending=True) == "none", filename_reply
+    # bare ASCII yes/no still classify
+    assert classify_approval("y", has_pending=True) == "single"
+    assert classify_approval("n", has_pending=True) == "deny"
+    assert classify_approval("ok", has_pending=True) == "single"
+
+
+def test_long_replies_bypass_substring_keywords_and_reach_the_judge():
+    # A substantive sentence (an amendment/question) must return "none" from the fast parser so the
+    # model judge reads it in context, instead of a stray 好/是 substring forcing a verdict.
+    from agent_protocol import classify_approval
+
+    assert classify_approval("是你的自我介紹，不是我的", has_pending=True) == "none"
+    assert classify_approval("改成放到桌面那邊好不好", has_pending=True) == "none"
+    # short clear KEYWORD answers are still fast-pathed, no model needed
+    assert classify_approval("可以", has_pending=True) == "single"
+    assert classify_approval("不要", has_pending=True) == "deny"
+    # 「先別」 is not a keyword - it correctly returns none so the model judge reads it (verified
+    # live: 「欸先等等我再想想」 -> decline via the judge). The fast path stays conservative.
+    assert classify_approval("先別", has_pending=True) == "none"

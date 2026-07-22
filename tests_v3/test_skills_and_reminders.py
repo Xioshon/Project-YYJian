@@ -243,3 +243,72 @@ def test_idle_note_carries_the_last_finished_task(tmp_path):
     note = rt._pending_task_note()
     assert "沒有任何任務" in note
     assert "SpeedTest.txt" in note and "剛剛才做完" in note and "不要說不記得" in note
+
+
+def _task_rt(tmp_path, scripted_responses):
+    from yueyue_v3.providers import ProviderResponse, ScriptedProvider
+    from yueyue_v3.runtime import YueYueRuntimeV3
+
+    (tmp_path / "workspace" / "brain").mkdir(parents=True)
+    (tmp_path / "workspace" / "brain" / "personality.md").write_text("月月", encoding="utf-8")
+    (tmp_path / "workspace" / "brain" / "rules.md").write_text("守規矩", encoding="utf-8")
+    provider = ScriptedProvider([ProviderResponse(r, "", []) for r in scripted_responses])
+    return YueYueRuntimeV3(tmp_path, provider, state_dir=tmp_path / "v3")
+
+
+def _seed_pending(rt):
+    import copy
+
+    from yueyue_v3.models import (
+        ActionEnvelope,
+        GoalContract,
+        RequestedOutput,
+        StepContract,
+        WorkflowStatus,
+    )
+
+    goal = GoalContract("在下載路徑建 a.txt", [RequestedOutput("c", "d", True, "text", [])], ["c"])
+    wf = rt.workflow_engine.create(goal, [StepContract("s1", "s", "act", "d", ["write_file"])])
+    wf.status = WorkflowStatus.AWAITING_PERMISSION
+    with rt.events.writer_scope():
+        state = copy.deepcopy(rt.state)
+        state.workflow = wf
+        state.permission.pending_action = ActionEnvelope("write_file", {"filename": "a.txt", "content": "x"}, "s1", "low")
+        state.permission.scope = "pending"
+        rt._replace_state(state, "test.seed", "t0")
+
+
+def test_model_judges_novel_approval_phrasing_when_keywords_miss(tmp_path):
+    # Phase 1: an approval the keyword parser can't classify goes to the model, not silently to
+    # chat. Here the fast parser returns "none" for 「行吧你趕緊弄」; the scripted model says approve.
+    rt = _task_rt(tmp_path, ["approve"])  # the _judge_permission_reply call
+    _seed_pending(rt)
+    verdict = rt._judge_permission_reply(
+        __import__("yueyue_v3.models", fromlist=["TurnEnvelope", "TurnMode"]).TurnEnvelope(
+            "telegram", "行吧你趕緊弄", __import__("yueyue_v3.models", fromlist=["TurnMode"]).TurnMode.TASK
+        )
+    )
+    assert verdict == "approve"
+
+
+def test_model_judge_defaults_to_unrelated_on_garbage(tmp_path):
+    # Safety: never auto-execute on a guess. Unparseable model output -> unrelated (do nothing).
+    from yueyue_v3.models import TurnEnvelope, TurnMode
+
+    rt = _task_rt(tmp_path, ["嗯我也不知道欸"])
+    _seed_pending(rt)
+    assert rt._judge_permission_reply(TurnEnvelope("telegram", "?", TurnMode.TASK)) == "unrelated"
+
+
+def test_forced_decision_grants_without_reparsing_keywords(tmp_path):
+    # A model-judged approve must grant even though classify_approval would return "none" for the
+    # same text - the whole point is to stop depending on the keyword list.
+    from yueyue_v3.models import ActionEnvelope, PermissionState
+    from yueyue_v3.permissions import PermissionController
+
+    controller = PermissionController()
+    state = PermissionState()
+    controller.request(state, ActionEnvelope("write_file", {"filename": "a.txt", "content": "x"}, "s1", "low"))
+    # 「行吧你弄」 is not in any keyword list
+    assert controller.apply_reply(state, "行吧你弄", forced_decision="single") in {"single", "turn"}
+    assert controller.permits(state, ActionEnvelope("write_file", {"filename": "a.txt", "content": "x"}, "s1", "low"))

@@ -51,8 +51,15 @@ class PermissionController:
         state.bundle = self.bundle_for(action.tool_name)
         return state
 
-    def apply_reply(self, state: PermissionState, text: str) -> str:
-        decision = classify_approval(text, has_pending=bool(state.pending_action))
+    def apply_reply(self, state: PermissionState, text: str, forced_decision: str | None = None) -> str:
+        # forced_decision lets the runtime supply a MODEL-judged verdict (approve/decline) for
+        # replies the fast keyword parser could not classify - the owner may approve or decline in
+        # unlimited phrasings a word list can never enumerate. Safety is unchanged: the model only
+        # decides "did the owner say yes"; which tools need approval and the grant scope stay here.
+        if forced_decision in {"single", "turn", "deny"}:
+            decision = forced_decision
+        else:
+            decision = classify_approval(text, has_pending=bool(state.pending_action))
         if decision == "deny":
             state.scope = "none"
             state.pending_action = None

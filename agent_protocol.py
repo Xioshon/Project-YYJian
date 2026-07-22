@@ -101,6 +101,20 @@ def screenshot_pattern() -> re.Pattern:
     return re.compile(rf"\[{{1,2}}(?:{re.escape(SCREENSHOT_MARKER_LABEL)}|screenshot):\s*(.*?)\]{{1,2}}", re.IGNORECASE)
 
 
+def _marker_hit(marker: str, normalized: str) -> bool:
+    """Whether an approval/deny marker matches the reply.
+
+    ASCII markers (y/n/ok/go/yes/no) match ONLY as the exact whole reply - never as a substring.
+    Live 2026-07-23: 「改成叫 AmendYou.txt」 contained the letter 'n' (deny) and 'y' (approve), so
+    the substring parser classified a filename amendment as a denial and cancelled the task before
+    the model judge could even run. CJK markers keep substring matching but are gated by the caller
+    to short replies only, so a bare 「好」 is approval while 「改成放好嗎」 is not."""
+    m = marker.casefold()
+    if m.isascii():
+        return m == normalized
+    return m in normalized
+
+
 def classify_approval(text: str, has_pending: bool) -> str:
     if not has_pending:
         return "none"
@@ -108,13 +122,16 @@ def classify_approval(text: str, has_pending: bool) -> str:
         normalized = _normalize_approval_text(candidate)
         if not normalized or len(normalized) > 120:
             continue
-        if any(marker.casefold() in normalized for marker in DENY_PHRASES):
+        # Substring keyword matching only for SHORT replies - a terse 「好」/「不要」 is a clear
+        # yes/no, but anything longer is a real sentence (an amendment, a question) that the model
+        # judge must read in context, not a keyword the parser should pattern-match. This keeps the
+        # fast path conservative: obvious short answers here, everything substantive to the model.
+        short = len(normalized) <= 10
+        if short and any(_marker_hit(marker, normalized) for marker in DENY_PHRASES):
             return "deny"
-        if any(marker.casefold() in normalized for marker in TURN_APPROVAL_PHRASES):
+        if short and any(_marker_hit(marker, normalized) for marker in TURN_APPROVAL_PHRASES):
             return "turn"
-        if any(
-            marker.casefold() == normalized or marker.casefold() in normalized for marker in SINGLE_APPROVAL_PHRASES
-        ):
+        if short and any(_marker_hit(marker, normalized) for marker in SINGLE_APPROVAL_PHRASES):
             return "single"
         if _looks_like_turn_approval(normalized):
             return "turn"
