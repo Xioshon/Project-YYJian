@@ -143,10 +143,17 @@ def build_aggregated_turn(parts: list[InboundMessagePart]) -> AggregatedTurn:
     media_parts = [part for part in ordered if part.kind in {"photo", "sticker"}]
     media_kind = _dominant_media_kind(media_parts)
     mode = classify_interaction(primary_text, has_media=bool(media_parts), media_kind=media_kind)
-    # ROADMAP P1: keyword routing is the fast path; when its decision rested on weak signals
-    # (the historical misroute zone), the cheap chat model re-judges. Opt-in via
-    # YUEYUE_LLM_ROUTING=1; any LLM failure keeps the keyword result.
-    if classification_is_grey(primary_text, mode, has_media=bool(media_parts), media_kind=media_kind):
+    # Phase 2 (2026-07-23): the MODEL is the router; keywords are only a fast recall pre-filter.
+    # The old design trusted the keyword verdict and asked the model ONLY on cases the keywords
+    # themselves flagged as grey - so a CONFIDENT-but-wrong verdict (「看一下下載路徑」 firmly
+    # classified as screen-observe) never reached the model. Now any TEXT turn the keywords did
+    # not confidently call plain chat - i.e. they saw some task/screen/tool intent, or the signal
+    # was weak - goes to the model to decide in context. Media attachments stay deterministic
+    # (a real photo/sticker is not a text-routing question). Any LLM failure keeps the keyword
+    # result, so this only refines routing, never breaks it.
+    if not media_parts and (mode != InteractionMode.CHAT or classification_is_grey(
+        primary_text, mode, has_media=False, media_kind=media_kind
+    )):
         mode = llm_route(primary_text, mode)
     if primary_text and mode == InteractionMode.SOCIAL_STICKER:
         mode = InteractionMode.CHAT

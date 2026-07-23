@@ -78,6 +78,40 @@ def _reply_reflects_content(reply: str, summary: str) -> bool:
     return hits >= min(2, len(fragments))
 
 
+class _StartTaskTool:
+    """Escalation tool the chat model can call to hand a request to the workflow engine. Duck-types
+    the skill/AgentTool shape (name/description/parameters) that providers.chat serializes. The
+    description IS the routing intelligence: it tells the model WHEN chatting should become doing."""
+
+    name = "start_task"
+    description = (
+        "只有當主人『這一句』清楚是要你實際動手操作電腦才呼叫，把任務交給執行引擎。"
+        "算數的：操作磁碟上的檔案/資料夾（列出、讀取、建立、寫入、搜尋某路徑裡的檔案）、"
+        "跑指令、需要多步驟完成並回報結果的事。"
+        "承接前一個任務、只補條件的後續才算（例如剛列了昨天的檔案，主人接著說「那今天的呢」"
+        "＝列出今天的檔案）。\n"
+        "絕對不要呼叫的情況：閒聊、情緒、意見；問你『會做什麼／有什麼功能／會玩什麼』這類"
+        "能力問題（直接用嘴巴答就好，不要真的去跑）；以及你自己就能回答的問題。"
+        "拿不準是不是要動手，就當成聊天，不要呼叫。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "objective": {
+                "type": "string",
+                "description": (
+                    "用一句清楚、可獨立執行的話，重述主人要完成的事（把對話裡的上下文補進去，"
+                    "例如把「那今天的呢」補成「列出下載資料夾今天編輯過的檔案」）。"
+                ),
+            }
+        },
+        "required": ["objective"],
+    }
+
+
+_START_TASK_TOOL = _StartTaskTool()
+
+
 class YueYueRuntimeV3:
     """Single-writer, goal-driven YueYue runtime."""
 
@@ -281,7 +315,7 @@ class YueYueRuntimeV3:
             return self._run_workflow(turn, tool_callback)
 
         if turn.mode in {TurnMode.CHAT, TurnMode.SOCIAL}:
-            return self._chat_turn(turn)
+            return self._chat_turn(turn, tool_callback)
 
         # A new task while one is still active (running/awaiting) queues instead of vanishing.
         if (
@@ -366,15 +400,19 @@ class YueYueRuntimeV3:
             prompt = instruction + "\n（你剛才那句不合適，重寫一句更自然、更短、字感乾淨的開場白）"
         return ""
 
-    def _chat_turn(self, turn: TurnEnvelope) -> str:
+    def _chat_turn(self, turn: TurnEnvelope, tool_callback: Callable | None = None) -> str:
         # ROADMAP P6 v2 (native tool calling, the Claude architecture): every chat turn the model
         # sees the FULL skill catalog as function tools and decides itself whether to reach for
         # one - "冷不冷" can call weather, "幫我記一下" can call notes, plain chatter calls
         # nothing. No keyword routing, no separate router call. Opt-in YUEYUE_SKILLS=1.
+        # Phase 2 (2026-07-23): the catalog also carries start_task, so a chat turn that turns out
+        # to need real work (a follow-up like 「今天編輯過的檔案」, or anything the fast router sent
+        # to chat) escalates into the workflow engine itself - the model routes by choosing the
+        # tool, using the short context it already has, instead of a keyword pre-classifier.
         tools = []
         if turn.mode == TurnMode.CHAT and env_value("YUEYUE_SKILLS") == "1":
             try:
-                tools = skill_tools()
+                tools = [*skill_tools(), _START_TASK_TOOL]
             except Exception:
                 tools = []
         messages = self.context.compile_turn(turn)
@@ -391,6 +429,13 @@ class YueYueRuntimeV3:
         try:
             response = self.provider.chat(messages, tools, model=_chat_voice_model())
             if tools and getattr(response, "tool_calls", None):
+                # If the model chose to escalate to a real task, hand off to the workflow engine
+                # and return its reply directly (task voice, permission flow) - do NOT run it
+                # through the chat social policy, which would truncate a permission ask to two
+                # bubbles. Any other tool calls are quick chat skills.
+                escalation = self._maybe_escalate_to_task(turn, response, tool_callback)
+                if escalation is not None:
+                    return escalation
                 reply = self._run_chat_skills(turn, messages, response)
                 grounded = True
             else:
@@ -476,6 +521,41 @@ class YueYueRuntimeV3:
             lines.append(f"- 另外還有 {len(self.state.task_queue)} 件排隊中：" + "；".join(
                 f"「{q[:40]}」" for q in self.state.task_queue[:3]))
         return "\n".join(lines)
+
+    def _maybe_escalate_to_task(
+        self, turn: TurnEnvelope, response: Any, tool_callback: Callable | None
+    ) -> str | None:
+        """If the chat model called start_task, hand off to the workflow engine and return its
+        reply; otherwise return None so normal chat-skill handling proceeds. This is how a chat
+        turn becomes real work without a keyword pre-router: the model reads the message plus the
+        short context it already has and decides to act."""
+        call = next(
+            (c for c in (response.tool_calls or []) if str(c.get("name") or "") == _START_TASK_TOOL.name),
+            None,
+        )
+        if not call:
+            return None
+        objective = str(dict(call.get("arguments") or {}).get("objective") or "").strip()
+        if not objective:
+            objective = turn.text
+        self._emit("chat.escalated_to_task", turn.turn_id, {"objective": objective[:200]})
+        task_turn = TurnEnvelope(turn.chat_id, objective[:500], TurnMode.TASK, turn.message_id)
+        # A task started from chat follows the same queue-if-busy rule as any other task entry.
+        if (
+            self.state.workflow
+            and self.state.workflow.status
+            not in {WorkflowStatus.COMPLETED, WorkflowStatus.CANCELLED, WorkflowStatus.BLOCKED}
+        ):
+            state = copy.deepcopy(self.state)
+            state.task_queue.append(objective[:500])
+            self._replace_state(state, "task_queue.push", turn.turn_id)
+            return self._compose_owner_voice(
+                "task_queued",
+                {"queued": objective[:120], "queue_length": len(self.state.task_queue),
+                 "current": self.state.workflow.goal.objective[:120]},
+                "好，這件先記下了，手上這個做完就接著弄～",
+            )
+        return self._start_task(task_turn, tool_callback)
 
     def _run_chat_skills(self, turn: TurnEnvelope, messages: list[dict[str, Any]], response: Any) -> str:
         """Execute the model's chosen skill calls, then let it weave the results into its own

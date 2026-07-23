@@ -312,3 +312,30 @@ def test_forced_decision_grants_without_reparsing_keywords(tmp_path):
     # 「行吧你弄」 is not in any keyword list
     assert controller.apply_reply(state, "行吧你弄", forced_decision="single") in {"single", "turn"}
     assert controller.permits(state, ActionEnvelope("write_file", {"filename": "a.txt", "content": "x"}, "s1", "low"))
+
+
+def test_chat_escalates_to_task_when_model_calls_start_task(tmp_path):
+    # Phase 2: a chat turn becomes real work when the model chooses start_task - no keyword
+    # pre-router. The model routes by choosing the tool, using its short context.
+
+    from yueyue_v3.models import TurnEnvelope, TurnMode
+
+    rt = _task_rt(tmp_path, [])
+    # simulate the chat model deciding to escalate
+    response = type("R", (), {"tool_calls": [{"id": "1", "name": "start_task", "arguments": {"objective": "列出下載夾今天的檔案"}}], "content": ""})()
+    turn = TurnEnvelope("telegram", "那今天的呢", TurnMode.CHAT)
+    with rt.events.writer_scope():
+        reply = rt._maybe_escalate_to_task(turn, response, None)
+    assert reply is not None, "start_task must hand off to the workflow engine"
+    # a non-start_task tool call returns None so normal chat-skill handling proceeds
+    other = type("R", (), {"tool_calls": [{"id": "2", "name": "note_add", "arguments": {"text": "x"}}], "content": ""})()
+    assert rt._maybe_escalate_to_task(turn, other, None) is None
+
+
+def test_start_task_tool_is_offered_in_chat_and_describes_when_to_escalate():
+    from yueyue_v3.runtime import _START_TASK_TOOL
+
+    assert _START_TASK_TOOL.name == "start_task"
+    # the description is the routing intelligence - it must steer AWAY from chatting/ability Qs
+    assert "能力問題" in _START_TASK_TOOL.description
+    assert _START_TASK_TOOL.parameters["required"] == ["objective"]
