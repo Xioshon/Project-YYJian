@@ -84,6 +84,16 @@ VISION_INTENT_MARKERS = [
     "analyze",
     "what is this",
     "describe",
+    "辨识",
+    "識別",
+    "看一下",
+    "影片",
+    "视频",
+    "視頻",
+    "圖片",
+    "图片",
+    "畫面",
+    "画面",
 ]
 
 TOOL_INTENT_MARKERS = [
@@ -203,56 +213,6 @@ QUICK_ACKS = {
     InteractionMode.SCREEN_OBSERVE: "我看一下畫面～",
 }
 
-VISION_INTENT_MARKERS.extend([
-    "看图",
-    "看圖",
-    "分析",
-    "辨识",
-    "辨識",
-    "识别",
-    "識別",
-    "这是什么",
-    "這是什麼",
-    "是什么",
-    "是什麼",
-    "帮我看",
-    "幫我看",
-    "看看",
-    "看一下",
-    "影片",
-    "视频",
-    "視頻",
-])
-TOOL_INTENT_MARKERS.extend([
-    "找 bug",
-    "找bug",
-    "跑一下",
-    "部署",
-    "跑自测",
-    "跑自測",
-])
-SCREEN_OBSERVE_MARKERS.extend([
-    "截图",
-    "截圖",
-    "截屏",
-    "屏幕",
-    "螢幕",
-    "萤幕",
-    "画面",
-    "畫面",
-    "看状态",
-    "看狀態",
-    "看看状态",
-    "看看狀態",
-    "看一下状态",
-    "看一下狀態",
-    "看一下屏幕",
-    "看一下螢幕",
-    "电脑屏幕",
-    "電腦螢幕",
-    "桌面状态",
-    "桌面狀態",
-])
 # Canonical Traditional forms - this update block previously re-introduced Simplified 处/画 that
 # the owner saw on every task ("我先处理一下"), because it overwrites the clean list above.
 # Owner 2026-07-21: 「我先處理一下」sounds like a service desk - wanted 「讓我先想一下下」-style
@@ -269,15 +229,6 @@ QUICK_ACK_POOLS = {
 QUICK_ACKS.update({mode: pool[0] for mode, pool in QUICK_ACK_POOLS.items()})
 
 
-# Canonical Unicode-safe routing markers. These override the older mojibake
-# lists above for normal runtime classification.
-VISION_INTENT_MARKERS.extend([
-    "看圖", "看图", "分析", "辨識", "识别", "這是什麼", "这是什么", "幫我看", "帮我看", "圖片", "图片", "影片", "視頻", "视频",
-])
-SCREEN_OBSERVE_MARKERS.extend([
-    "截圖", "截图", "截屏", "螢幕", "屏幕", "畫面", "画面", "看狀態", "看状态", "看看狀態", "看看状态",
-    "看一下螢幕", "看一下屏幕", "電腦屏幕", "电脑屏幕", "桌面狀態", "桌面状态",
-])
 # These describe specific keyboard/UI mechanics with no everyday metaphorical use ("press the
 # spacebar once" is never a figure of speech), so they stay safe to trigger standalone.
 COMPUTER_ACTION_MARKERS = [
@@ -315,19 +266,6 @@ TASK_TARGET_CONTEXT_MARKERS = [
 TASK_REQUEST_PHRASE_MARKERS = [
     "幫我", "帮我", "可以幫", "可以帮", "請幫", "请帮", "麻煩", "麻烦", "請你", "请你",
 ]
-
-# Clean UTF-8 routing markers added at the final definition site. These are the
-# markers normal runtime should rely on; older mojibake entries above are only
-# kept so old traces/tests do not lose compatibility.
-VISION_INTENT_MARKERS.extend([
-    "看圖", "看图", "分析", "辨識", "识别", "這是什麼", "这是什么", "幫我看", "帮我看",
-    "圖片", "图片", "影片", "視頻", "视频", "畫面", "画面",
-])
-SCREEN_OBSERVE_MARKERS.extend([
-    "截圖", "截图", "截屏", "螢幕", "屏幕", "畫面", "画面", "看看狀態", "看看状态",
-    "看一下螢幕", "看一下屏幕", "電腦屏幕", "电脑屏幕", "桌面狀態", "桌面状态",
-])
-
 
 # Sticker-send detection now lives in a single shared place: intent_router.is_sticker_send_request.
 # It used to be duplicated here with a separately-drifted marker set (and duplicated again in the
