@@ -398,6 +398,11 @@ try:  # pragma: no cover - trivial import guard
 except Exception:  # pragma: no cover
     _zh_convert = None
 
+# zhconv zh-hant's complete set of Taiwan-bias over-conversions on script-neutral chars
+# (verified against the full Traditional corpus 2026-07-23): 喫→吃 (owner flagged the archaic 喫),
+# 臺→台. Undo them so HK-written output stays modern. Fixed set, not a growing blocklist.
+_ZHCONV_TW_BIAS = str.maketrans({"喫": "吃", "臺": "台"})
+
 
 def _detect_chinese_script(text: str) -> str:
     """Return 'simplified', 'traditional', or '' (no signal) for the owner's current wording.
@@ -462,15 +467,17 @@ def to_traditional_script(reply: str) -> str:
     ended in a canned fallback - the owner's top pet hate - when the leak is mechanically
     fixable.
 
-    Uses zhconv's full standard mapping when available. The in-repo character table is a
-    hand-picked tripwire of ~428 chars and it missed everyday ones - 「還是剛才那两件…不敢乱動…
-    加進來吗」 reached the owner intact on 2026-07-22 - and growing that list by hand is exactly
-    the whack-a-mole this project keeps rejecting. zh-hant (not zh-tw) is deliberate: it converts
-    the SCRIPT without swapping in Taiwan vocabulary, so 信息/屏幕 stay as the owner writes them.
+    Uses zhconv's full standard mapping when available - the in-repo 428-char table missed
+    everyday chars (两/乱/吗). Target is zh-hant, which matches the glyph standard the rest of the
+    codebase's Traditional strings use (說 not 説), so blocklists/samples keep matching. zh-hant's
+    ONLY flaw is a Taiwan bias on two script-neutral chars, 吃→喫 and 台→臺 (owner flagged 喫 on
+    2026-07-23); _ZHCONV_TW_BIAS undoes exactly those. This set is COMPLETE and verified against
+    the whole Traditional corpus, not a list that grows - it is the full fixed set of zhconv's
+    neutral over-conversions. (zh-hk avoids these but remaps 說→説, breaking internal matching.)
     Falls back to the local table if the package is absent, so this stays a soft dependency."""
     if _zh_convert is not None:
         try:
-            return _zh_convert(reply, "zh-hant")
+            return _zh_convert(reply, "zh-hant").translate(_ZHCONV_TW_BIAS)
         except Exception:
             pass
     return reply.translate(_SIMPLIFIED_TO_TRADITIONAL_TABLE)

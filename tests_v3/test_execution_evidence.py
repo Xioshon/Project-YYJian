@@ -599,9 +599,13 @@ def test_full_script_conversion_catches_everyday_simplified():
     assert to_traditional_script("那两件") == "那兩件"
     assert to_traditional_script("不敢乱動") == "不敢亂動"
     assert to_traditional_script("要加進來吗") == "要加進來嗎"
-    # zh-hant converts the SCRIPT only - the owner's own vocabulary must survive untouched
+    # zh-HK converts the SCRIPT only - the owner's own vocabulary must survive untouched
     assert to_traditional_script("屏幕上的信息") == "屏幕上的信息"
     assert to_traditional_script("軟件和網絡") == "軟件和網絡"
+    # zh-HK, NOT zh-hant: 吃 must stay modern 吃, never the archaic 喫 (owner flagged 2026-07-23)
+    assert to_traditional_script("主人吃飯沒") == "主人吃飯沒"
+    assert to_traditional_script("決定吃什麼") == "決定吃什麼"
+    assert "喫" not in to_traditional_script("我想吃辣，你吃了嗎")
 
 
 def test_cantonese_gate_catches_the_particles_that_leaked():
