@@ -754,3 +754,42 @@ def test_long_replies_bypass_substring_keywords_and_reach_the_judge():
     # 「先別」 is not a keyword - it correctly returns none so the model judge reads it (verified
     # live: 「欸先等等我再想想」 -> decline via the judge). The fast path stays conservative.
     assert classify_approval("先別", has_pending=True) == "none"
+
+
+def test_read_tools_reach_absolute_paths_outside_workspace(tmp_path):
+    # Live 2026-07-23: 「在下載路徑找一個音樂播放器的python文件」 failed with the raw error
+    # 「search_in_files can only search inside workspace」 leaking into chat. Reads reach absolute
+    # paths (like read_file), so listing/searching the Downloads folder works; system dirs don't.
+    import os
+
+    from core_tools import real_list_files, real_search_in_files
+
+    (tmp_path / "player.py").write_text("# music player\nimport pygame\n", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("hello", encoding="utf-8")
+
+    listed = real_list_files(str(tmp_path))
+    assert listed.status == "ok"
+    names = list(listed.data or [])
+    assert "player.py" in names, names  # clean name, not a ..\..\ path
+
+    found = real_search_in_files("music", str(tmp_path))
+    assert found.status == "ok"
+    assert any("player.py" in hit for hit in (found.data or []))
+
+    # protected system locations stay refused even as read targets
+    refused = real_list_files(os.environ.get("SYSTEMROOT", r"C:\Windows"))
+    assert refused.status == "error"
+    refused_search = real_search_in_files("x", os.environ.get("SYSTEMROOT", r"C:\Windows"))
+    assert refused_search.status == "error"
+
+
+def test_tool_progress_notifier_never_forwards_raw_errors():
+    # A mid-task tool error is internal; the runtime composes ONE in-voice final reply. Forwarding
+    # raw errors leaked 「search_in_files 這一步失敗了：... can only search inside workspace」.
+    import inspect
+
+    import main
+
+    source = inspect.getsource(main.TelegramGateway._tool_notifier_for)
+    code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+    assert "這一步失敗了" not in code, "raw tool errors must not be sent to the owner"

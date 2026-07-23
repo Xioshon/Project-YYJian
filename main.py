@@ -656,11 +656,10 @@ class TelegramGateway:
         "search_in_files": "正在搜尋檔案內容...",
     }
     _PROGRESS_MAX_LINES = 6
-    _PROGRESS_MAX_ERRORS = 2
     _PROGRESS_REPEAT_GAP_SECONDS = 20.0
 
     def _tool_notifier_for(self, message):
-        progress = {"lines": 0, "errors": 0, "last_label": "", "last_at": 0.0}
+        progress = {"lines": 0, "last_label": "", "last_at": 0.0}
 
         def notify(tool_name, args, state="start", result=None):
             try:
@@ -679,19 +678,11 @@ class TelegramGateway:
                         f"_{html.escape(label)}_",
                         parse_mode="Markdown",
                     )
-                elif state == "end" and result and getattr(result, "status", "") == "error":
-                    if getattr(result, "error_category", "") == "transient" or getattr(result, "retryable", False):
-                        return
-                    if progress["errors"] >= self._PROGRESS_MAX_ERRORS:
-                        return
-                    progress["errors"] += 1
-                    detail = html.escape(str(getattr(result, "error", "") or getattr(result, "message", ""))[:400])
-                    self._telegram_call_best_effort(
-                        self.bot.send_message,
-                        message.chat.id,
-                        f"`{tool_name}` 這一步失敗了：{detail}",
-                        parse_mode="Markdown",
-                    )
+                # A mid-task tool error is an INTERNAL event, never owner-facing. The workflow
+                # engine retries/replans, and the runtime composes ONE in-voice reply for the final
+                # outcome. Forwarding the raw error leaked 「search_in_files 這一步失敗了：... can
+                # only search inside workspace」 straight into chat (live 2026-07-23) - exactly the
+                # kind of runtime detail the owner should never see.
             except Exception:
                 pass
 

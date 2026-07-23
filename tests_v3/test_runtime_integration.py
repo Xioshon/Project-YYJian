@@ -211,7 +211,7 @@ def test_owner_reply_never_exposes_internal_control_plane_terms(runtime_root) ->
     assert reply == "我還沒拿到結果，先停一下。"
 
 
-def test_v3_tool_notifier_narrates_significant_tools_with_dedupe_and_honest_errors(runtime_root) -> None:
+def test_v3_tool_notifier_narrates_progress_but_never_forwards_raw_errors(runtime_root) -> None:
     class FakeBot:
         def __init__(self):
             self.actions = []
@@ -235,14 +235,14 @@ def test_v3_tool_notifier_narrates_significant_tools_with_dedupe_and_honest_erro
     notify("capture_screen", {}, "start", None)
     # A tool without an owner-facing label stays typing-only.
     notify("update_profile", {}, "start", None)
-    # Retryable/transient errors stay quiet (the runtime retries them); real failures are reported.
-    notify("click_ui_element", {}, "end", V3ToolResult("error", "failed", error="transient blip", retryable=True))
-    notify("click_ui_element", {}, "end", V3ToolResult("error", "failed", error="element gone"))
+    # A real tool failure is INTERNAL now (2026-07-23): the workflow engine retries/replans and the
+    # runtime composes one in-voice final reply. Forwarding the raw error leaked
+    # 「search_in_files 這一步失敗了：... can only search inside workspace」 into chat.
+    notify("search_in_files", {}, "end", V3ToolResult("error", "failed", error="can only search inside workspace"))
 
     texts = [text for _chat, text in gateway.bot.messages]
-    assert texts[0] == "_正在點擊介面..._"
-    assert texts[1] == "_正在截取畫面..._"
-    assert len(texts) == 3 and "element gone" in texts[2]
+    assert texts == ["_正在點擊介面..._", "_正在截取畫面..._"]
+    assert not any("workspace" in t or "失敗" in t for t in texts), "raw tool errors must never reach the owner"
     assert ("owner", "typing") in gateway.bot.actions
 
 

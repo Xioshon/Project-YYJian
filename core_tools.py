@@ -429,11 +429,20 @@ def real_execute_python(code: str, timeout: int = 30) -> ToolResult:
 
 
 def real_search_in_files(keyword: str, directory: str = ".") -> ToolResult:
+    # Reads reach absolute paths, matching read_file (2026-07-23): the owner asked to find a file
+    # in Downloads and this failed with "can only search inside workspace", leaking a raw internal
+    # error into chat. Searching is strictly less dangerous than the writes already permitted;
+    # protected system locations stay off-limits.
     target_dir = resolve_path(directory)
-    if not is_workspace_path(target_dir):
+    if not is_workspace_path(target_dir) and not os.path.isabs(directory):
         return _error("search_in_files can only search inside workspace.")
+    if is_protected_system_path(target_dir):
+        return _error("That path is a protected system location; I will not search it.")
     if not os.path.exists(target_dir):
         return _error("Directory not found.")
+    # Show results relative to the SEARCHED dir when it's outside the workspace, so a Downloads
+    # hit reads as "player.py" not "..\..\..\Users\...\player.py".
+    base = WORKSPACE_DIR if is_workspace_path(target_dir) else target_dir
     results = []
     valid_extensions = {".py", ".txt", ".md", ".json", ".js", ".html", ".css", ".yml", ".yaml"}
     try:
@@ -447,7 +456,7 @@ def real_search_in_files(keyword: str, directory: str = ".") -> ToolResult:
                     with open(path, encoding="utf-8", errors="replace") as file:
                         for number, line in enumerate(file, 1):
                             if keyword.casefold() in line.casefold():
-                                results.append(f"{os.path.relpath(path, WORKSPACE_DIR)}:{number}: {line.strip()}")
+                                results.append(f"{os.path.relpath(path, base)}:{number}: {line.strip()}")
                                 if len(results) >= 100:
                                     return _ok("Search results truncated.", results)
                 except Exception:
@@ -459,6 +468,8 @@ def real_search_in_files(keyword: str, directory: str = ".") -> ToolResult:
 
 def real_list_files(directory: str = ".", recursive: bool = False, max_results: int = 200) -> ToolResult:
     target_dir = resolve_path(directory)
+    if is_protected_system_path(target_dir):
+        return _error("That path is a protected system location; I will not list it.")
     if not os.path.exists(target_dir):
         return _error("Path not found.")
     if not os.path.isdir(target_dir):
@@ -467,6 +478,9 @@ def real_list_files(directory: str = ".", recursive: bool = False, max_results: 
         max_results = max(1, min(int(max_results), 1000))
     except Exception:
         max_results = 200
+    # Show names relative to the LISTED dir when it's outside the workspace, so a Downloads listing
+    # reads as "player.py" not "..\..\..\Users\...\player.py".
+    base = WORKSPACE_DIR if is_workspace_path(target_dir) else target_dir
     results = []
     try:
         if recursive:
@@ -474,7 +488,7 @@ def real_list_files(directory: str = ".", recursive: bool = False, max_results: 
                 dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
                 for name in sorted(dirs + files):
                     path = os.path.join(root, name)
-                    results.append(os.path.relpath(path, WORKSPACE_DIR) + ("/" if os.path.isdir(path) else ""))
+                    results.append(os.path.relpath(path, base) + ("/" if os.path.isdir(path) else ""))
                     if len(results) >= max_results:
                         return _ok("File list truncated.", results)
         else:
@@ -482,7 +496,7 @@ def real_list_files(directory: str = ".", recursive: bool = False, max_results: 
                 if name.startswith(".") or name == "__pycache__":
                     continue
                 path = os.path.join(target_dir, name)
-                results.append(os.path.relpath(path, WORKSPACE_DIR) + ("/" if os.path.isdir(path) else ""))
+                results.append(os.path.relpath(path, base) + ("/" if os.path.isdir(path) else ""))
                 if len(results) >= max_results:
                     return _ok("File list truncated.", results)
         return _ok("File list completed.", results)
