@@ -13,13 +13,15 @@ from typing import Any
 
 from agent_protocol import classify_approval, extract_primary_message
 from core_tools import AgentTool, ToolResult, env_value
+from owner_language import SIMPLIFIED
 from skill_engine import SkillContext, execute_skill, skill_tools
 from voice_contract import (
-    VOICE_REGISTER_EN,
     owner_text_is_simplified,
     repair_nod_idiom,
     repair_taiwan_particles,
+    voice_register_en,
     voice_register_violation,
+    voice_register_zh,
 )
 
 from .context import (
@@ -387,18 +389,43 @@ class YueYueRuntimeV3:
                     [],
                     model=_chat_voice_model(),
                 )
-                reply = _drop_trailing_full_stop(to_traditional_script(_clean_reply(response.content)))
+                reply = _drop_trailing_full_stop(self._in_owner_script(_clean_reply(response.content)))
             except Exception:
                 return ""
             if (
                 reply
                 and len(reply) <= 120
-                and not voice_register_violation(reply)
+                and not voice_register_violation(reply, allow_simplified=self._language() == SIMPLIFIED)
                 and not self._opener_leaks_meta(reply)
             ):
                 return reply
             prompt = instruction + "\n（你剛才那句不合適，重寫一句更自然、更短、字感乾淨的開場白）"
         return ""
+
+    def _language(self) -> str:
+        """The owner's CONFIGURED language code, or "" when they never set one.
+
+        "" is not the same as zh-Hant: an unset owner keeps the legacy detect-the-owner's-script-
+        and-mirror-it path, so adding the language setting changed nothing for anyone who has not
+        used it."""
+        try:
+            return self.context.owner_language()
+        except Exception:
+            return ""
+
+    def _in_owner_script(self, reply: str, language: str | None = None) -> str:
+        """Render a FINISHED reply in the owner's configured script.
+
+        This is not the old mirroring. Nothing is detected: the script comes from a setting the
+        owner stated. It is a repair net, not the generation path - with 简体 configured, the
+        persona material and the reply directive are already Simplified, so YueYue writes
+        Simplified natively and this has nothing to fix. What it does cover is the Traditional
+        LITERALS this codebase still ships (deterministic fallbacks, canned failure lines), which
+        would otherwise reach a Simplified owner in the wrong script."""
+        language = self._language() if language is None else language
+        if language == SIMPLIFIED:
+            return to_simplified_script(reply)
+        return to_traditional_script(reply)
 
     def _chat_turn(self, turn: TurnEnvelope, tool_callback: Callable | None = None) -> str:
         # ROADMAP P6 v2 (native tool calling, the Claude architecture): every chat turn the model
@@ -450,7 +477,12 @@ class YueYueRuntimeV3:
             reply = self._apply_social_chat_reply_policy(turn.text, reply, grounded=grounded)
             reply = _drop_trailing_full_stop(reply)
             reply = self._deduplicate_emoji_against_recent(turn.chat_id, reply)
-            if owner_script_is_simplified_with_history(turn.text, self.context.short_context, turn.chat_id):
+            # Legacy path ONLY. Once the owner has stated a language, _apply_social_chat_reply_policy
+            # already rendered the reply in it and there is nothing left to guess - which is the
+            # whole point of the setting.
+            if not self._language() and owner_script_is_simplified_with_history(
+                turn.text, self.context.short_context, turn.chat_id
+            ):
                 reply = to_simplified_script(reply)
         self.context.remember(turn, reply)
         self._emit("turn.replied", turn.turn_id, {"mode": turn.mode.value, "reply": reply[:500]})
@@ -601,12 +633,14 @@ class YueYueRuntimeV3:
                 [],
                 model=_chat_voice_model(),
             )
-            reply = _drop_trailing_full_stop(to_traditional_script(_clean_reply(response.content)))
-            if reply and not voice_register_violation(reply):
+            reply = _drop_trailing_full_stop(self._in_owner_script(_clean_reply(response.content)))
+            if reply and not voice_register_violation(
+                reply, allow_simplified=self._language() == SIMPLIFIED
+            ):
                 return reply
         except Exception:
             pass
-        return f"主人，時間到囉，該「{text}」了"
+        return self._in_owner_script(f"主人，時間到囉，該「{text}」了")
 
     def _post_completion_veto(self, workflow: WorkflowState) -> str:
         """Return a veto reason when the outputs plainly do not answer the objective, else "".
@@ -707,12 +741,20 @@ class YueYueRuntimeV3:
     def _apply_social_chat_reply_policy(
         self, owner_text: str, reply: str, grounded: bool = False
     ) -> str:
-        # Simplified leaks are mechanically repairable - fix them BEFORE gating instead of
-        # burning a regeneration (and possibly the canned fallback) on them. If the owner is
-        # typing Simplified, the mirroring step after this converts the reply back anyway.
-        reply = to_traditional_script(reply)
+        # Script leaks are mechanically repairable - fix them BEFORE gating instead of burning a
+        # regeneration (and possibly the canned fallback) on them. Which direction to repair comes
+        # from the owner's language setting; with none set, the reply is normalised to Traditional
+        # and the mirroring step after this converts it back if the owner is typing Simplified.
+        language = self._language()
+        allow_simplified = language == SIMPLIFIED
+        reply = self._in_owner_script(reply, language)
         reply = repair_nod_idiom(repair_taiwan_particles(reply))
-        if not _chat_reply_violates_social_policy(reply, owner_text, grounded):
+        # repair_nod_idiom writes its replacement in Traditional (one replacement string, not one
+        # per script); put the reply back in the owner's script if it just introduced one.
+        reply = self._in_owner_script(reply, language)
+        if not _chat_reply_violates_social_policy(
+            reply, owner_text, grounded, allow_simplified=allow_simplified
+        ):
             return reply
         # Most violations are a pure length overrun (the model's own reaction was on-topic, just a
         # line or two too long) rather than banned/leaked content. Prefer trimming the model's real
@@ -720,13 +762,19 @@ class YueYueRuntimeV3:
         # canned fallback text is a last resort, not the default outcome of going one line over.
         for max_lines in ((3, 2) if grounded else (2, 1)):
             truncated = _truncate_chat_reply(reply, max_lines)
-            if truncated and not _chat_reply_violates_social_policy(truncated, owner_text, grounded):
+            if truncated and not _chat_reply_violates_social_policy(
+                truncated, owner_text, grounded, allow_simplified=allow_simplified
+            ):
                 return truncated
         # Truncation alone didn't fix it (e.g. the violation is banned/leaked wording, not just
         # length) - ask the model to rewrite its own reply within the constraint instead of
         # silently replacing its real answer with a scripted line.
-        regenerated = self._regenerate_compliant_chat_reply(owner_text, reply)
-        if regenerated and not _chat_reply_violates_social_policy(regenerated, owner_text, grounded):
+        regenerated = self._in_owner_script(
+            self._regenerate_compliant_chat_reply(owner_text, reply), language
+        )
+        if regenerated and not _chat_reply_violates_social_policy(
+            regenerated, owner_text, grounded, allow_simplified=allow_simplified
+        ):
             return regenerated
         # Trace the surrender so live fallbacks are diagnosable (what did the model try to say?).
         self._emit(
@@ -734,7 +782,8 @@ class YueYueRuntimeV3:
             "",
             {"owner_text": owner_text[:200], "rejected_reply": reply[:300]},
         )
-        return _social_chat_fallback(owner_text)
+        # The pooled fallbacks are Traditional literals - render them in the owner's language.
+        return self._in_owner_script(_social_chat_fallback(owner_text), language)
 
     def _regenerate_compliant_chat_reply(self, owner_text: str, reply: str) -> str:
         if _denies_a_capability_she_has(reply):
@@ -745,16 +794,23 @@ class YueYueRuntimeV3:
                 "重新回一句：直接說你可以幫忙，問主人要不要現在就去做，別說自己做不到。"
             )
         else:
+            # "wrong script" is only a defect on the Traditional side - an owner who set 简体 is
+            # SUPPOSED to get Simplified, so naming it as a fault here would push the model to
+            # rewrite a correct reply into the wrong language.
+            language = self._language()
+            wrong_script = "/繁體字" if language == SIMPLIFIED else "/簡體字"
             critique = (
-                "你剛剛的回覆太長、用錯了字感（台味語尾/粵語口語字/簡體字），"
+                f"你剛剛的回覆太長、用錯了字感（台味語尾/粵語口語字{wrong_script}），"
                 "或裡面提到了不該對主人講的內部詞（例如流程、系統、內部規則）。"
                 "重新回一句自然的短回覆，不要提到流程、系統、內部規則、任何開發或除錯用語。"
             )
         prompt = (
             f"{critique}"
-            "請用你自己的語氣，一到兩句話，不要換行超過一次，"
-            "用香港書面繁體+內地網聊語感，別用「喔/喲/耶」收尾，別寫「嘅/喺/㗎/唔/冇」這類粵語字。\n"
-            f"主人剛剛說：{owner_text}\n"
+            "請用你自己的語氣，一到兩句話，不要換行超過一次。\n"
+            # The register comes from voice_contract, the single source of truth, instead of a
+            # hand-copied paraphrase that would have to be duplicated per language.
+            + voice_register_zh(self._language())
+            + f"\n主人剛剛說：{owner_text}\n"
             f"你原本想回：{reply}"
         )
         try:
@@ -842,7 +898,10 @@ class YueYueRuntimeV3:
         return self._finish_screen_observe(turn, reply)
 
     def _finish_screen_observe(self, turn: TurnEnvelope, reply: str) -> str:
-        if owner_script_is_simplified_with_history(turn.text, self.context.short_context, turn.chat_id):
+        language = self._language()
+        if language:
+            reply = self._in_owner_script(reply, language)
+        elif owner_script_is_simplified_with_history(turn.text, self.context.short_context, turn.chat_id):
             reply = to_simplified_script(reply)
         self.context.remember(turn, reply)
         self._emit("turn.replied", turn.turn_id, {"mode": "screen_observe", "reply": reply[:500]})
@@ -1429,9 +1488,16 @@ class YueYueRuntimeV3:
         return {"actions_taken": actions[-12:], "artifacts": artifacts[:6]}
 
     def _compose_owner_voice(self, event: str, facts: dict[str, Any], fallback: str) -> str:
+        language = self._language()
+        allow_simplified = language == SIMPLIFIED
         prompt = (
-            "Write one concise owner-facing YueYue reply in natural Traditional Chinese. "
-            + VOICE_REGISTER_EN
+            (
+                "Write one concise owner-facing YueYue reply in natural SIMPLIFIED Chinese "
+                "(简体中文) - that is the language the owner set. "
+                if allow_simplified
+                else "Write one concise owner-facing YueYue reply in natural Traditional Chinese. "
+            )
+            + voice_register_en(language)
             + " Use only the supplied facts. "
             "Do not mention runtime, policy, workflow, TaskGraph, internal tools, or hidden reasoning. "
             "Do not add recommendations that are not in the facts. "
@@ -1463,11 +1529,14 @@ class YueYueRuntimeV3:
                 # Owner-voice lines are persona speech, not planning - they follow the chat
                 # voice model so the register/tone stays consistent across chat and task turns.
                 response = self.provider.chat(messages, [], model=_chat_voice_model())
-                candidate = to_traditional_script(_clean_reply(response.content))
+                candidate = self._in_owner_script(_clean_reply(response.content), language)
                 # Same deterministic repairs the chat path applies before ITS gate: a stray Taiwan
                 # particle or the owner-disliked 「等你點頭」 idiom is a mechanical slip, not a wrong
                 # answer, and rejecting it here would burn a retry or drop to a canned fallback.
-                candidate = repair_nod_idiom(repair_taiwan_particles(candidate))
+                # Re-normalised after, because repair_nod_idiom substitutes a Traditional phrase.
+                candidate = self._in_owner_script(
+                    repair_nod_idiom(repair_taiwan_particles(candidate)), language
+                )
                 if not candidate:
                     critique = "\nYour previous attempt was empty. Write the reply."
                     continue
@@ -1480,18 +1549,25 @@ class YueYueRuntimeV3:
                 # Register gate: task-voice replies had no output-side enforcement, which is how
                 # spoken Cantonese (嘅/喺/㗎) leaked into a live task reply on 2026-07-12. The
                 # fallbacks are all clean written Traditional, so falling back is always safe.
-                violation = voice_register_violation(candidate)
+                violation = voice_register_violation(candidate, allow_simplified=allow_simplified)
                 if violation:
+                    target = (
+                        "standard written Simplified Chinese (简体中文), no Taiwan-flavored final "
+                        "particles, no spoken Cantonese, no Traditional"
+                        if allow_simplified
+                        else "standard written Traditional Chinese (香港書面繁體), no Taiwan-flavored "
+                        "final particles, no spoken Cantonese, no Simplified"
+                    )
                     critique = (
                         f"\nYour previous attempt violated the register ({violation}). Rewrite it in "
-                        "standard written Traditional Chinese (香港書面繁體), no Taiwan-flavored final "
-                        "particles, no spoken Cantonese, no Simplified:\n" + candidate[:200]
+                        f"{target}:\n" + candidate[:200]
                     )
                     continue
                 return candidate
             except Exception:
                 break
-        return fallback
+        # Every caller's fallback is a Traditional literal - render it in the owner's language.
+        return self._in_owner_script(fallback, language)
 
     def _execution_instruction(self, workflow: WorkflowState, allowed: list[str]) -> str:
         step = workflow.current_step()
@@ -2185,17 +2261,34 @@ def _estimated_telegram_bubbles(text: str) -> list[str]:
     return parts
 
 
+def _both_scripts(text: str) -> str:
+    """The text plus its Traditional rendering, joined - a haystack that matches a marker written
+    in either script. Every marker list in this module is written in Traditional (some with a
+    hand-added Simplified twin), so a natively-Simplified reply - which is what an owner who set
+    简体 now gets - would slip past all of them. Searching the shadow too fixes every list at once
+    instead of doubling each list by hand, which is the growth this project keeps removing."""
+    value = str(text or "").casefold()
+    try:
+        shadow = to_traditional_script(value)
+    except Exception:
+        return value
+    return value if shadow == value else value + "\n" + shadow
+
+
 def _chat_reply_violates_social_policy(
-    reply: str, owner_text: str = "", grounded: bool = False
+    reply: str, owner_text: str = "", grounded: bool = False, allow_simplified: bool = False
 ) -> bool:
     """grounded=True means this reply is REPORTING a real skill/runtime result the owner directly
     asked for (task list, reminders, search hit). Those answers are allowed to be a line longer and
     to use capability words, because the leak rules exist to stop UNPROMPTED meta chatter - not to
     censor an answer the owner requested. Live 2026-07-22: 「現在有什麼任務」 got its honest answer
-    guillotined mid-list one time and replaced by a canned line the next."""
+    guillotined mid-list one time and replaced by a canned line the next.
+
+    allow_simplified=True when the reply is legitimately Simplified because the owner SET 简体 as
+    their language - then raw Simplified is the point, not a leak."""
     value = str(reply or "")
-    lowered = value.casefold()
-    owner_lowered = str(owner_text or "").casefold()
+    lowered = _both_scripts(value)
+    owner_lowered = _both_scripts(owner_text)
     if not value.strip():
         return True
     lines = _estimated_telegram_bubbles(value)
@@ -2259,10 +2352,13 @@ def _chat_reply_violates_social_policy(
     if value.count("\u55b5") > 2:
         return True
     # Owner register gate (voice_contract): Taiwan-flavored final particles, spoken-Cantonese
-    # characters, or raw Simplified (unless the owner's own message is Simplified - script
-    # mirroring is deliberate). Violations flow into the same truncate/regenerate/fallback
-    # pipeline as every other quality breach.
-    if voice_register_violation(value, allow_simplified=owner_text_is_simplified(owner_text)):
+    # characters, or raw Simplified - unless Simplified is deliberate, either because the owner SET
+    # 简体 as their language (allow_simplified) or, on the legacy unset-language path, because their
+    # own message is Simplified and the reply mirrors it. Violations flow into the same
+    # truncate/regenerate/fallback pipeline as every other quality breach.
+    if voice_register_violation(
+        value, allow_simplified=allow_simplified or owner_text_is_simplified(owner_text)
+    ):
         return True
     # Too many sentence-enders reads as choppy/over-punctuated - but a soft trailing ellipsis
     # (\u3002\u3002\u3002 / \u2026 / ~~~), which the owner's preferred tender cadence uses, is one stylistic beat,

@@ -9,7 +9,30 @@ from typing import Any
 
 from chat_text_sanitizers import _is_plain_greeting_text
 from core_tools import env_value
-from voice_contract import VOICE_REGISTER_ZH, repair_simplified_script, voice_register_violation
+from owner_language import SIMPLIFIED, read_language
+from voice_contract import repair_simplified_script, voice_register_violation, voice_register_zh
+
+
+def _owner_language() -> str:
+    """The owner's configured language, read fresh - a switch must apply to the very next reply."""
+    return read_language()
+
+
+def _reply_script_instruction(language: str) -> str:
+    """The 'write in this language' line for these short fast-path prompts."""
+    return "用简体中文" if language == SIMPLIFIED else "用繁體中文"
+
+
+def _normalize_script(text: str, language: str) -> str:
+    """Repair a stray-script leak in a fast-path line, in whichever direction the owner set."""
+    if language != SIMPLIFIED:
+        return repair_simplified_script(text)
+    try:
+        from yueyue_v3.context import to_simplified_script
+
+        return to_simplified_script(text)
+    except Exception:
+        return text
 
 
 def _hits_blocked_phrase(value: str) -> bool:
@@ -471,7 +494,7 @@ def _is_valid_micro_plain_greeting(text: str, recent: list[str]) -> bool:
         return False
     if _has_overexplained_social_wording(value):
         return False
-    if voice_register_violation(value):
+    if voice_register_violation(value, allow_simplified=_owner_language() == SIMPLIFIED):
         return False
     key = _social_similarity_key(value)
     if not key:
@@ -512,10 +535,11 @@ def _model_chat_without_tools(agent: Any, messages: list[dict[str, str]]) -> str
 
 def _generated_greeting_prompt(owner_prompt: str, recent: list[str]) -> list[dict[str, str]]:
     recent_lines = [str(item or "").strip() for item in recent[-4:] if str(item or "").strip()]
+    language = _owner_language()
     system = (
         "你是月月，只回輕短寒暄。\n"
-        "用繁體中文。一句話，28字以內，不換行。\n"
-        f"{VOICE_REGISTER_ZH}\n"
+        f"{_reply_script_instruction(language)}。一句話，28字以內，不換行。\n"
+        f"{voice_register_zh(language)}\n"
         "語氣短、口語、俏皮、微傲嬌，有一點黏但不要曖昧。\n"
         # Positive framing on purpose: an earlier version spelled out the disliked words here, and
         # naming a token inside a prohibition makes a model MORE likely to emit it.
@@ -568,7 +592,7 @@ def _is_valid_generated_greeting(text: str, recent: list[str]) -> bool:
         return False
     if _has_overexplained_social_wording(value):
         return False
-    if voice_register_violation(value):
+    if voice_register_violation(value, allow_simplified=_owner_language() == SIMPLIFIED):
         return False
     normalized = re.sub(r"[\s\u3000\uff0c,.\u3002!！?？~～]+", "", value.casefold())
     if normalized in {"hi", "hello", "嗨", "你好", "hi你好"}:
@@ -595,9 +619,10 @@ def _greeting_rejection_reason(text: str, recent: list[str]) -> str:
     hits = [phrase for phrase in GENERATED_GREETING_BAD_PHRASES if phrase.casefold() in lowered]
     if hits:
         return "用了太熟口熟面的罐頭字眼（" + "、".join(hits[:2]) + "），換個自然說法"
-    violation = voice_register_violation(value)
+    violation = voice_register_violation(value, allow_simplified=_owner_language() == SIMPLIFIED)
     if violation:
-        return "字感不對（" + violation + "），用香港書面繁體，別用台味語尾或粵語口語字"
+        target = "用简体中文书面语" if _owner_language() == SIMPLIFIED else "用香港書面繁體"
+        return "字感不對（" + violation + "），" + target + "，別用台味語尾或粵語口語字"
     if _social_similarity_key(value) and _social_similarity_key(value) in {
         _social_similarity_key(item) for item in recent[-6:]
     }:
@@ -613,7 +638,7 @@ def _compose_generated_plain_greeting(agent: Any, owner_prompt: str, recent: lis
             return ""
         text = str(raw or "").strip()
         text = re.sub(r"^['\"「『]+|['\"」』]+$", "", text).strip()
-        text = repair_simplified_script(text)
+        text = _normalize_script(text, _owner_language())
         if _is_valid_generated_greeting(text, recent):
             return text
         # Retry once with a named critique before surrendering to the pooled fallback.
@@ -642,7 +667,7 @@ def _compose_generated_short_line(agent: Any, system: str, user: str, recent: li
             return ""
         text = str(raw or "").strip()
         text = re.sub(r"^['\"「『]+|['\"」』]+$", "", text).strip()
-        text = repair_simplified_script(text)
+        text = _normalize_script(text, _owner_language())
         if _is_valid_micro_plain_greeting(text, recent):
             return text
         prompt = user + f"\n你剛寫的「{text[:40]}」被拒：{_greeting_rejection_reason(text, recent)}。"
@@ -766,9 +791,9 @@ def _compose_wake_greeting_reply(
     mismatched = bool(bucket and bucket != "morning")
     system = (
         "你是月月，主人剛打招呼說睡醒了/早安。\n"
-        '用繁體中文回一句自然短句，20字以內，不換行，語氣傲嬌帶點關心，不要說教。'
+        f'{_reply_script_instruction(_owner_language())}回一句自然短句，20字以內，不換行，語氣傲嬌帶點關心，不要說教。'
         "\n不要提到系統、流程、時間感知這類詞。"
-        f"\n{VOICE_REGISTER_ZH}"
+        f"\n{voice_register_zh(_owner_language())}"
     )
     if mismatched:
         system += f"\n主人說的是早安，但現在真實時段其實是「{label}」，不是早上。用真實時段自然吐槽他睡太久，不要順著他說早安。"
@@ -812,6 +837,7 @@ def compose_fast_reply(
     facts = dict(facts or {})
     fallback = dict(fallback or {"content": ""})
     recent = _load_recent()
+    language = _owner_language()
 
     if kind == "plain_greeting":
         if plain_greeting_social_generation_enabled:
@@ -842,7 +868,7 @@ def compose_fast_reply(
         sticker_marker = str(facts.get("sticker_marker") or "").strip()
 
         generated = _compose_generated_short_line(
-            agent, f'你是月月。你要把一張表情包發給主人，附一句自然的短話。用繁體中文，20字以內，不換行，語氣傲嬌但帶點寵溺，不要描述圖片內容，不要說這張圖片。{VOICE_REGISTER_ZH}', f'主人說：{owner_prompt}。自然回一句配這張表情包。', recent
+            agent, f'你是月月。你要把一張表情包發給主人，附一句自然的短話。{_reply_script_instruction(language)}，20字以內，不換行，語氣傲嬌但帶點寵溺，不要描述圖片內容，不要說這張圖片。{voice_register_zh(language)}', f'主人說：{owner_prompt}。自然回一句配這張表情包。', recent
         )
         text, content = _compose_sticker_content(
             generated,
@@ -858,7 +884,7 @@ def compose_fast_reply(
         sticker_marker = str(facts.get("sticker_marker") or "").strip()
 
         generated = _compose_generated_short_line(
-            agent, f'你是月月。主人要你再補發一次表情包，附一句自然的短話。用繁體中文，20字以內，不換行，語氣傲嬌但帶點寵溺，不要描述圖片內容，不要說這張圖片。{VOICE_REGISTER_ZH}', f'主人說：{owner_prompt}。自然回一句配這張再補發的表情包。', recent
+            agent, f'你是月月。主人要你再補發一次表情包，附一句自然的短話。{_reply_script_instruction(language)}，20字以內，不換行，語氣傲嬌但帶點寵溺，不要描述圖片內容，不要說這張圖片。{voice_register_zh(language)}', f'主人說：{owner_prompt}。自然回一句配這張再補發的表情包。', recent
         )
         text, content = _compose_sticker_content(
             generated,
@@ -878,7 +904,7 @@ def compose_fast_reply(
 - 不要說已經發了。
 - 不要 Markdown。
 - 30 字以內，避免固定模板。
-- {VOICE_REGISTER_ZH}
+- {voice_register_zh(language)}
 - 不要重複最近用過的句子：{recent[-5:]}
 
 使用者原句：{owner_prompt}
@@ -887,7 +913,7 @@ def compose_fast_reply(
         text = _ask_model(agent, prompt)
 
         bad = ["已經發", "已发", "[表情包", "發了", "发了"]
-        if text and voice_register_violation(text):
+        if text and voice_register_violation(text, allow_simplified=_owner_language() == SIMPLIFIED):
             text = ""
         if not text or any(x in text for x in bad):
             text = random.choice([

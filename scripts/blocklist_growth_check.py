@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
 import response_composer as rc  # noqa: E402
 import yueyue_v3.context as ctx  # noqa: E402
 import yueyue_v3.runtime as rt  # noqa: E402
+from scripts import generate_persona_locales as locales  # noqa: E402
 
 # This guard exists because response-quality tuning kept growing these reject/marker
 # lists cycle after cycle without anyone stepping back to ask whether the *prompt*
@@ -44,6 +45,12 @@ BASELINE: dict[str, tuple[object, int]] = {
     "context.WORKFLOW_APPROVAL_MARKERS": (ctx.WORKFLOW_APPROVAL_MARKERS, 10),
     "context.WORKFLOW_ERROR_MARKERS": (ctx.WORKFLOW_ERROR_MARKERS, 10),
     "response_composer.GENERATED_GREETING_BAD_PHRASES": (rc.GENERATED_GREETING_BAD_PHRASES, 143),
+    # The per-language persona glossary and its adjudication record. Tracked here for the same
+    # reason as everything above: each entry is a judgement call, and judgement calls must
+    # accumulate visibly. Both are DERIVED from `generate_persona_locales.py --audit`, so growth
+    # should follow a measurement, never a hunch.
+    "locales.GLOSSARY[zh-Hans]": (locales._LOCALE_GLOSSARY["zh-Hans"], 2),
+    "locales.AUDIT_REJECTED[zh-Hans]": (locales._AUDIT_REJECTED["zh-Hans"], 5),
 }
 
 failed = 0

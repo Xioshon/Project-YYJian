@@ -12,7 +12,8 @@ from typing import Any
 from agent_hooks import emit_trace
 from agent_llm import SiliconFlowAdapter
 from core_tools import PROJECT_CACHE_DIR, env_value
-from voice_contract import VOICE_REGISTER_ZH, repair_simplified_script, voice_register_violation
+from owner_language import SIMPLIFIED, read_language
+from voice_contract import repair_simplified_script, voice_register_violation, voice_register_zh
 
 PRESENCE_MODE_ENV = "YUEYUE_PRESENCE_MODE"
 PRESENCE_DAILY_LIMIT_ENV = "YUEYUE_PRESENCE_DAILY_LIMIT"
@@ -258,8 +259,15 @@ class PresenceComposer:
         opportunity: PresenceOpportunity,
         recent_candidates: list[PresenceCandidate] | None = None,
     ) -> PresenceQualityDecision:
-        # Simplified leaks are mechanically repairable - fix before gating instead of rejecting.
-        draft.message = repair_simplified_script(draft.message or "")
+        # Script leaks are mechanically repairable - fix before gating instead of rejecting. The
+        # direction comes from the owner's language setting; with none set this is unchanged.
+        language = read_language()
+        if language == SIMPLIFIED:
+            from yueyue_v3.context import to_simplified_script
+
+            draft.message = to_simplified_script(draft.message or "")
+        else:
+            draft.message = repair_simplified_script(draft.message or "")
         message = " ".join((draft.message or "").split())
         recent_candidates = recent_candidates or []
         recent_sent = self.recent_topic_history(limit=12)
@@ -284,7 +292,9 @@ class PresenceComposer:
             return PresenceQualityDecision(False, "generic_checkin_without_context", checks=checks)
         if any(marker in lowered for marker in FORMAL_MESSAGE_MARKERS):
             return PresenceQualityDecision(False, "too_formal_or_notification_like", checks=checks)
-        register_violation = voice_register_violation(message)
+        register_violation = voice_register_violation(
+            message, allow_simplified=read_language() == SIMPLIFIED
+        )
         if register_violation:
             checks["register_violation"] = register_violation
             return PresenceQualityDecision(False, "voice_register_violation", checks=checks)
@@ -316,7 +326,7 @@ class PresenceComposer:
         prompt = self._build_prompt(opportunity, short_context, recent_candidates)
         response = llm.chat_with_tools(
             [
-                {"role": "system", "content": PRESENCE_COMPOSER_SYSTEM_PROMPT},
+                {"role": "system", "content": presence_composer_system_prompt(read_language())},
                 {"role": "user", "content": prompt},
             ],
             [],
@@ -781,17 +791,30 @@ BLAND_MESSAGE_MARKERS = ["你還好嗎", "你还好吗", "今天怎麼樣", "今
 FORMAL_MESSAGE_MARKERS = ["通知", "提醒您", "根據目前", "系统", "系統", "待命狀態", "presence", "runtime", "任務狀態"]
 TOOL_PROMISE_MARKERS = ["我幫你跑", "我帮你跑", "我去執行", "我去执行", "工具", "截圖", "截图", "命令"]
 
-PRESENCE_COMPOSER_SYSTEM_PROMPT = (
-    "你是月月的主動陪伴訊息 composer。\n"
-    "你的任務不是發通知，而是判斷此刻有沒有一句值得主人回的短消息。\n"
-    "人格方向：親近、熟、偏女友/伴侶式陪伴，可以可愛、好奇、輕微調侃，但不要客服腔、報告腔、任務腔。\n"
-    + VOICE_REGISTER_ZH
-    + "\n如果沒有具體語境或好話題，請輸出 should_send=false。\n"
-    "如果 reason 是 long_silence_icebreak，代表主人很久沒回；可以開一個輕、小、有趣的新話題，但不要質問、不要查崗、不要讓人有壓力。\n"
-    "只輸出 JSON，格式：\n"
-    '{"should_send": true/false, "message": "繁體中文短句", "message_type": "followup|playful|care|share|icebreak|none", '
-    '"topic_source": "短話題來源", "confidence": 0.0-1.0, "reason": "簡短原因"}\n'
-)
+def presence_composer_system_prompt(language: str = "") -> str:
+    """The proactive-message composer prompt, in the owner's configured language.
+
+    Proactive messages are the one owner-facing line nobody asked for, so it especially must not
+    arrive in a language the owner did not choose."""
+    simplified = language == SIMPLIFIED
+    return (
+        "你是月月的主動陪伴訊息 composer。\n"
+        "你的任務不是發通知，而是判斷此刻有沒有一句值得主人回的短消息。\n"
+        "人格方向：親近、熟、偏女友/伴侶式陪伴，可以可愛、好奇、輕微調侃，但不要客服腔、報告腔、任務腔。\n"
+        + voice_register_zh(language)
+        + "\n如果沒有具體語境或好話題，請輸出 should_send=false。\n"
+        "如果 reason 是 long_silence_icebreak，代表主人很久沒回；可以開一個輕、小、有趣的新話題，但不要質問、不要查崗、不要讓人有壓力。\n"
+        "只輸出 JSON，格式：\n"
+        '{"should_send": true/false, "message": "'
+        + ("简体中文短句" if simplified else "繁體中文短句")
+        + '", "message_type": "followup|playful|care|share|icebreak|none", '
+        '"topic_source": "短話題來源", "confidence": 0.0-1.0, "reason": "簡短原因"}\n'
+    )
+
+
+# Traditional default, kept as a module constant because the register-sync guard and the presence
+# tests reference it directly. The live composer calls presence_composer_system_prompt(language).
+PRESENCE_COMPOSER_SYSTEM_PROMPT = presence_composer_system_prompt()
 
 
 def load_presence_health(path: str = PRESENCE_HEALTH_FILE) -> dict[str, Any]:

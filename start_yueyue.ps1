@@ -226,6 +226,7 @@ try {
         Invoke-Python -Python $Python -Arguments @("scripts\temporal_context_check.py")
         Invoke-Python -Python $Python -Arguments @("scripts\stability_check.py")
         Invoke-Python -Python $Python -Arguments @("scripts\blocklist_growth_check.py")
+        Invoke-Python -Python $Python -Arguments @("scripts\generate_persona_locales.py", "--check")
         Invoke-Python -Python $Python -Arguments @("scripts\watchdog_check.py")
         Invoke-Python -Python $Python -Arguments @("-m", "ruff", "check", "yueyue_v3", "tests_v3", "main.py", "agent_protocol.py", "scripts")
     } else {

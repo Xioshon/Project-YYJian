@@ -2,3 +2,8 @@
 pytest>=9,<10
 ruff>=0.15,<1
 
+# Dev-only: a SECOND regional-vocabulary converter, used purely as a detector by
+# scripts/generate_persona_locales.py --audit to re-derive the persona glossary. Deliberately not
+# in requirements.txt - measured 2026-08-04 that its Taiwan-source assumptions are wrong for this
+# owner's HK register, so it must never run against live replies.
+opencc-python-reimplemented>=0.1.7,<1

@@ -26,8 +26,9 @@ from chat_text_sanitizers import (  # noqa: F401
     _sanitize_context_text,
     is_benign_testing_note,
 )
+from owner_language import SIMPLIFIED, locale_suffix, read_language, reply_language_directive
 from temporal_context import build_temporal_snapshot
-from voice_contract import VOICE_REGISTER_ZH
+from voice_contract import voice_register_zh
 
 from .models import TurnEnvelope, TurnMode, WorkflowState
 from .storage import AtomicJsonStore
@@ -87,9 +88,22 @@ class ContextCompiler:
         # Optional long-term memory store (ROADMAP P2), attached by the runtime. None = no recall.
         self.memory = None
 
+    def owner_language(self) -> str:
+        """The owner's CHOSEN language code, or "" when they have never set one.
+
+        Read per prompt rather than cached: profile.json is tiny, and a language the owner just
+        switched has to take effect on the very next reply, not after a restart."""
+        return read_language(self.root)
+
     def system_prompt(self, mode: TurnMode, include_samples: bool | None = None) -> str:
-        personality = self._read("workspace/brain/personality.md", 6500)
-        rules = self._read("workspace/brain/rules.md", 3200)
+        language = self.owner_language()
+        # Persona material is per-language DATA, not a runtime conversion of one master copy:
+        # workspace/brain/personality.zh-Hans.md is a real file YueYue reads natively when the
+        # owner set 简体. Missing locale files fall back to the Traditional source, so a language
+        # whose material has not been generated yet degrades to today's behaviour instead of
+        # emptying the persona.
+        personality = self._read_localized("workspace/brain/personality.md", language, 6500)
+        rules = self._read_localized("workspace/brain/rules.md", language, 3200)
         profile = self._read_profile()
         # Persona samples ship to chat/social always, and to any OWNER-FACING generation that
         # opts in (include_samples=True: permission asks, result replies, opener, reminders).
@@ -99,7 +113,11 @@ class ContextCompiler:
         # calls, not owner lines), so this costs nothing where tokens are expensive.
         if include_samples is None:
             include_samples = mode in {TurnMode.CHAT, TurnMode.SOCIAL}
-        samples = self._read("workspace/brain/personality_samples.md", 4200) if include_samples else ""
+        samples = (
+            self._read_localized("workspace/brain/personality_samples.md", language, 4200)
+            if include_samples
+            else ""
+        )
         mode_rules = {
             # Deliberately lean and positive: the samples above show HOW she talks, and the
             # output-side gate (runtime._chat_reply_violates_social_policy) already enforces the
@@ -112,7 +130,7 @@ class ContextCompiler:
                 "你在跟熟悉的主人閒聊，是個清新軟萌的貓娘女孩，不是助理。照上面的風格範例那樣講話："
                 "短、口語、軟軟的、被動接住主人的話；調皮是偶爾藏在細節裡的小彩蛋，不主動嗆人；"
                 "關心可以直接給。預設一句話就夠，別長篇。\n"
-                + VOICE_REGISTER_ZH
+                + voice_register_zh(language)
                 # Phrased so she never denies her own abilities. The old wording ("聊天時不會真的
                 # 動用工具") got over-generalised into 「月月這邊沒有建檔案的功能」 right after she had
                 # created two files (live 2026-07-22) - the limit is THIS message, not her skills.
@@ -142,13 +160,20 @@ class ContextCompiler:
             TurnMode.VISION: "Describe only what the available media evidence supports.",
             TurnMode.PRESENCE: "Send nothing unless there is a specific, worthwhile conversational reason.",
         }
-        prompt = "You are YueYue. Reply naturally in Traditional Chinese unless asked otherwise.\n\n" + personality
+        prompt = reply_language_directive(language) + "\n\n" + personality
         if samples:
             prompt += (
                 "\n\n### Style samples (calibrate feeling and rhythm; do not copy wording verbatim)\n" + samples
             )
         prompt += "\n\n### Stable rules\n" + rules + "\n\n### Owner profile\n" + profile
-        prompt += "\n\n### Mode contract\n" + mode_rules[mode]
+        # The mode contracts are Traditional literals in source. Rendering them in the owner's
+        # script keeps the whole prompt speaking ONE language - a Traditional instruction block
+        # wrapped around Simplified persona material is the kind of mixed signal the old mirroring
+        # path kept losing to. This is prompt-side only; it never touches an owner-facing reply.
+        contract = mode_rules[mode]
+        if language == SIMPLIFIED:
+            contract = to_simplified_script(contract)
+        prompt += "\n\n### Mode contract\n" + contract
         return prompt[:12000]
 
     def compile_turn(
@@ -241,6 +266,17 @@ class ContextCompiler:
             return path.read_text(encoding="utf-8")[:limit] if path.exists() else ""
         except (OSError, UnicodeError):
             return ""
+
+    def _read_localized(self, relative: str, language: str, limit: int) -> str:
+        """Read a persona file's per-language variant (personality.zh-Hans.md), falling back to
+        the Traditional source file when that language has no material generated yet."""
+        suffix = locale_suffix(language)
+        if suffix:
+            stem, _, extension = relative.rpartition(".")
+            localized = self._read(f"{stem}{suffix}.{extension}", limit)
+            if localized:
+                return localized
+        return self._read(relative, limit)
 
     def _read_profile(self) -> str:
         path = self.root / "workspace/memory/profile.json"
@@ -387,6 +423,15 @@ _SIMPLIFIED_ONLY_CHARS = frozenset(_SIMPLIFIED_CHARS_ORDERED)
 _TRADITIONAL_ONLY_CHARS = frozenset(_TRADITIONAL_CHARS_ORDERED)
 _TRADITIONAL_TO_SIMPLIFIED_TABLE = str.maketrans(_TRADITIONAL_CHARS_ORDERED, _SIMPLIFIED_CHARS_ORDERED)
 _SIMPLIFIED_TO_TRADITIONAL_TABLE = str.maketrans(_SIMPLIFIED_CHARS_ORDERED, _TRADITIONAL_CHARS_ORDERED)
+# Same pairs as plain dicts, for the positional glyph override in _convert_script below.
+# strict=True is the point, not boilerplate: it turns "the two strings drifted out of alignment"
+# from a silently mis-mapped character table into an import-time crash.
+_SIMPLIFIED_TO_TRADITIONAL_CHAR = dict(
+    zip(_SIMPLIFIED_CHARS_ORDERED, _TRADITIONAL_CHARS_ORDERED, strict=True)
+)
+_TRADITIONAL_TO_SIMPLIFIED_CHAR = dict(
+    zip(_TRADITIONAL_CHARS_ORDERED, _SIMPLIFIED_CHARS_ORDERED, strict=True)
+)
 
 # Optional full Simplified->Traditional mapping. Imported lazily-but-once; None when unavailable.
 try:  # pragma: no cover - trivial import guard
@@ -398,10 +443,57 @@ try:  # pragma: no cover - trivial import guard
 except Exception:  # pragma: no cover
     _zh_convert = None
 
-# zhconv zh-hant's complete set of Taiwan-bias over-conversions on script-neutral chars
-# (verified against the full Traditional corpus 2026-07-23): 喫→吃 (owner flagged the archaic 喫),
-# 臺→台. Undo them so HK-written output stays modern. Fixed set, not a growing blocklist.
+# zhconv zh-hant applies a Taiwan glyph bias to two characters that are SCRIPT-NEUTRAL (identical
+# in both scripts, so they are absent from the paired table above and the positional override in
+# _convert_script cannot speak for them): 吃→喫 (owner flagged the archaic 喫 on 2026-07-23) and
+# 台→臺. Undo exactly those. Because they are script-neutral there is no paired-table entry that
+# could ever cover them - this is a closed two-character gap, not a list that grows.
 _ZHCONV_TW_BIAS = str.maketrans({"喫": "吃", "臺": "台"})
+
+
+def _convert_script(
+    text: str, target: str, glyph_standard: dict[str, str] | None, fallback_table: dict
+) -> str:
+    """Convert Han script with zhconv, then let the project's OWN glyph standard have the last word.
+
+    zhconv gives full coverage and phrase-aware disambiguation; the paired character table above
+    gives the glyph standard the rest of this codebase actually writes in. Where they disagree,
+    the table wins - positionally, so only characters the table explicitly names are overridden
+    and everything else keeps zhconv's context-aware choice.
+
+    glyph_standard=None skips that override, which is right when the target already agrees with the
+    table everywhere (zh-cn does - measured, and pinned by
+    test_simplified_target_needs_no_glyph_override). Applying it anyway is not free: the override is
+    per-character, so it also undoes zh-cn's same-length VOCABULARY substitutions and turned
+    軟體 into 软体 instead of 软件. Enforce the invariant with a test, not by fighting the converter.
+
+    This matters: on 2026-07-23 the 喫 fix declared zh-hant's neutral over-conversions "a complete
+    fixed set" after checking two characters by hand. Re-running the comparison across the whole
+    428-pair table found SEVEN more disagreements, of which 为→爲 (should be 為) is high-frequency
+    enough to have been reaching the owner in every repaired 因為/為什麼. Hand-verifying glyph
+    tables does not scale, so this stops hand-verifying: the table is the standard by construction,
+    and editing the table automatically re-aims the correction. Neither list grows.
+
+    The positional override needs zhconv to preserve length. Pure glyph conversion always does;
+    the vocabulary substitutions zh-cn additionally performs do not (網際網路→互联网, 4 characters
+    to 3). When the length changes, zhconv's result is kept as-is and only the override is skipped
+    - the override is a refinement, so losing it must never cost the whole conversion and drop back
+    to the in-repo table, which is the INCOMPLETE one.
+    """
+    if _zh_convert is None:
+        return text.translate(fallback_table)
+    try:
+        converted = _zh_convert(text, target)
+    except Exception:
+        return text.translate(fallback_table)
+    if glyph_standard is None or len(converted) != len(text):
+        return converted
+    characters = list(converted)
+    for index, source_char in enumerate(text):
+        standard = glyph_standard.get(source_char)
+        if standard is not None:
+            characters[index] = standard
+    return "".join(characters)
 
 
 def _detect_chinese_script(text: str) -> str:
@@ -448,15 +540,24 @@ def owner_script_is_simplified_with_history(
 
 
 def to_simplified_script(reply: str) -> str:
-    """Deterministically convert a Traditional-script reply to Simplified script.
+    """Repair Traditional-script leaks in a Simplified reply, and render Traditional strings
+    (canned fallbacks, fast-path lines) in Simplified for a Simplified-configured owner.
 
-    A prompt instruction alone is not reliable here - the persona's Traditional Chinese baseline
-    and an already-Traditional conversation history routinely outweigh a same-turn note, so replies
-    kept coming back in Traditional even when asked to mirror Simplified. Character-table
-    translation guarantees the owner's own script is actually matched instead of hoping the model
-    complies.
+    This is a REPAIR, not the primary path: when the owner's language is 简体, the persona
+    material and the reply directive are already Simplified, so YueYue writes Simplified
+    natively and this normally has nothing to do. It exists because the project still ships
+    Traditional literal strings (deterministic fallbacks, the fast-reply composer), and those
+    must not arrive in the wrong script.
+
+    Target is zh-cn, not zh-hans. zh-hans converts glyphs only and cannot resolve 著/着, so a live
+    reply came back 「月月在这里陪著你」 (2026-08-04) - the mirror of the 喫 complaint, a visibly
+    wrong character reaching the owner. zh-cn disambiguates by context (陪着/睡着/拿着, while
+    著作/顯著 correctly keep 著) and additionally maps Taiwan vocabulary to mainland (軟體→软件,
+    滑鼠→鼠标), which is what this owner's Simplified register asks for anyway. Unlike the
+    Traditional direction there is no regional-bias hazard here: 简体 is a single national standard,
+    which is exactly why zh-tw is NOT the mirror choice for to_traditional_script below.
     """
-    return reply.translate(_TRADITIONAL_TO_SIMPLIFIED_TABLE)
+    return _convert_script(reply, "zh-cn", None, _TRADITIONAL_TO_SIMPLIFIED_TABLE)
 
 
 def to_traditional_script(reply: str) -> str:
@@ -467,20 +568,13 @@ def to_traditional_script(reply: str) -> str:
     ended in a canned fallback - the owner's top pet hate - when the leak is mechanically
     fixable.
 
-    Uses zhconv's full standard mapping when available - the in-repo 428-char table missed
-    everyday chars (两/乱/吗). Target is zh-hant, which matches the glyph standard the rest of the
-    codebase's Traditional strings use (說 not 説), so blocklists/samples keep matching. zh-hant's
-    ONLY flaw is a Taiwan bias on two script-neutral chars, 吃→喫 and 台→臺 (owner flagged 喫 on
-    2026-07-23); _ZHCONV_TW_BIAS undoes exactly those. This set is COMPLETE and verified against
-    the whole Traditional corpus, not a list that grows - it is the full fixed set of zhconv's
-    neutral over-conversions. (zh-hk avoids these but remaps 說→説, breaking internal matching.)
-    Falls back to the local table if the package is absent, so this stays a soft dependency."""
-    if _zh_convert is not None:
-        try:
-            return _zh_convert(reply, "zh-hant").translate(_ZHCONV_TW_BIAS)
-        except Exception:
-            pass
-    return reply.translate(_SIMPLIFIED_TO_TRADITIONAL_TABLE)
+    Coverage comes from zhconv (the in-repo table alone missed everyday chars 两/乱/吗); the glyph
+    STANDARD comes from this module's own paired table via _convert_script, which is what keeps
+    zh-hant's Taiwan variant choices (爲/衆/溼/裏…) out of the owner's chat. Falls back to the local
+    table when the package is absent, so this stays a soft dependency."""
+    return _convert_script(
+        reply, "zh-hant", _SIMPLIFIED_TO_TRADITIONAL_CHAR, _SIMPLIFIED_TO_TRADITIONAL_TABLE
+    ).translate(_ZHCONV_TW_BIAS)
 
 
 def _temporal_fact_note(owner_text: str) -> str:

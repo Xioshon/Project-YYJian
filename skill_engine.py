@@ -26,6 +26,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import owner_language
 from local_store import EXPENSES, NOTES, TODOS
 from reminders import DEFAULT_REMINDER_STORE
 
@@ -412,6 +413,32 @@ def _list_tasks(args: dict, ctx: SkillContext) -> SkillResult:
     return SkillResult("；".join(parts))
 
 
+# ------------------------------------------------------------------ language
+
+def _get_language(args: dict, ctx: SkillContext) -> SkillResult:
+    chosen = owner_language.read_language()
+    options = "、".join(owner_language.display_name(code) for code in owner_language.SUPPORTED_LANGUAGES)
+    if not chosen:
+        return SkillResult(
+            f"主人還沒設定過語言，現在用的是預設的{owner_language.display_name(owner_language.DEFAULT_LANGUAGE)}。"
+            f"可選：{options}"
+        )
+    return SkillResult(f"主人的語言設定是{owner_language.display_name(chosen)}。可選：{options}")
+
+
+def _set_language(args: dict, ctx: SkillContext) -> SkillResult:
+    requested = str(args.get("language") or "").strip()
+    code = owner_language.write_language(requested)
+    if not code:
+        options = "、".join(owner_language.display_name(c) for c in owner_language.SUPPORTED_LANGUAGES)
+        return SkillResult(f"不支援「{requested[:20]}」這個語言，目前只有：{options}", ok=False)
+    # The note is phrased in the NEW language: this reply is the first one the owner sees after
+    # switching, so it is also the proof that the switch took effect.
+    if code == owner_language.SIMPLIFIED:
+        return SkillResult("语言已经切换成简体中文了，从现在开始都用简体回复主人")
+    return SkillResult(f"語言已經切換成{owner_language.display_name(code)}了，之後都用這個回覆主人")
+
+
 # ------------------------------------------------------------------ memory
 
 # Set by the runtime: callable(text, source) -> None that writes a fact to long-term memory.
@@ -530,6 +557,18 @@ SKILLS: list[Skill] = [
           _p({"query": {"type": "string", "description": "精煉的搜索詞"}}, ["query"]), _web_search),
     Skill("weather", "查天氣（今天冷不冷/要不要帶傘/某城市天氣）。",
           _p({"city": {"type": "string", "description": "城市名，主人沒說就用他常在的城市"}}), _weather),
+    # Routing by DESCRIPTION, not by a keyword table in front of the model - same architecture as
+    # every other skill here, so 「以後跟我講簡體」「用简体字」「switch to simplified」 all land
+    # without anyone maintaining a phrase list.
+    Skill("get_language",
+          "主人問你現在用哪種語言／中文字體跟他說話，或問有哪些語言可以選。",
+          _p({}), _get_language),
+    Skill("set_language",
+          "主人要你改用另一種語言或中文字體跟他說話（改用簡體/用繁體/switch to simplified/"
+          "以後都講簡體字）。language 填主人要的那一種：繁體 或 簡體。"
+          "只有主人明確要求換語言時才呼叫；他只是自己打了簡體字並不算。",
+          _p({"language": {"type": "string", "description": "繁體 或 簡體（zh-Hant / zh-Hans 也可以）"}},
+             ["language"]), _set_language),
 ]
 
 _SKILLS_BY_NAME = {s.name: s for s in SKILLS}

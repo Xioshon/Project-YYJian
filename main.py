@@ -54,6 +54,7 @@ from core_tools import (
     set_telegram_context,
 )
 from intent_router import classify_owner_intent
+from owner_language import SIMPLIFIED, read_language
 from reminders import DEFAULT_REMINDER_STORE, ReminderScheduler
 from reply_context import reply_summary_for_context
 from response_composer import compose_fast_reply, is_plain_greeting, is_simple_wake_greeting
@@ -70,6 +71,28 @@ for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
 TELEGRAM_MESSAGE_LIMIT = 4096
+
+
+def _in_owner_script(text: str) -> str:
+    """Render an outgoing message in the owner's CONFIGURED language script.
+
+    The last safety net, deliberately placed after sticker/screenshot markers have been stripped
+    out - marker payloads are FILENAMES (「嗚嗚嗚.gif」) and converting one would break the lookup.
+
+    This is not the old detect-and-mirror path: there is no detection, only a setting the owner
+    stated. Its whole job is the Traditional literals this codebase still ships - the fast-reply
+    composer's pooled greetings, deterministic failure lines, quick acknowledgements - which the
+    model never wrote and so cannot have written in Simplified. Generated replies arrive here
+    already in the right language, and this is a no-op on them.
+    """
+    if read_language() != SIMPLIFIED:
+        return text
+    try:
+        from yueyue_v3.context import to_simplified_script
+
+        return to_simplified_script(text)
+    except Exception:
+        return text
 
 
 def _read_text_file(path: str, default: str = "") -> str:
@@ -573,6 +596,7 @@ class TelegramGateway:
         raw_screenshots = screenshot_re.findall(clean_text)
         screenshots = _dedupe_preserve_order(raw_screenshots)
         clean_text = screenshot_re.sub("", clean_text).strip()
+        clean_text = _in_owner_script(clean_text)
         _record_render_dedupe(chat_id, "sticker", len(raw_stickers), len(stickers))
         _record_render_dedupe(chat_id, "screenshot", len(raw_screenshots), len(screenshots))
 

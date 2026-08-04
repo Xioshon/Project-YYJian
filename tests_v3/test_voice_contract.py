@@ -101,8 +101,13 @@ def test_prompt_sites_all_import_the_shared_contract() -> None:
     root = pathlib.Path(__file__).resolve().parents[1]
     for name in ("response_composer.py", "agent_presence.py", "yueyue_v3/context.py", "yueyue_v3/runtime.py"):
         source = (root / name).read_text(encoding="utf-8")
-        assert "VOICE_REGISTER" in source, f"{name} must import the shared voice contract"
+        # Either form counts as "came from the contract": the constants, or the per-language
+        # accessors voice_register_zh/voice_register_en that select between them.
+        assert "VOICE_REGISTER" in source or "voice_register_zh" in source or "voice_register_en" in source, (
+            f"{name} must import the shared voice contract"
+        )
         assert "字感：香港書面繁體" not in source, f"{name} still carries a hand-copied register line"
+        assert "字感：简体中文书面语" not in source, f"{name} still carries a hand-copied register line"
     assert response_composer.voice_register_violation is voice_register_violation
 
 

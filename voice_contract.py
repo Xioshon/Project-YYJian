@@ -28,6 +28,32 @@ VOICE_REGISTER_ZH = (
     "內地網絡梗（笑死/絕了/無語/emmm）可以自然出現但別堆砌。"
 )
 
+# The same register expressed for an owner whose LANGUAGE SETTING is Simplified (owner_language
+# .SIMPLIFIED). Hand-written rather than machine-converted from VOICE_REGISTER_ZH, because a
+# mechanical conversion produces the self-contradictory line 「字感：香港书面繁体」 - the one
+# sentence in the register that names the script itself cannot survive a script conversion. The
+# vocabulary preference carries over unchanged (屏幕/网络/软件/视频/信息 IS the mainland word set),
+# and so do both failure directions: no Taiwan-flavoured final particles, no spoken Cantonese.
+VOICE_REGISTER_ZH_HANS = (
+    "字感：简体中文书面语+内地网聊语感——用「屏幕/网络/软件/视频/信息/文件/文件夹」这一路的词，"
+    "不用台湾腔的「萤幕/网路/软体/档案/资料夹」；语尾别用「喔/哟/耶」这类台味助词，直接收句就好。"
+    "书面中文不是粤语口语：不要写「嘅/喺/㗎/咗/唔/冇/睇/嚟/俾/佢/撳/呢个/几多/边个/点解」"
+    "这类粤语字词，要用通用书面中文写（这个/多少/哪个/为什么）。语气词（啦/咯/嘛）可以用但要少，一句顶多一个；"
+    "内地网络梗（笑死/绝了/无语/emmm）可以自然出现但别堆砌。"
+)
+
+
+def voice_register_zh(language: str = "") -> str:
+    """The Chinese-language register block for the owner's configured language.
+
+    Every Chinese prompt that generates an owner-facing line calls this instead of hard-coding
+    VOICE_REGISTER_ZH, so adding a language never means hunting down copies of the register.
+    """
+    from owner_language import SIMPLIFIED
+
+    return VOICE_REGISTER_ZH_HANS if language == SIMPLIFIED else VOICE_REGISTER_ZH
+
+
 VOICE_REGISTER_EN = (
     "Lexical register: Hong Kong WRITTEN Traditional Chinese with mainland-internet chat "
     "rhythm - prefer 屏幕/網絡/軟件/視頻/信息 over Taiwan-style 螢幕/網路/軟體, and avoid "
@@ -38,6 +64,26 @@ VOICE_REGISTER_EN = (
     "sparing, at most one per line. Mainland internet expressions (笑死/絕了/無語/真的假的/"
     "？？？/哈哈哈哈/emmm) may appear naturally but at most one per line, never stacked."
 )
+
+# VOICE_REGISTER_EN for an owner whose language setting is Simplified. Same two failure directions
+# and the same vocabulary set; only the script the reply is written in differs. Kept beside its
+# Traditional twin so a register change is made in one visible place, never in one of two.
+VOICE_REGISTER_EN_HANS = (
+    "Lexical register: written SIMPLIFIED Chinese with mainland-internet chat rhythm - prefer "
+    "屏幕/网络/软件/视频/信息 over Taiwan-style 萤幕/网路/软体, and avoid Taiwan-flavored "
+    "particles like 喔/哟/耶 as habitual line endings. Written register is NOT spoken Cantonese: "
+    "never use Cantonese-only words such as 嘅/喺/㗎/咗/唔/冇/睇/嚟/俾/佢/撳/呢个/几多/边个/点解 - "
+    "write standard written Chinese (这个/多少/哪个/为什么). Tone particles (啦/咯/嘛) are welcome "
+    "but sparing, at most one per line. Mainland internet expressions (笑死/绝了/无语/真的假的/"
+    "？？？/哈哈哈哈/emmm) may appear naturally but at most one per line, never stacked."
+)
+
+
+def voice_register_en(language: str = "") -> str:
+    """The English-prompt register block for the owner's configured language."""
+    from owner_language import SIMPLIFIED
+
+    return VOICE_REGISTER_EN_HANS if language == SIMPLIFIED else VOICE_REGISTER_EN
 
 # Cantonese-only characters that never appear in the written register YueYue should use.
 # Deliberately high-precision: each of these is unambiguous spoken Cantonese on its own.
@@ -74,7 +120,9 @@ _CANTONESE_BIGRAMS = (
 
 # Taiwan-flavored particles rejected only in the sentence/line-final position (possibly
 # followed by punctuation) - mid-word occurrences like 耶誕/喲呵 quoting are not the target.
-_TAIWAN_FINAL_PARTICLE_RE = re.compile(r"[喔喲耶](?=[\s。！？!?~～…，,]|$)")
+# 哟 is 喲's Simplified glyph, added so the rule still bites when the owner's configured language
+# is 简体 (喔/耶 are script-neutral). Closing an existing entry's other glyph, not a new entry.
+_TAIWAN_FINAL_PARTICLE_RE = re.compile(r"[喔喲哟耶](?=[\s。！？!?~～…，,]|$)")
 
 # A small set of high-frequency, unambiguous Simplified-only characters (each one's
 # Traditional form differs, and the char itself has no common Traditional usage - e.g. 后
@@ -99,20 +147,39 @@ _CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
 _JAPANESE_SHINJITAI_CHARS = "実気転読図経済駅様"
 
 
+def _traditional_shadow(text: str) -> str:
+    """A Traditional rendering of `text`, used ONLY for matching - never delivered to the owner.
+
+    Every list in this module is written in Traditional, so a natively-Simplified reply (the owner
+    set 简体) would sail past all of them: 「諗」 is written 「谂」, 「呢個」 is 「呢个」. Rather than
+    duplicating each list per script - the growing-blocklist disease - the checks run against both
+    the text as written and this shadow. Same trick response_composer._hits_blocked_phrase uses.
+    """
+    try:
+        from yueyue_v3.context import to_traditional_script
+
+        return to_traditional_script(text)
+    except Exception:
+        return text
+
+
 def voice_register_violation(text: str, allow_simplified: bool = False) -> str:
     """Return a short reason string if `text` violates the owner's register, else "".
 
-    Callers gate model OUTPUT with this, before any owner-script mirroring. Pass
-    allow_simplified=True when the owner's own current message is Simplified - the reply
-    deliberately mirrors their script then, so Simplified is not a defect in that turn.
+    Callers gate model OUTPUT with this. Pass allow_simplified=True when the reply is legitimately
+    Simplified - the owner's configured language is 简体, or (legacy, unset-language path) their
+    own current message is Simplified and the reply mirrors it.
     """
     value = str(text or "")
     if not value:
         return ""
-    hits = [ch for ch in _CANTONESE_ONLY_CHARS if ch in value]
+    # Script-insensitive: the register lists are Traditional, the reply may not be.
+    shadow = _traditional_shadow(value)
+    variants = (value, shadow) if shadow != value else (value,)
+    hits = [ch for ch in _CANTONESE_ONLY_CHARS if any(ch in item for item in variants)]
     if hits:
         return f"cantonese_chars:{''.join(hits[:5])}"
-    bigram_hits = [phrase for phrase in _CANTONESE_BIGRAMS if phrase in value]
+    bigram_hits = [phrase for phrase in _CANTONESE_BIGRAMS if any(phrase in item for item in variants)]
     if bigram_hits:
         return f"cantonese_phrase:{'/'.join(bigram_hits[:3])}"
     match = _TAIWAN_FINAL_PARTICLE_RE.search(value)
@@ -152,16 +219,21 @@ def repair_taiwan_particles(text: str) -> str:
 # natural Chinese, so no prompt instruction reliably suppresses it - and spelling it out inside a
 # "don't say X" line made models emit it MORE. Rewriting the finished sentence is deterministic,
 # costs nothing, and stays one owner-named idiom rather than a growing style blocklist.
-_NOD_IDIOM_RE = re.compile(r"(?:在)?等(?:著|着)?(?:你|主人|您)(?:的)?點頭")
+# Both glyph pairs (點頭 / 点头) so the rewrite still bites when the owner's configured language is
+# 简体. The REPLACEMENT stays Traditional on purpose: the egress script normalisation renders the
+# finished reply in the owner's language anyway, so there is no second replacement string to keep
+# in sync with this one.
+_NOD_WORD_RE = re.compile(r"[點点][頭头]")
+_NOD_IDIOM_RE = re.compile(r"(?:在)?等(?:著|着)?(?:你|主人|您)(?:的)?[點点][頭头]")
 
 
 def repair_nod_idiom(text: str) -> str:
     """Rewrite 「等你點頭」-style approval phrasing into the owner's preferred 「等你說可以」."""
     value = str(text or "")
-    if "點頭" not in value:
+    if not _NOD_WORD_RE.search(value):
         return value
     value = _NOD_IDIOM_RE.sub("等你說可以", value)
-    return value.replace("點頭", "說可以")
+    return _NOD_WORD_RE.sub("說可以", value)
 
 
 def repair_simplified_script(text: str) -> str:
